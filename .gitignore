@@ -1,0 +1,6 @@
+/target
+.idea
+.vscode
+.fleet
+.env
+.DS_Store

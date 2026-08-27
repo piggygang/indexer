@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:17.6
+    container_name: piggygang-indexer-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: piggygang_indexer
+    # Host port 5433: 5432 is taken by piggygang-services' Postgres.
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

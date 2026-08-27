@@ -1,0 +1,15 @@
+# Keep the build context small. Cargo.lock is deliberately NOT ignored —
+# reproducible Docker builds need it.
+target/
+.git/
+.github/
+.idea/
+.vscode/
+.fleet/
+.env
+.env.example
+.DS_Store
+README.md
+CLAUDE.md
+docker-compose.yml
+railway.*.json

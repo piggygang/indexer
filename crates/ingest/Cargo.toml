@@ -1,0 +1,21 @@
+[package]
+name = "indexer-ingest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# ALG-623 adds the real transports as optional deps behind features:
+#   ws   = ["dep:tokio-tungstenite", ...]   Helius Enhanced WebSockets (primary)
+#   grpc = ["dep:helius-laserstream"]       LaserStream gRPC (Business-plan upgrade)
+# The mock stays unconditional — it is the test double other crates import.
+
+[dependencies]
+async-stream = { workspace = true }
+futures-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+futures-util = { workspace = true }
