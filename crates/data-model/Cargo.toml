@@ -1,0 +1,20 @@
+[package]
+name = "indexer-data-model"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Leaf crate: depends on sqlx, not on indexer-config (services translate
+# DatabaseConfig into `connect` arguments) nor on indexer-ingest (slots are
+# plain integers here).
+[dependencies]
+anyhow = { workspace = true }
+bs58 = { workspace = true }
+chrono = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
