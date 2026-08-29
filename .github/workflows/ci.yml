@@ -8,6 +8,24 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        # Same image, credentials and host port as docker-compose.yml, so
+        # DATABASE_URL is identical locally and in CI.
+        image: public.ecr.aws/docker/library/postgres:17.6
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: piggygang_indexer
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:password@localhost:5433/piggygang_indexer
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -19,4 +37,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      # DB tests are #[ignore]d so a laptop without Postgres stays green;
+      # here they must run (and a missing DATABASE_URL would fail them).
+      - run: cargo test --workspace -- --include-ignored
+      - name: migrate + seed twice (end-to-end idempotency)
+        run: |
+          cargo run -p indexer-admin -- migrate
+          cargo run -p indexer-admin -- seed
+          cargo run -p indexer-admin -- seed --expect-unchanged

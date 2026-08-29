@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 pub struct Config {
     pub server: ServerConfig,
     pub helius: HeliusConfig,
+    pub database: DatabaseConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -32,8 +33,41 @@ pub struct HeliusConfig {
     pub api_key: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct DatabaseConfig {
+    /// `DATABASE_URL`. Optional at parse time (like `HELIUS_API_KEY`) so that
+    /// tooling which never touches Postgres still boots; every binary that
+    /// does talk to Postgres calls [`DatabaseConfig::required_url`] at
+    /// startup. On Railway: `${{Postgres.DATABASE_URL}}`.
+    pub url: Option<String>,
+    /// `DATABASE_MAX_CONNECTIONS`, default 5 — Railway Postgres is shared by
+    /// the api, the future ingester and one-off admin runs.
+    pub max_connections: u32,
+    /// `DATABASE_CONNECT_TIMEOUT_SECS`, default 5.
+    pub connect_timeout_secs: u64,
+}
+
+impl DatabaseConfig {
+    /// The URL, or a hard error naming the variable — services and the admin
+    /// CLI call this at boot so a missing `DATABASE_URL` fails loudly.
+    pub fn required_url(&self) -> Result<&str> {
+        self.url
+            .as_deref()
+            .context("DATABASE_URL is required (see .env.example)")
+    }
+}
+
 impl Config {
     pub fn try_from_env() -> Result<Self> {
+        let database = DatabaseConfig {
+            url: env::var("DATABASE_URL").ok().filter(|v| !v.is_empty()),
+            max_connections: parsed_or("DATABASE_MAX_CONNECTIONS", 5)?,
+            connect_timeout_secs: parsed_or("DATABASE_CONNECT_TIMEOUT_SECS", 5)?,
+        };
+        anyhow::ensure!(
+            database.max_connections >= 1,
+            "invalid DATABASE_MAX_CONNECTIONS=0: need at least one connection"
+        );
         Ok(Self {
             server: ServerConfig {
                 host: string_or("HOST", "::"),
@@ -42,6 +76,7 @@ impl Config {
             helius: HeliusConfig {
                 api_key: env::var("HELIUS_API_KEY").ok().filter(|v| !v.is_empty()),
             },
+            database,
         })
     }
 }
@@ -71,23 +106,52 @@ where
 mod tests {
     use super::*;
 
+    const KEYS: [&str; 6] = [
+        "HOST",
+        "PORT",
+        "HELIUS_API_KEY",
+        "DATABASE_URL",
+        "DATABASE_MAX_CONNECTIONS",
+        "DATABASE_CONNECT_TIMEOUT_SECS",
+    ];
+
+    fn clear() {
+        for key in KEYS {
+            env::remove_var(key);
+        }
+    }
+
     // One sequential test: env vars are process-global, so parallel tests
     // mutating the same keys would race.
     #[test]
     fn env_parsing() {
-        env::remove_var("HOST");
-        env::remove_var("PORT");
-        env::remove_var("HELIUS_API_KEY");
+        clear();
         let config = Config::try_from_env().unwrap();
         assert_eq!(config.server.host, "::");
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.helius.api_key, None);
+        assert_eq!(config.database.url, None);
+        assert_eq!(config.database.max_connections, 5);
+        assert_eq!(config.database.connect_timeout_secs, 5);
+        assert!(config
+            .database
+            .required_url()
+            .unwrap_err()
+            .to_string()
+            .contains("DATABASE_URL"));
 
         env::set_var("PORT", "9090");
         env::set_var("HELIUS_API_KEY", "test-key");
+        env::set_var("DATABASE_URL", "postgres://localhost/x");
+        env::set_var("DATABASE_MAX_CONNECTIONS", "12");
         let config = Config::try_from_env().unwrap();
         assert_eq!(config.server.port, 9090);
         assert_eq!(config.helius.api_key.as_deref(), Some("test-key"));
+        assert_eq!(
+            config.database.required_url().unwrap(),
+            "postgres://localhost/x"
+        );
+        assert_eq!(config.database.max_connections, 12);
 
         env::set_var("PORT", "80800");
         let err = Config::try_from_env().unwrap_err();
@@ -95,8 +159,22 @@ mod tests {
             err.to_string().contains("PORT"),
             "unexpected error: {err:#}"
         );
-
         env::remove_var("PORT");
-        env::remove_var("HELIUS_API_KEY");
+
+        env::set_var("DATABASE_MAX_CONNECTIONS", "abc");
+        let err = Config::try_from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("DATABASE_MAX_CONNECTIONS"),
+            "unexpected error: {err:#}"
+        );
+
+        env::set_var("DATABASE_MAX_CONNECTIONS", "0");
+        let err = Config::try_from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("DATABASE_MAX_CONNECTIONS=0"),
+            "unexpected error: {err:#}"
+        );
+
+        clear();
     }
 }

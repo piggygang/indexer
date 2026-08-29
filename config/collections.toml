@@ -1,0 +1,72 @@
+# Collections / tokens registry seed (ALG-619).
+#
+# Apply with:  cargo run -p indexer-admin -- seed
+# Semantics: upsert by slug (config is the source of truth for every scalar
+# column, including `enabled`); mint lists are insert-only; nothing is ever
+# deleted — disable a collection instead. Re-running is a no-op.
+#
+# On-chain addresses live ONLY here and in config/seeds/ — never in Rust or
+# in migrations. Adding a collection = one [[collections]] entry (+ a mint
+# list for a token_metadata collection without a certified collection), then
+# `seed`, then the backfill (ALG-621). No code changes.
+version = 1
+
+[[collections]]
+slug = "piggy-sol-gang"
+name = "Piggy SOL Gang"
+standard = "token_metadata"
+enabled = true
+# No Metaplex certified collection on chain (collection: null on every
+# metadata account). Membership = the closed mint list; creator + symbol are
+# the on-chain validation signals (creators[0] = verified_creator, verified).
+verified_creator = "Pigv3gFWLWJL8QwrFBkdZLe1RYzNJTSJPGEUNVimJjh"
+update_authority = "7NsngNMtXJNdHgeK4znQDZ5xVzT2nkGoGRGhMWApejCV"
+symbol = "PSG"
+mints = { file = "seeds/piggy-sol-gang.mints.json", count = 10000 }
+# Re-hosted metadata (the original shdw-drive host is dead); {mint} = the
+# mint address. Used by the backfill instead of the on-chain URI.
+metadata_uri_template = "https://pub-b1a45763f0a64d8fa271f66f5514a561.r2.dev/old/metadata/{mint}.json"
+
+[[collections]]
+slug = "piggy-girl-gang"
+name = "Piggy Girl Gang"
+standard = "token_metadata"
+enabled = true
+verified_creator = "Pigv3gFWLWJL8QwrFBkdZLe1RYzNJTSJPGEUNVimJjh"
+update_authority = "7NsngNMtXJNdHgeK4znQDZ5xVzT2nkGoGRGhMWApejCV"
+symbol = "PGG"
+mints = { file = "seeds/piggy-girl-gang.mints.json", count = 5000 }
+# All 5,000 on-chain URIs still point at the dead shdw-drive host; the
+# re-hosted files are mint-keyed on Vercel Blob (see the Image Rehost project).
+metadata_uri_template = "https://rk2cjjujjgvqwsmy.public.blob.vercel-storage.com/piggy-girl-gang-json/{mint}.json"
+# The off-chain JSON carries a per-asset-unique "Name" trait ("#1934"):
+# shown on the detail page, never a facet.
+facet_exclude = ["Name"]
+
+[[collections]]
+slug = "pig-mud"
+name = "Pig Mud"
+standard = "token_metadata"
+enabled = true
+verified_creator = "5uJo36TpiSjGCjLQXvyqCugZRJAPWs4F97m68hrxV6bJ"
+update_authority = "7NsngNMtXJNdHgeK4znQDZ5xVzT2nkGoGRGhMWApejCV"
+symbol = "PMUD"
+mints = { file = "seeds/pig-mud.mints.json", count = 2073 }
+# On-chain URIs point at shdw-drive (dead) and no re-host exists yet: add a
+# metadata_uri_template here once the files are re-hosted.
+
+[[collections]]
+slug = "piggy-gang"
+name = "Piggy Gang"
+standard = "core"
+enabled = true
+# Metaplex Core CollectionV1. Dynamic: swapping a SOL Gang piggy burns the
+# mint and creates a Core asset named "#N" in this collection.
+address = "J3nHgSDJj6CPj2ypuDWNuvuiYii965RcSmFAPQVDWA18"
+
+[[tokens]]
+mint = "FUtxQAXuC4TgQvF7C5RTRsgqHvPqn4iHhMicRZKV775E"
+symbol = "PIGGY"
+name = "Piggy Token"
+decimals = 9
+enabled = true

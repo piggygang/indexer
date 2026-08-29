@@ -77,15 +77,21 @@ runtime image, distroless-ready.
 ## Repository layout
 
 ```
+config/
+  collections.toml   the collections/tokens registry seed — the ONLY home of on-chain addresses
+  seeds/*.mints.json closed mint lists for Token Metadata collections without a certified collection
 crates/
-  config/    indexer-config — env config, fail-fast validation
-  ingest/    indexer-ingest — transport-agnostic ingest interface + mock
+  config/      indexer-config — env config, fail-fast validation
+  data-model/  indexer-data-model — Postgres migrations, registry, seed, ingest cursors, facet queries
+  ingest/      indexer-ingest — transport-agnostic ingest interface + mock
 services/
-  api/       indexer-api — REST API (today: /health hello service)
+  admin/       indexer-admin — migrate | seed | bench
+  api/         indexer-api — REST API (today: /health, /ready)
 ```
 
-Future members (the workspace globs already cover them):
-`crates/data-model` (ALG-619), `services/ingester` (ALG-623).
+Future member (the workspace globs already cover it): `services/ingester`
+(ALG-623). `railway.api.json` deliberately does not watch `config/**` or
+`services/admin/**` — neither is part of the API image.
 
 ### The ingest abstraction
 
@@ -118,18 +124,23 @@ semantics against the mock through the public trait.
 Prereqs: Rust via rustup (the pinned 1.90 toolchain auto-installs), Docker.
 
 ```sh
-docker compose up -d           # Postgres 17.6 on localhost:5433 (not used yet — ALG-619)
-cp .env.example .env           # then fill HELIUS_API_KEY when needed
+docker compose up -d                        # Postgres 17.6 on localhost:5433
+cp .env.example .env                        # DATABASE_URL points at it; fill HELIUS_API_KEY when needed
+cargo run -p indexer-admin -- migrate       # apply migrations (the API also does this at boot)
+cargo run -p indexer-admin -- seed          # registry from config/collections.toml (idempotent)
 cargo run -p indexer-api
-curl localhost:8080/health
+curl localhost:8080/health                  # liveness, no DB
+curl localhost:8080/ready                   # readiness: DB ping → 200 / 503
 ```
 
-Checks (same as CI):
+Checks (same as CI; the DB tests need `DATABASE_URL`, and are `#[ignore]`d
+so a plain `cargo test --workspace` stays green without Postgres):
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace -- --include-ignored
+cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op the second time
 ```
 
 ## Configuration
@@ -140,13 +151,95 @@ cargo test --workspace
 | `HOST` | no | `::` | dual-stack bind; Railway private networking needs the IPv6 bind |
 | `RUST_LOG` | no | `info` | |
 | `HELIUS_API_KEY` | not yet | — | required by ingest/backfill work (ALG-621/623) |
-| `DATABASE_URL` | not yet | — | becomes required in ALG-619; on Railway set to `${{Postgres.DATABASE_URL}}` |
+| `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}`; the seed runs from a workstation against `DATABASE_PUBLIC_URL` |
+| `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
+| `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
 
 ## Endpoints
 
-- `GET /health` — liveness (no dependency checks):
+- `GET /health` — liveness (no dependency checks; the Railway deploy gate):
   `{"status":"ok","service":"indexer-api","version":"0.1.0","commit":"<git sha>"}`
-- `GET /ready` — planned (ALG-619): DB ping.
+- `GET /ready` — readiness: `SELECT 1` with a 2 s bound → `200 {"status":"ready"}`
+  or `503 {"status":"unavailable","reason":…}`. Outside `/v1` and outside the API contract.
+
+## Collections registry (ALG-619)
+
+The registry (`collections`, `collection_mints`, `tokens`) is data, seeded
+from `config/collections.toml` + `config/seeds/*.mints.json` by
+`indexer-admin seed` — upsert by slug, mint lists insert-only, nothing is
+ever deleted, re-running is a no-op. **No on-chain address exists in Rust,
+SQL or tests.** Registered today (all enabled): Piggy SOL Gang (10,000
+mints), Piggy Girl Gang (5,000), Pig Mud (2,073) — all Metaplex Token
+Metadata — Piggy Gang (Metaplex Core, dynamic), and the `$PIGGY` fungible
+token (registry only, no balances).
+
+Membership is derived by Postgres from the row (`membership_rule`); backfill,
+live pipeline and reconciliation `match` on it, so a new collection is one
+TOML entry, `seed`, backfill — zero code:
+
+| Kind | TOML | rule | how members are found |
+|---|---|---|---|
+| Token Metadata with a certified collection | `standard="token_metadata"`, `address` | `tm_collection` | DAS `searchAssets` by collection |
+| Token Metadata without one (the three Piggy TM collections: `collection: null` on chain) | `verified_creator`, `symbol`, `mints = { file, count }` | `tm_allowlist` | the committed mint list (`getAssetBatch`); creator/symbol are validation signals |
+| Metaplex Core | `standard="core"`, `address` (CollectionV1) | `core_collection` | DAS `searchAssets` by collection; new mints appear automatically |
+| Announced / unknown | `enabled = false`, nothing else | NULL | skipped |
+
+Optional per-collection keys: `update_authority`, `image_url`,
+`metadata_uri_template` (`{mint}` placeholder — used instead of the on-chain
+URI when the original host is dead, as it is for Piggy Girl Gang),
+`facet_exclude` (trait types stored but never faceted, e.g. Girl Gang's
+per-asset-unique `Name`). The seed refuses to change a collection's
+`standard`/`address`/`verified_creator` once it has assets unless
+`--allow-identity-change` is given, and refuses a mint already owned by
+another collection.
+
+## Data model
+
+Five forward-only migrations in `crates/data-model/migrations/` (never edit
+one after it has been applied anywhere; expand-only across a release because
+Railway overlaps old and new replicas and rollback re-deploys an older
+binary). Tables:
+
+- `assets` — one row per NFT (`address` = mint or Core asset id, `bigint`
+  surrogate key), name → generated `number`, `burned`, `membership_status`,
+  observed `owner` + `owner_slot`, `last_activity_*` (trigger-maintained),
+  `image_status`. Fetched off-chain JSON lives in `asset_documents`.
+- `trait_types` / `trait_values` / `asset_attributes` — per-collection
+  dictionary + narrow `(asset, type, value)` rows; `facet_counts` view for the
+  unfiltered counts, `indexer_data_model::facets` for the disjunctive
+  (marketplace-style) filtered counts.
+- `activity` — events keyed `(asset_id, signature, seq)` for at-least-once
+  ingest; kinds `mint|transfer|sale|burn|stake|unstake|other` (the API serves
+  the first four); shape CHECKs mirror the contract's nullability.
+  `asset_signatures` keeps the raw per-asset crawl so ALG-622 can reclassify
+  without refetching.
+- `ownership_history` — intervals with a GiST `EXCLUDE` (no overlaps ⇒ at
+  most one open interval per asset), deferrable; `integrity_*` views are
+  what reconciliation (ALG-624) diffs.
+- `ingest_state` (slot cursor per live stream, monotonic) and
+  `backfill_state` (per-collection job cursors, opaque JSON).
+- `collection_stats` view — supply, holders, 24h/7d activity.
+
+The browse/facet population is "member assets of the collection, burned
+included" (the UI greys burned NFTs); only `supply`/`holders` exclude burned.
+
+### Facet performance (acceptance: < 100 ms)
+
+`cargo run --release -p indexer-admin -- bench` seeds three synthetic
+collections (10k PSG-like, 5k PGG-like with a unique-per-asset trait, 10k
+Core-like — Piggy-scale, real cardinalities and skew) and times the
+disjunctive facet query through the same sqlx path the API will use (the
+statement is planned with real parameter values every time —
+`persistent(false)` — so no generic-plan surprise). Measured locally on
+29 Aug 2026 (PG 17.6 in Docker, M-series laptop): every scenario p50 ≤ 40 ms
+(two active types on 10k assets: 39 ms; three types: 33 ms; text search:
+5 ms), 5k-asset collection ≤ 22 ms; all three collections are timed. Re-run on real data after the backfill
+with `bench --slug piggy-sol-gang` (the scenarios are derived from the
+collection's own facet distribution); `--dirty` rewrites 20 % of the rows
+first to mimic a live ingester. The query scans the collection's attribute
+rows once, so a future 100k-asset external collection would land around
+300 ms — the documented escape hatches are an API-side cache for the
+unfiltered counts and a materialized `facet_counts`.
 
 ## Deployment
 
@@ -193,7 +286,7 @@ Railway gotchas (verified 2026-08-27):
 
 ## Roadmap
 
-- ALG-619 — data model & collections registry (migrations, `ingest_state`)
+- ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
 - ALG-620 — freeze v1 API contract (OpenAPI) + mock server for Explorer
 - ALG-621 — DAS backfill (assets, attributes, owners)
 - ALG-622 — historical activity backfill (archival API)

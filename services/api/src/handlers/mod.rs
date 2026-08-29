@@ -5,7 +5,7 @@ use actix_web::{web, HttpResponse};
 // Route registration lives here (not inline in main) so tests can build the
 // identical route table via `App::new().configure(handlers::configure)`.
 pub fn configure(cfg: &mut web::ServiceConfig) {
-    cfg.service(health::health);
+    cfg.service(health::health).service(health::ready);
 }
 
 pub async fn not_found() -> HttpResponse {
