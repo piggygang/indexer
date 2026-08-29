@@ -22,11 +22,13 @@ pub mod seed;
 pub mod synth;
 pub mod types;
 
-use std::time::Duration;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use sqlx::migrate::Migrator;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
+use sqlx::Connection;
 
 pub use sqlx::PgPool;
 
@@ -34,17 +36,54 @@ pub use sqlx::PgPool;
 /// `indexer-admin migrate`.
 pub static MIGRATOR: Migrator = sqlx::migrate!();
 
+const UNRESOLVED_REFERENCE: &str = "DATABASE_URL still contains an unresolved Railway reference \
+(`${{…}}`) — set the variable to exactly `${{Postgres.DATABASE_URL}}`, nothing before or after it";
+
+/// Validates `DATABASE_URL` before any connection attempt. Misconfigurations
+/// that can never succeed fail immediately with a message naming the fix,
+/// instead of burning the boot retry budget: an unresolved Railway
+/// reference, or a `localhost` host inside a Railway container. Error
+/// messages never include the password.
+pub fn check_database_url(url: &str, on_railway: bool) -> anyhow::Result<PgConnectOptions> {
+    if url.contains("${{") {
+        return Err(anyhow::Error::msg(UNRESOLVED_REFERENCE));
+    }
+    let options = PgConnectOptions::from_str(url)
+        .context("DATABASE_URL is not a valid postgres:// URL (see .env.example)")?;
+    let host = options.get_host();
+    if on_railway && matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        anyhow::bail!(
+            "DATABASE_URL points at {host}:{} inside a Railway container — set it to exactly \
+             `${{{{Postgres.DATABASE_URL}}}}` (the Postgres service's private-network URL)",
+            options.get_port()
+        );
+    }
+    Ok(options)
+}
+
+/// `host:port/database as user` — what the boot log prints; never the password.
+pub fn describe_database_target(options: &PgConnectOptions) -> String {
+    format!(
+        "{}:{}/{} as {}",
+        options.get_host(),
+        options.get_port(),
+        options.get_database().unwrap_or("<default>"),
+        options.get_username()
+    )
+}
+
 /// Eager connect: fails fast when Postgres is unreachable, which is what a
-/// service wants at boot.
+/// CLI wants.
 pub async fn connect(
     url: &str,
     max_connections: u32,
     connect_timeout: Duration,
 ) -> anyhow::Result<PgPool> {
+    let options = check_database_url(url, false)?;
     PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(connect_timeout)
-        .connect(url)
+        .connect_with(options)
         .await
         .context("connecting to DATABASE_URL")
 }
@@ -89,29 +128,51 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     migrator.run(pool).await.context("running migrations")
 }
 
-/// [`connect`] with bounded retries for boot time: a Postgres restart or a
-/// brief network blip must not turn into a crash loop under Railway's
-/// ON_FAILURE restart policy, while a genuinely bad URL still fails within
-/// `give_up_after`. Migration failures are never retried.
+/// Boot-time connect with bounded retries: a Postgres restart or a brief
+/// network blip must not turn into a crash loop under Railway's ON_FAILURE
+/// restart policy, while a genuinely bad URL still fails within
+/// `give_up_after`. The target is logged first (sanitized), each attempt is
+/// a direct connection so the warning carries the real cause ("Connection
+/// refused", DNS, auth) rather than the pool's acquire timeout, and URLs that
+/// can never work are rejected without retrying. Migration failures are
+/// never retried.
 pub async fn connect_with_retry(
     url: &str,
     max_connections: u32,
     connect_timeout: Duration,
     give_up_after: Duration,
 ) -> anyhow::Result<PgPool> {
-    let started = std::time::Instant::now();
+    let on_railway = std::env::var_os("RAILWAY_ENVIRONMENT").is_some();
+    let options = check_database_url(url, on_railway)?;
+    let target = describe_database_target(&options);
+    log::info!("database target: {target}");
+
+    let started = Instant::now();
     let mut delay = Duration::from_secs(1);
     loop {
-        match connect(url, max_connections, connect_timeout).await {
-            Ok(pool) => return Ok(pool),
-            Err(e) if started.elapsed() + delay < give_up_after => {
-                log::warn!("database not reachable ({e:#}); retrying in {delay:?}");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(10));
-            }
-            Err(e) => return Err(e),
+        let error =
+            match tokio::time::timeout(connect_timeout, PgConnection::connect_with(&options)).await
+            {
+                Ok(Ok(conn)) => {
+                    let _ = conn.close().await;
+                    break;
+                }
+                Ok(Err(e)) => anyhow::Error::new(e),
+                Err(_) => anyhow::anyhow!("connect timed out after {connect_timeout:?}"),
+            };
+        if started.elapsed() + delay >= give_up_after {
+            return Err(error.context(format!("connecting to {target}")));
         }
+        log::warn!("database not reachable ({error:#}); retrying in {delay:?}");
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_secs(10));
     }
+    // The probe proved reachability; the pool connects on first use (the
+    // migration step right after boot).
+    Ok(PgPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(connect_timeout)
+        .connect_lazy_with(options))
 }
 
 /// `/ready` probe: `SELECT 1` bounded by a timeout.
@@ -134,4 +195,72 @@ pub async fn touch_assets_for_bench(pool: &PgPool, collection_id: i32) -> sqlx::
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LOCAL: &str = "postgres://postgres:secret-pw@localhost:5433/piggygang_indexer";
+
+    #[test]
+    fn rejects_unresolved_railway_reference() {
+        let url = LOCAL.to_string() + "${{Postgres.DATABASE_URL}}";
+        let msg = check_database_url(&url, true).unwrap_err().to_string();
+        assert!(msg.contains("unresolved"), "{msg}");
+        assert!(!msg.contains("secret-pw"));
+        // Also rejected off Railway (the admin CLI path).
+        assert!(check_database_url(&url, false).is_err());
+    }
+
+    #[test]
+    fn rejects_localhost_inside_railway() {
+        let msg = check_database_url(LOCAL, true).unwrap_err().to_string();
+        assert!(msg.contains("localhost:5433"), "{msg}");
+        assert!(msg.contains("${{Postgres.DATABASE_URL}}"), "{msg}");
+        assert!(!msg.contains("secret-pw"));
+    }
+
+    #[test]
+    fn accepts_localhost_locally_and_describes_without_password() {
+        let options = check_database_url(LOCAL, false).unwrap();
+        assert_eq!(
+            describe_database_target(&options),
+            "localhost:5433/piggygang_indexer as postgres"
+        );
+        let remote = check_database_url(
+            "postgres://postgres:pw@postgres.railway.internal:5432/railway",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            describe_database_target(&remote),
+            "postgres.railway.internal:5432/railway as postgres"
+        );
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        let msg = check_database_url("not a url", false)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("not a valid postgres:// URL"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_with_the_real_cause() {
+        // Port 1 is closed: the probe fails immediately, the budget of 1 s
+        // is exhausted before the first sleep, and the cause is preserved.
+        let err = connect_with_retry(
+            "postgres://x:y@127.0.0.1:1/x",
+            1,
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("connecting to 127.0.0.1:1/x as x"), "{msg}");
+        assert!(msg.to_lowercase().contains("refused"), "{msg}");
+    }
 }
