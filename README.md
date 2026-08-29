@@ -267,6 +267,26 @@ Railway gotchas (verified 2026-08-27):
 - Service variables reach the Docker build **only when the Dockerfile declares
   a matching `ARG`**.
 
+### Deploy troubleshooting
+
+The API boots by validating `DATABASE_URL`, logging the sanitized target
+(`database target: <host>:<port>/<db> as <user>`), retrying connectivity for
+up to 60 s and then running migrations; a failing migration is fatal on
+purpose. Reading the log:
+
+- Exits immediately with *unresolved Railway reference* or *points at
+  localhost inside a Railway container* → the service variable is wrong. It
+  must be exactly `${{Postgres.DATABASE_URL}}` — not the `.env.example` value
+  with the reference appended, which is what produced
+  `postgres://…@localhost:5433/piggygang_indexer${{…}}` on the first deploy.
+- `database not reachable (Connection refused …)` against
+  `postgres.railway.internal` → Postgres is down, or in another environment
+  than the `api` service.
+- `failed to lookup address` → private networking / DNS not ready; the retry
+  covers Railway's start-up delay.
+- Keep `RUST_LOG=info` in production: `debug` logs every SQL statement,
+  including the full migration bodies.
+
 ### One-time bootstrap
 
 1. Install the Railway GitHub App on the `piggygang` org (access to
