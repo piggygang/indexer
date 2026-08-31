@@ -90,8 +90,9 @@ services/
 ```
 
 Future member (the workspace globs already cover it): `services/ingester`
-(ALG-623). `railway.api.json` deliberately does not watch `config/**` or
-`services/admin/**` — neither is part of the API image.
+(ALG-623). The `api` service deliberately does not watch `config/**` or
+`services/admin/**` — neither is part of the API image. The `admin` service
+watches both, because the registry seed ships inside *its* image.
 
 ### The ingest abstraction
 
@@ -151,7 +152,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `HOST` | no | `::` | dual-stack bind; Railway private networking needs the IPv6 bind |
 | `RUST_LOG` | no | `info` | |
 | `HELIUS_API_KEY` | not yet | — | required by ingest/backfill work (ALG-621/623) |
-| `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}`; the seed runs from a workstation against `DATABASE_PUBLIC_URL` |
+| `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
 
@@ -243,27 +244,156 @@ unfiltered counts and a materialized `facet_counts`.
 
 ## Deployment
 
-Railway, config-as-code in `railway.api.json` (builder, healthcheck, restart
-policy, region). Flow: push to `main` → GitHub Actions CI → Railway (**Wait
-for CI** enabled) builds the Dockerfile → `/health` must return 200 → traffic
-cutover. Rollback: `git revert` + push, or dashboard → previous deployment →
-Redeploy.
+Railway, project config in `.railway/railway.ts` (Infrastructure-as-Code).
+Flow: push to `main` → GitHub Actions CI → Railway (**Wait for CI** enabled)
+builds the Dockerfile → `/health` must return 200 → traffic cutover. Rollback:
+`git revert` + push, or dashboard → previous deployment → Redeploy.
+
+### Services
+
+| Service | Binary | Start | Healthcheck | Why it exists |
+|---|---|---|---|---|
+| `api` | `indexer-api` (default `BIN`) | image `CMD` | `/health`, 120 s | serves traffic |
+| `admin` | `indexer-admin` (`BIN=indexer-admin`) | idles — see below | none | a container to `railway ssh` into and run `migrate` / `seed` against Postgres over the private network |
 
 **Deployment contract:** the Dockerfile builds workspace binary
-`${BIN}` (default `indexer-api`) and runs it as `app`; the process
-must listen on `[::]:$PORT`; `RAILWAY_GIT_COMMIT_SHA` is passed as a build arg
-and baked into `/health` as `commit`. The future ingester service reuses the
-same Dockerfile with service variable `BIN=indexer-ingester` and its
-own `railway.ingester.json` (`restartPolicyType: ALWAYS`, no healthcheck).
+`${BIN}` (default `indexer-api`) and installs it under **its own name** at
+`/usr/local/bin/${BIN}`, running as the unprivileged `app` user. The image
+records the choice in `APP_BIN` and its `CMD` is
+`/bin/sh -c 'exec "$APP_BIN"'`, because an exec-form `CMD` cannot expand a
+build arg; `exec` hands PID 1 to the binary. There is deliberately **no
+`ENTRYPOINT`** — a Railway start command replaces the ENTRYPOINT, and whether
+an image `CMD` is then appended as arguments is undocumented. A service that
+serves traffic must listen on `[::]:$PORT`; `RAILWAY_GIT_COMMIT_SHA` is passed
+as a build arg and baked into `/health` as `commit`. The future ingester service
+reuses the same Dockerfile with service variable `BIN=indexer-ingester` and
+becomes a third `service()` in `.railway/railway.ts` (no healthcheck, restart
+policy `ALWAYS`).
 
-Railway gotchas (verified 2026-08-27):
+The `admin` container idles on purpose. `indexer-admin` is a CLI with a
+*required* subcommand, so the image's default `CMD` would exit 2 immediately and
+leave nothing to attach to. Its start command is
+
+```sh
+/bin/sh -c "trap 'exit 0' TERM INT; sleep infinity & wait"
+```
+
+Railway runs a start command **in exec form** — it replaces the image's
+ENTRYPOINT and gets no shell, so `trap`, `&` and `$VAR` only work inside an
+explicit `/bin/sh -c` wrapper. The trap matters because a bare `sleep infinity`
+becomes PID 1, has no signal handler, and per `pid_namespaces(7)` ignores
+SIGTERM, so every redeploy would wait out the grace period and SIGKILL. If the
+quoting ever misbehaves, `/bin/sh -c "exec sleep infinity"` is the simpler
+fallback (at the cost of that slower shutdown). `admin` has **no healthcheck** and **no
+domain**: with `healthcheckPath` unset a deployment goes Active as soon as the
+container starts, which is exactly what a service that never binds `$PORT`
+needs. It costs roughly $0.15–$0.25/month idle.
+
+`config/` ships in the **admin image only** — the builder stages it behind a
+`${BIN}` check and the runtime overlays `/app/dist` onto `/app`, so the api
+image stays config-free. CI asserts the `${BIN}` literal still matches
+`services/admin/Cargo.toml`, because a package rename would otherwise produce a
+green build whose `seed` fails only at run time.
+
+### Infrastructure-as-Code
+
+Railway **deprecated config-as-code**: new services cannot opt into
+`railway.json`/`railway.toml`, and existing files stop being read on
+**2026-12-01**. Project config therefore lives in `.railway/railway.ts`.
+
+Prerequisites: **Node ≥ 22** (the CLI evaluates the file with
+`node --experimental-strip-types`, added in 22.6) and the SDK installed at the
+repo root — `npm install railway` — because the CLI resolves `railway/iac` from
+`node_modules` rather than injecting it. `package.json`/`package-lock.json` are
+committed for that reason; the Rust workspace has no Node runtime dependency.
+
+```sh
+railway config pull                          # live project → authoring code
+railway config plan --detailed-exit-code     # read-only; 0 = no drift, 2 = pending
+railway config apply --plan <pinned> --yes
+```
+
+**Always author `railway.ts` from `railway config pull`, never by hand and
+never from `railway config migrate`.** IaC treats omission as deletion, so a
+file that does not mention the Postgres service invites the reconciler to delete
+Postgres *and its volume*; `pull` imports the whole project, secrets included as
+`preserve()`. Before any `apply`, read the plan and abort on any
+`delete`/`replace`/`recreate`, on any change under `Postgres`, or on any removal
+of `HELIUS_API_KEY`. **Never pass `--confirm-destructive`** — needing it is the
+abort signal, and usually means a service name's casing is wrong
+(`Postgres`, not `postgres`).
+
+Secrets stay in Railway: render them as `preserve()`, never as literals in
+`railway.ts`. `.railway/` and `node_modules/` are dockerignored so the IaC
+toolchain never enters the build context (both `COPY . .` stages would
+otherwise bust the cargo-chef layer on every edit).
+
+### The IaC option surface
+
+`docs.railway.com/infrastructure-as-code/reference` documents only a subset —
+it omits `build.builder`, `build.dockerfilePath`, `build.watchPatterns`, the
+whole `deploy` block (restart policy, cron, `sleepApplication`, limit
+overrides), `networking`, and `github(..., { checkSuites })`. **The
+authoritative surface is the bundled type declarations in the `railway` npm
+package** (`IntentServiceConfig` in `node_modules/railway/dist/`). Read those,
+not the website, before concluding something must be set by hand — there are
+currently **no dashboard-only settings** for this project.
+
+Two more places the docs mislead:
+
+- **Regions.** The IaC reference's example key is `europe-west4`, which is not a
+  valid region id. `railway config pull` round-trips the short code — this
+  project uses `ams`. The SDK does not validate region strings (`BucketRegion`
+  is the only region union), so a wrong one type-checks and fails at apply.
+- **Wait for CI** is `source: github(repo, { checkSuites: true })`.
+
+Watch patterns matter more than they look: without them **every push rebuilds
+every service**, including README-only commits, and an `admin` rebuild tears
+down an SSH session mid-command. Railway's build cache is per service, so
+`admin`'s first build recompiles the whole dependency graph.
+
+### Operating the admin service
+
+```sh
+railway ssh keys add --key ~/.ssh/id_ed25519.pub --name "laptop"   # once per account
+railway ssh --service admin -- indexer-admin migrate
+railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml --dry-run
+railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml
+railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml --expect-unchanged
+```
+
+Pass `--config` as an **absolute path** so nothing depends on where the SSH
+session lands, and prefer this non-interactive form: `railway ssh --session`
+auto-installs tmux, which will not work here (the container runs as uid 10001
+and apt lists are removed), and without tmux a dropped connection SIGHUPs the
+command. That is safe — `seed` is a single transaction and idempotent, so an
+interrupted run rolls back cleanly — but you would have to re-run it blind.
+
+**Never run bare `indexer-admin bench` against production:** with no `--slug`
+it seeds three synthetic `bench-*` collections into the live database, and
+unlike `seed` it is not one transaction. Use
+`indexer-admin bench --slug piggy-sol-gang`, and `indexer-admin bench --clean`
+to remove bench data. Never `--dirty` on production.
+
+Railway gotchas (verified 2026-08-30):
 
 - The healthcheck **gates deploys only** — it is not uptime monitoring. Add an
   external pinger for real alerting (ALG-628).
 - **Wait for CI waits on ALL GitHub check suites** — a stray failing
   third-party check silently blocks deploys.
-- The per-service **config file path** is set in the Railway dashboard and is
-  absolute from repo root.
+- **Config-as-code is deprecated.** New services cannot use it; existing
+  `railway.json`/`railway.toml` stop being read on **2026-12-01**. Use
+  `.railway/railway.ts`, and see the IaC warnings above before any `apply`.
+- **IaC omission means deletion** — a resource missing from `railway.ts` is a
+  deletion candidate, Postgres and its volume included.
+- **A config file's settings are never written back to the dashboard** — "the
+  settings in the dashboard will not be updated with the settings defined in
+  code". So a service migrating off `railway.json` must have those settings
+  authored in `railway.ts` (or entered by hand) *before* the file is dropped.
+- **The IaC docs are an incomplete subset** of the SDK's real option surface,
+  and their region example is wrong. Trust the bundled `.d.ts`, not the website.
+- **Node ≥ 22 is required** to evaluate `railway.ts`; on Node 20 the CLI fails
+  with `node: bad option: --experimental-strip-types`.
 - Service variables reach the Docker build **only when the Dockerfile declares
   a matching `ARG`**.
 
@@ -296,13 +426,57 @@ purpose. Reading the log:
    provisioning Postgres — volumes are region-pinned.
 4. `railway add --database postgres` (confirm it landed in Amsterdam).
 5. `railway add --repo piggygang/indexer`; in the dashboard: rename the
-   service `api`, set Config file path `railway.api.json`, branch `main`,
-   enable **Wait for CI**, confirm region.
+   service `api`, branch `main`, enable **Wait for CI**, set Watch Paths,
+   confirm region.
 6. Variables on `api`: `HELIUS_API_KEY`, `DATABASE_URL=${{Postgres.DATABASE_URL}}`,
    `RUST_LOG=info`.
 7. Push → CI green → build → healthcheck → ACTIVE. `railway domain --service
    api`, then `curl https://<domain>/health`.
 8. `railway link` in the repo dir (enables `railway logs` / `railway ssh`).
+
+### Adding the `admin` service
+
+Done once, on top of the bootstrap above. Snapshot first — `railway variables
+--service api` and `--service Postgres` to a directory **outside the repo**, and
+confirm a recent Postgres backup exists.
+
+1. `nvm use 24` (or newer) and `npm install railway`, then `railway config pull`
+   to baseline the live project as code.
+2. Add the `admin` service to `.railway/railway.ts` and author the settings the
+   old `railway.api.json` supplied onto `api` — `build.builder`/`dockerfilePath`/
+   `watchPatterns`, `healthcheck`, `healthcheckTimeout`, `deploy.restartPolicyType`
+   and `restartPolicyMaxRetries`. Leave the Postgres and volume blocks
+   byte-identical to what `pull` produced.
+3. `railway config plan --out <file>`, read every line against the abort list in
+   **Infrastructure-as-Code** above, then
+   `railway config apply --plan <file> --yes`. Apply **before** touching the
+   config-file setting: until this runs, the api's builder, watch patterns,
+   healthcheck and restart policy are `null` in its stored settings.
+4. Dashboard → `api` → Settings → **clear the Config file path**, then delete
+   `railway.api.json` and push. A service managed by `railway.json` cannot also
+   be managed by `railway.ts`.
+5. Verify: `railway ssh --service admin -- indexer-admin --version`,
+   `-- ls /app/config/seeds`, and that `DATABASE_URL` resolves to
+   `postgres.railway.internal` (not `proxy.rlwy.net`, not a literal `${{…}}`).
+   Then run `migrate` and `seed` per **Operating the admin service**.
+
+#### Retiring `railway.api.json`
+
+The repo no longer carries a config-as-code file; `.railway/railway.ts` is the
+single source of truth. Railway **never writes config-file values back into the
+dashboard**, so everything that file supplied had to be re-authored — in
+`railway.ts`, since the SDK can express all of it — before the file was deleted.
+Order, per service:
+
+1. Author the settings in `railway.ts` and `railway config apply` them. Do this
+   first: `railway config plan` against this project showed every one of those
+   api settings as `null`, i.e. they lived only in the file and never reached
+   the service's stored settings.
+2. Clear the service's **Config file path** in the dashboard. A service managed
+   by `railway.json` cannot also be managed by `railway.ts`, and what Railway
+   does with a path pointing at a *missing* file is undocumented — so the path
+   is cleared before the file is deleted, never after.
+3. Delete the file and push.
 
 ## Roadmap
 

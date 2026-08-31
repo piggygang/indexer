@@ -12,4 +12,11 @@ target/
 README.md
 CLAUDE.md
 docker-compose.yml
-railway.*.json
+# Railway IaC authoring (.railway/railway.ts) and its npm toolchain. Railway
+# reads the config from the git repo, not the build context, so excluding it is
+# safe. Keeping node_modules out matters: both COPY . . stages would otherwise
+# bust the cargo-chef layer on every edit.
+node_modules/
+package.json
+package-lock.json
+.railway/

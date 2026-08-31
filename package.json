@@ -1,0 +1,9 @@
+{
+  "name": "indexer-railway-config",
+  "private": true,
+  "description": "Type surface for .railway/railway.ts only — the Rust workspace has no Node runtime dependency.",
+  "dependencies": {
+    "railway": "^3.11.0"
+  },
+  "type": "module"
+}
