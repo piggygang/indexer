@@ -35,6 +35,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The Dockerfile stages config/ into the admin image with a literal
+      # `${BIN}` = "indexer-admin" compare. A package rename would otherwise
+      # produce a green build whose `seed` fails only at run time.
+      - name: Dockerfile config staging matches the admin package name
+        run: |
+          grep -qF 'name = "indexer-admin"' services/admin/Cargo.toml
+          grep -qF '"${BIN}" = "indexer-admin"' Dockerfile
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # DB tests are #[ignore]d so a laptop without Postgres stays green;

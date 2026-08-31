@@ -72,6 +72,19 @@ pub fn describe_database_target(options: &PgConnectOptions) -> String {
     )
 }
 
+/// True inside a Railway container. `RAILWAY_ENVIRONMENT` is a legacy alias
+/// that is no longer in Railway's documented variable reference, so the
+/// documented names are checked too — this guard must never fail open.
+fn on_railway() -> bool {
+    [
+        "RAILWAY_ENVIRONMENT",
+        "RAILWAY_ENVIRONMENT_NAME",
+        "RAILWAY_SERVICE_ID",
+    ]
+    .iter()
+    .any(|k| std::env::var_os(k).is_some())
+}
+
 /// Eager connect: fails fast when Postgres is unreachable, which is what a
 /// CLI wants.
 pub async fn connect(
@@ -79,7 +92,8 @@ pub async fn connect(
     max_connections: u32,
     connect_timeout: Duration,
 ) -> anyhow::Result<PgPool> {
-    let options = check_database_url(url, false)?;
+    let options = check_database_url(url, on_railway())?;
+    log::info!("database target: {}", describe_database_target(&options));
     PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(connect_timeout)
@@ -142,8 +156,7 @@ pub async fn connect_with_retry(
     connect_timeout: Duration,
     give_up_after: Duration,
 ) -> anyhow::Result<PgPool> {
-    let on_railway = std::env::var_os("RAILWAY_ENVIRONMENT").is_some();
-    let options = check_database_url(url, on_railway)?;
+    let options = check_database_url(url, on_railway())?;
     let target = describe_database_target(&options);
     log::info!("database target: {target}");
 
@@ -209,7 +222,7 @@ mod tests {
         let msg = check_database_url(&url, true).unwrap_err().to_string();
         assert!(msg.contains("unresolved"), "{msg}");
         assert!(!msg.contains("secret-pw"));
-        // Also rejected off Railway (the admin CLI path).
+        // Also rejected with on_railway = false.
         assert!(check_database_url(&url, false).is_err());
     }
 
