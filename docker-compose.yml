@@ -17,5 +17,42 @@ services:
       timeout: 5s
       retries: 5
 
+  # Prism mock of the frozen v1 contract (ALG-620), so piggygang-explorer
+  # (ALG-630) can be built before the API exists.
+  #
+  # Profiled, so a bare `docker compose up -d` still starts only Postgres.
+  # Compose enables a profile automatically when the service is named, so
+  # `docker compose up -d mock` is all the Explorer team needs.
+  mock:
+    image: stoplight/prism:5.15.10
+    # Every published tag is linux/amd64 only; declared so Apple Silicon
+    # emulates it deterministically instead of failing on the manifest.
+    platform: linux/amd64
+    container_name: piggygang-indexer-mock
+    profiles: ["mock"]
+    # -h 0.0.0.0: Prism defaults to the container's loopback, which would make
+    #   the published port unreachable from the host.
+    # --errors: turn request violations into 4xx instead of a happy 200, so the
+    #   Explorer finds its own bugs at build time.
+    # No --dynamic: static mode serves the hand-written examples. The faker
+    #   would emit random junk for base58 addresses and incoherent counts.
+    # --no-multiprocess: the image sets NODE_ENV=production, which makes Prism
+    #   default -m on, and its cluster path crashes on this image's Node with
+    #   "Cannot read properties of undefined (reading 'isPrimary')".
+    command: ["mock", "-h", "0.0.0.0", "-p", "4010", "--errors", "--no-multiprocess", "/openapi/v1.yaml"]
+    volumes:
+      # Read-only bind rather than a copy: Prism reloads on save, so editing
+      # the contract re-serves it without a restart.
+      - ./openapi:/openapi:ro
+    # 4010 is Prism's own default and collides with nothing here (Postgres is
+    # on 5433, indexer-api on 8080).
+    ports:
+      - "4010:4010"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:4010/v1/collections"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:

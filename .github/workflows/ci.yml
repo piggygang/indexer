@@ -52,3 +52,45 @@ jobs:
           cargo run -p indexer-admin -- migrate
           cargo run -p indexer-admin -- seed
           cargo run -p indexer-admin -- seed --expect-unchanged
+
+  # The frozen v1 API contract (ALG-620). A separate job with no `needs:`, so it
+  # runs in parallel with `check` and adds no wall-clock time — `check` compiles
+  # the workspace and runs migrations, this lints one YAML file.
+  #
+  # Kept in THIS workflow rather than a new file on purpose: Railway waits on
+  # the commit's check suites, and one workflow is one suite. A second workflow
+  # would create a second suite. Note the consequence: a spec-only lint failure
+  # now blocks production deploys of unrelated Rust changes.
+  openapi:
+    runs-on: ubuntu-latest
+    env:
+      REDOCLY_TELEMETRY: "off"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.19.0"
+      # Lint proves the document is valid OpenAPI and that every example still
+      # matches its schema — Prism serves those examples verbatim to the
+      # Explorer, so a drifted example is a silently wrong mock.
+      - name: Lint the frozen v1 contract
+        run: npx --yes @redocly/cli@2.49.0 lint --config openapi/redocly.yaml
+      # Lint cannot see whether Prism can actually serve the document. This can:
+      # it boots the mock and exercises the shapes the Explorer depends on,
+      # including a bracketed trait filter, which OpenAPI leaves undefined for
+      # deepObject and which no linter validates.
+      - name: Mock server boots and serves the contract
+        run: |
+          npx --yes @stoplight/prism-cli@5.15.10 mock \
+            -h 127.0.0.1 -p 4010 --errors --no-multiprocess openapi/v1.yaml &
+          for _ in $(seq 1 40); do
+            curl -sf http://127.0.0.1:4010/v1/collections >/dev/null && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:4010/v1/collections | grep -q piggy-sol-gang
+          curl -sf http://127.0.0.1:4010/v1/collections/piggy-sol-gang/facets >/dev/null
+          curl -sf 'http://127.0.0.1:4010/v1/collections/piggy-sol-gang/nfts?trait%5BHead%5D=Crown&sort=-activity' >/dev/null
+      # The Explorer (ALG-630) generates its typed client from this file; if
+      # codegen breaks, the contract is not usable no matter how valid it is.
+      - name: Contract generates a TypeScript client
+        run: npx --yes openapi-typescript@7 openapi/v1.yaml -o /tmp/api.gen.ts

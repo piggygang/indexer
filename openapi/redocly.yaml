@@ -1,0 +1,39 @@
+# Lint config for the frozen v1 contract (ALG-620). Kept beside the spec so
+# `openapi/` is self-contained and one .dockerignore entry covers both.
+apis:
+  v1:
+    root: v1.yaml
+
+extends:
+  - recommended
+
+rules:
+  # Prism serves these examples verbatim to the Explorer (ALG-630), so an
+  # example that has drifted from its schema is a silently wrong mock that the
+  # Explorer then builds against. Error, not the recommended default of warn.
+  # The rule defaults to allowAdditionalProperties: false, which applies
+  # unevaluatedProperties semantics that no validator here resolves across
+  # `allOf` + `$ref` — it would reject every field of an allOf-composed example.
+  # Types, patterns, enums, required and the if/then constraints are all still
+  # checked, which is what keeps the mock honest.
+  no-invalid-media-type-examples:
+    severity: error
+    allowAdditionalProperties: true
+  no-invalid-schema-examples: error
+  no-invalid-parameter-examples: error
+
+  # Every operation documents its failure paths and has a stable operationId
+  # (the Explorer's generated client names its methods from it).
+  operation-4xx-response: error
+  operation-operationId: error
+
+  # Proprietary internal API with no license file; `security: []` at the
+  # document root is the deliberate "public and unauthenticated" declaration,
+  # so security-defined stays at its recommended severity on purpose.
+  info-license: off
+  info-license-strict: off
+
+  # The localhost servers are the point, not an oversight: ALG-630 switches the
+  # Explorer between the Prism mock and production with a single env var, so
+  # both URLs are part of the contract.
+  no-server-example.com: off

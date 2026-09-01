@@ -80,6 +80,8 @@ runtime image, distroless-ready.
 config/
   collections.toml   the collections/tokens registry seed — the ONLY home of on-chain addresses
   seeds/*.mints.json closed mint lists for Token Metadata collections without a certified collection
+openapi/
+  v1.yaml            the frozen v1 API contract (ALG-620); redocly.yaml lints it
 crates/
   config/      indexer-config — env config, fail-fast validation
   data-model/  indexer-data-model — Postgres migrations, registry, seed, ingest cursors, facet queries
@@ -162,6 +164,83 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
   `{"status":"ok","service":"indexer-api","version":"0.1.0","commit":"<git sha>"}`
 - `GET /ready` — readiness: `SELECT 1` with a 2 s bound → `200 {"status":"ready"}`
   or `503 {"status":"unavailable","reason":…}`. Outside `/v1` and outside the API contract.
+
+## API contract (ALG-620)
+
+`openapi/v1.yaml` is the **frozen** v1 contract — OpenAPI 3.1, hand-written.
+ALG-625/626 implement it; the Explorer (ALG-630) generates its typed client from
+it and develops against the mock. The schema serves the contract, never the
+reverse. `/health` and `/ready` are deliberately outside it.
+
+- `GET /v1/collections` · `GET /v1/collections/{slug}` — the registry plus
+  `stats` (supply, holders, burned, indexed, 24h/7d activity, holder cohorts).
+- `GET /v1/collections/{slug}/nfts` — the browse grid: `trait[Type]=Value`
+  filters, `q`, `sort`, keyset `cursor`.
+- `GET /v1/collections/{slug}/facets` — disjunctive trait counts plus `total`,
+  the size of the filtered result set.
+- `GET /v1/collections/{slug}/holders` · `/activity` — top holders; recent
+  events, newest first, each carrying its NFT card.
+- `GET /v1/nfts/{id}` · `/activity` · `/owners` — detail, timeline, ownership
+  history. `{id}` is the base58 mint or Core asset address; internal ids are
+  never exposed.
+- `GET /v1/wallets/{address}/nfts` — portfolio grouped by collection. An unknown
+  wallet is `200` with an empty portfolio, never `404`.
+- `GET /v1/search` — smart search: a pasted mint or wallet resolves to a `route`;
+  text and `#N` return hits grouped by collection.
+
+Conventions: JSON fields are **camelCase**, enum *values* are the Postgres CHECK
+literals (`token_metadata`, `mint`, `dead`); every property is present, with
+explicit `null` rather than omission; keyset cursors are opaque and there is no
+`total` on a page (the filtered count is `facets.total`); `priceLamports` is a
+decimal **string** and `slot` a number; `X-RateLimit-*` and weak `ETag`s
+throughout. Rarity fields exist but are `null` until ALG-627 — freezing them now
+means that issue does not have to break a frozen contract.
+
+### Mock server
+
+```sh
+docker compose up -d mock                        # Prism on :4010
+curl -s localhost:4010/v1/collections | jq
+curl -s -H 'Prefer: example=empty' localhost:4010/v1/collections/piggy-sol-gang/nfts
+curl -s -H 'Prefer: code=429' localhost:4010/v1/collections
+```
+
+Static mode, so responses are the hand-written examples: real slugs, names,
+symbols and supplies, but **synthetic** addresses (`SYN…`/`HLD…`/`Sgn…`) — real
+on-chain addresses live only in `config/`. The browse example deliberately
+includes a burned pig and an unnumbered one so the Explorer can build the greyed
+and fallback card states. Named examples (`empty`, `lastPage`, `emptyWallet`,
+`byMint`, `byWallet`, `nothing`) and `Prefer: code=<status>` cover the rest.
+
+### One client-side caveat
+
+OpenAPI leaves `deepObject` with array values undefined, and **openapi-fetch's
+default query serializer throws** on the `trait` parameter. Supply one:
+
+```ts
+createClient<paths>({
+  baseUrl: process.env.NEXT_PUBLIC_INDEXER_URL,   // mock: http://localhost:4010
+  querySerializer(q) {
+    const parts: string[] = [];
+    for (const [k, v] of Object.entries(q ?? {})) {
+      if (v == null) continue;
+      if (k === "trait") {
+        for (const [type, values] of Object.entries(v as Record<string, string[]>))
+          for (const value of values)
+            parts.push(`trait[${encodeURIComponent(type)}]=${encodeURIComponent(value)}`);
+      } else if (Array.isArray(v)) {
+        for (const item of v) parts.push(`${k}=${encodeURIComponent(String(item))}`);
+      } else {
+        parts.push(`${k}=${encodeURIComponent(String(v))}`);
+      }
+    }
+    return parts.join("&");
+  },
+});
+```
+
+Prism ignores `trait` entirely, so the mock returns the same page with or
+without it — filter *wiring* is only testable against the real API.
 
 ## Collections registry (ALG-619)
 
@@ -481,7 +560,7 @@ Order, per service:
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
-- ALG-620 — freeze v1 API contract (OpenAPI) + mock server for Explorer
+- ALG-620 — freeze v1 API contract (OpenAPI) + mock server for Explorer — done
 - ALG-621 — DAS backfill (assets, attributes, owners)
 - ALG-622 — historical activity backfill (archival API)
 - ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service
