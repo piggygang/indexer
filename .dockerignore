@@ -20,3 +20,8 @@ node_modules/
 package.json
 package-lock.json
 .railway/
+# The frozen v1 contract and its lint config are build ARTIFACTS: the Explorer
+# generates its client from them, Prism bind-mounts them from the host, and CI
+# lints them from the checkout. Nothing in either image reads them, and leaving
+# them in the context would bust the builder's `COPY . .` on every spec edit.
+openapi/
