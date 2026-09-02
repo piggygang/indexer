@@ -43,6 +43,29 @@ pub enum MembershipRule {
     TmAllowlist,
 }
 
+/// Reachability of `assets.image_uri` — the API contract's `imageStatus`
+/// enum. Written only by the opt-in image pass (`backfill --check-images`);
+/// the asset backfill leaves it [`ImageStatus::Unknown`], which the contract
+/// defines as "not checked, load optimistically".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
+pub enum ImageStatus {
+    Unknown,
+    Ok,
+    Dead,
+}
+
+impl ImageStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Ok => "ok",
+            Self::Dead => "dead",
+        }
+    }
+}
+
 /// Activity event kinds. The API serves [`EventKind::PUBLIC`]; the rest are
 /// stored so the classifier (ALG-622) needs no migration for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]

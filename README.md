@@ -131,6 +131,7 @@ docker compose up -d                        # Postgres 17.6 on localhost:5433
 cp .env.example .env                        # DATABASE_URL points at it; fill HELIUS_API_KEY when needed
 cargo run -p indexer-admin -- migrate       # apply migrations (the API also does this at boot)
 cargo run -p indexer-admin -- seed          # registry from config/collections.toml (idempotent)
+cargo run -p indexer-admin -- backfill      # DAS backfill (needs HELIUS_API_KEY; idempotent)
 cargo run -p indexer-api
 curl localhost:8080/health                  # liveness, no DB
 curl localhost:8080/ready                   # readiness: DB ping → 200 / 503
@@ -153,7 +154,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `PORT` | no | `8080` | injected by Railway |
 | `HOST` | no | `::` | dual-stack bind; Railway private networking needs the IPv6 bind |
 | `RUST_LOG` | no | `info` | |
-| `HELIUS_API_KEY` | not yet | — | required by ingest/backfill work (ALG-621/623) |
+| `HELIUS_API_KEY` | `admin backfill` | — | Helius Developer key. Read only by the subcommand that needs it, so `migrate`/`seed` still run without one; ALG-623 will need it too |
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
@@ -557,11 +558,97 @@ Order, per service:
    is cleared before the file is deleted, never after.
 3. Delete the file and push.
 
+## DAS backfill (ALG-621)
+
+`indexer-admin backfill` fills `assets`, `asset_attributes` and
+`asset_documents` from Helius DAS plus each collection's off-chain metadata.
+It is the first thing that puts real chain state in the database, and
+everything after it (ALG-622/623/624) builds on that baseline.
+
+```sh
+cargo run -p indexer-admin -- backfill --slug piggy-sol-gang --limit 25   # smoke run
+cargo run -p indexer-admin -- backfill                                    # every enabled collection
+cargo run -p indexer-admin -- backfill --check-images                     # opt-in reachability pass
+cargo run -p indexer-admin -- backfill --expect-unchanged                 # proves a re-run changes nothing
+```
+
+**Membership comes from the registry, not from code.** The pass `match`es on
+`collections.membership_rule`: `tm_allowlist` enumerates the committed mint
+list and asks DAS `getAssetBatch` (1 000 ids per call, so the three Piggy
+Token Metadata collections are ~18 calls); `core_collection` and
+`tm_collection` page `searchAssets` by collection address. Adding a collection
+stays one TOML entry plus `seed`.
+
+**Idempotency is structural, not a convention.** Every upsert carries a
+`WHERE … IS DISTINCT FROM …` guard, so an unchanged row produces no tuple and
+never fires the `updated_at` trigger; `--expect-unchanged` exits non-zero if
+anything moved, and `SELECT count(*) FROM assets WHERE updated_at > $t` is the
+independent check. A second pass over an unchanged collection also issues zero
+HTTP requests: a document is re-fetched only when it is missing, or when the
+URI we would fetch today differs from the one recorded in
+`metadata_source_uri`.
+
+That last clause is what makes a dead metadata host recoverable with no code
+change. Pig Mud's on-chain URIs point at the defunct shdw-drive host, so its
+assets, names and owners come from DAS while its attributes stay empty and the
+run reports the gap. Adding a `metadata_uri_template` to `config/collections.toml`
+once the files are re-hosted changes the computed URI, and the next run
+re-fetches and fills in. An asset whose document could not be read is
+deliberately left out of the attribute delete scope, so a failed fetch never
+wipes good data.
+
+**What it does not write.** No `ownership_history`: DAS reports the current
+owner but not the slot at which that ownership began, and stamping the
+snapshot slot would make `/nfts/{id}/owners` claim a pig held since 2021 was
+acquired today. The contract already promises `heldSince: null` until the
+activity backfill (ALG-622) runs, and leaving the table empty keeps ALG-624's
+"empty means healthy" integrity view meaningful. `image_status` is likewise
+untouched unless `--check-images` is passed — the contract defines `unknown`
+as "not checked, load optimistically".
+
+`owner_slot` is stamped from a `getSlot` taken **before** each DAS call, a
+conservative lower bound on the observation, and the writer only advances
+ownership under `EXCLUDED.owner_slot > assets.owner_slot`. The slot alone is
+never a reason to write, or every pass would rewrite every row.
+
+Progress and results are durable in `backfill_state` (`kind = 'das_assets'`),
+so a run's outcome is readable after the fact without scrollback:
+
+```sh
+psql "$DATABASE_URL" -c "SELECT c.slug, s.status, s.progress \
+  FROM backfill_state s JOIN collections c ON c.id = s.collection_id \
+ WHERE s.kind = 'das_assets';"
+```
+
+Ids DAS does not know are counted and sampled into `progress.missing`, never
+invented as rows to make a supply count reconcile.
+
+### Running it on Railway
+
+Not wired up yet, and it needs two changes **in this order**, because IaC
+treats a `preserve()` for a variable that does not exist as a change to
+reconcile:
+
+1. Set `HELIUS_API_KEY` on the `admin` service (dashboard or
+   `railway variables --service admin --set ...`). Today the key exists only
+   on `api`; `preserve()` does not copy a value between services.
+2. Add `HELIUS_API_KEY: preserve()` to the `admin` env block in
+   `.railway/railway.ts`, then `railway config plan`, read every line, then
+   `apply`. Never `--confirm-destructive`.
+
+Also note `DATABASE_MAX_CONNECTIONS = "2"` on `admin`: enough for the backfill,
+which uses one pooled connection at a time, but leaves no headroom if a second
+one-off run overlaps.
+
+```sh
+railway ssh --service admin -- indexer-admin backfill --slug piggy-sol-gang
+```
+
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
 - ALG-620 — freeze v1 API contract (OpenAPI) + mock server for Explorer — done
-- ALG-621 — DAS backfill (assets, attributes, owners)
+- ALG-621 — DAS backfill (assets, attributes, owners) — done
 - ALG-622 — historical activity backfill (archival API)
 - ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service
 - ALG-624 — reconciliation: periodic DAS diff + self-heal

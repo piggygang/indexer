@@ -7,14 +7,23 @@ resolver = "2"
 
 [workspace.dependencies]
 indexer-config = { path = "crates/config" }
+indexer-das = { path = "crates/das" }
 indexer-data-model = { path = "crates/data-model" }
 indexer-ingest = { path = "crates/ingest" }
 
-# Unused entries below are inert version pins for upcoming issues: helius
-# with ALG-621 (DAS backfill), actix-cors with ALG-625 (public API). TLS
-# policy: rustls everywhere — sqlx uses runtime-tokio-rustls; when wiring
-# reqwest/tungstenite, pick their rustls features too (keeps libssl out of
-# the runtime image).
+# actix-cors is an inert version pin for ALG-625 (public API); nothing depends
+# on it yet.
+#
+# TLS policy: rustls everywhere, so no libssl in the runtime image. sqlx uses
+# runtime-tokio-rustls; reqwest's `rustls-tls` expands to
+# `rustls-tls-webpki-roots` -> `__rustls-ring`, which reuses the rustls 0.23 +
+# ring already in Cargo.lock rather than adding a second crypto provider.
+# `cargo tree -d` must keep showing one rustls and one provider. (reqwest 0.13
+# would default to rustls-platform-verifier + aws-lc-rs, hence the 0.12 pin.)
+#
+# ALG-621 deliberately does NOT use the `helius` SDK: it hard-depends on the
+# whole solana-sdk/solana-client tree and defaults to native-tls, for what is
+# a handful of JSON-RPC POSTs. crates/das speaks DAS directly over reqwest.
 actix-cors = "0.7"
 actix-web = "4.11"
 anyhow = "1.0"
@@ -26,8 +35,8 @@ dotenv = "0.15"
 env_logger = "0.11"
 futures-core = "0.3"
 futures-util = "0.3"
-helius = "0.3.2"
 log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "gzip", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate", "macros"] }

@@ -26,6 +26,11 @@ mints = { file = "seeds/piggy-sol-gang.mints.json", count = 10000 }
 # Re-hosted metadata (the original shdw-drive host is dead); {mint} = the
 # mint address. Used by the backfill instead of the on-chain URI.
 metadata_uri_template = "https://pub-b1a45763f0a64d8fa271f66f5514a561.r2.dev/old/metadata/{mint}.json"
+# Same per-asset-unique "Name" trait ("#6545") as Girl Gang: stored and shown
+# on the detail page, never a facet. Without this the backfill would intern
+# 10,000 singleton facet values, which bloats /facets and pushes the real
+# values out of the planner's MCV list.
+facet_exclude = ["Name"]
 
 [[collections]]
 slug = "piggy-girl-gang"
