@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, TimeZone, Utc};
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -46,6 +47,31 @@ pub struct BatchResult {
     pub missing: Vec<String>,
 }
 
+/// One entry of `getSignaturesForAddress`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SignatureInfo {
+    pub signature: String,
+    pub slot: i64,
+    /// Unix seconds. The RPC spells it `blockTime`; without the rename this
+    /// would silently stay `None` on every row.
+    #[serde(rename = "blockTime", default)]
+    pub block_time: Option<i64>,
+    /// Present when the transaction failed on chain.
+    #[serde(default)]
+    pub err: Option<Value>,
+}
+
+impl SignatureInfo {
+    pub fn failed(&self) -> bool {
+        self.err.is_some()
+    }
+
+    pub fn block_time_utc(&self) -> Option<DateTime<Utc>> {
+        self.block_time
+            .and_then(|secs| Utc.timestamp_opt(secs, 0).single())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct SearchPage {
     pub items: Vec<Asset>,
@@ -62,6 +88,7 @@ pub enum Reachability {
     Undetermined,
 }
 
+#[derive(Clone)]
 pub struct DasClient {
     http: Client,
     endpoint: String,
@@ -114,6 +141,60 @@ impl DasClient {
             method: "getSlot".into(),
             message: format!("expected a number, got {result}"),
         })
+    }
+
+    /// Wall-clock time of a slot. `None` when the cluster does not have it —
+    /// a very fresh `confirmed` slot, or one outside the RPC's block window.
+    ///
+    /// `activity.block_time` is NOT NULL, so an event whose slot cannot be
+    /// resolved must be parked rather than guessed at; see
+    /// `indexer_data_model::activity::park_signature`.
+    pub async fn get_block_time(&self, slot: i64) -> Result<Option<DateTime<Utc>>, DasError> {
+        let result = self.rpc("getBlockTime", json!([slot])).await?;
+        Ok(result
+            .as_i64()
+            .and_then(|secs| Utc.timestamp_opt(secs, 0).single()))
+    }
+
+    /// Signatures that reference an address, newest first.
+    ///
+    /// This is the gap-recovery primitive: it is 1 credit rather than DAS's
+    /// 10, it works for regular NFTs (DAS's `getSignaturesForAsset` is
+    /// documented for *compressed* assets), and it carries `blockTime`, which
+    /// removes the need for a separate `getBlockTime` on the recovery path.
+    pub async fn get_signatures_for_address(
+        &self,
+        address: &str,
+        before: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<SignatureInfo>, DasError> {
+        let mut options = json!({ "limit": limit, "commitment": "confirmed" });
+        if let Some(before) = before {
+            options["before"] = json!(before);
+        }
+        let value = self
+            .rpc("getSignaturesForAddress", json!([address, options]))
+            .await?;
+        serde_json::from_value(value).map_err(|source| DasError::Decode {
+            method: "getSignaturesForAddress".into(),
+            source,
+        })
+    }
+
+    /// One transaction in the same `jsonParsed` shape the WebSocket delivers,
+    /// so the recovery path can feed the *same* decoder as the live path.
+    /// `None` when the cluster no longer has it.
+    pub async fn get_transaction(&self, signature: &str) -> Result<Option<Value>, DasError> {
+        let params = json!([
+            signature,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+                "maxSupportedTransactionVersion": 0,
+            }
+        ]);
+        let value = self.rpc("getTransaction", params).await?;
+        Ok((!value.is_null()).then_some(value))
     }
 
     /// Fetches up to [`MAX_BATCH`] assets, splitting the chunk when DAS
@@ -435,6 +516,32 @@ mod tests {
         assert!(backoff(1) < backoff(2));
         assert!(backoff(2) < backoff(3));
         assert!(backoff(20) <= Duration::from_secs(8));
+    }
+
+    /// Pins the camelCase rename: without it `block_time` deserializes to
+    /// `None` on every row and the recovery path silently loses its timestamps.
+    #[test]
+    fn signature_info_reads_the_rpc_shape() {
+        let info: SignatureInfo = serde_json::from_value(serde_json::json!({
+            "signature": "SYNsig",
+            "slot": 443_800_000_i64,
+            "blockTime": 1_700_000_000_i64,
+            "err": null,
+            "memo": null,
+            "confirmationStatus": "confirmed",
+        }))
+        .unwrap();
+        assert_eq!(info.slot, 443_800_000);
+        assert_eq!(info.block_time, Some(1_700_000_000));
+        assert!(info.block_time_utc().is_some());
+        assert!(!info.failed());
+
+        let failed: SignatureInfo = serde_json::from_value(serde_json::json!({
+            "signature": "SYNsig", "slot": 1, "err": {"InstructionError": [0, "Custom"]},
+        }))
+        .unwrap();
+        assert!(failed.failed());
+        assert_eq!(failed.block_time_utc(), None);
     }
 
     #[tokio::test]

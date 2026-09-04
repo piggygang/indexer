@@ -1,5 +1,5 @@
-//! Operational commands: migrations, the registry seed, the DAS backfill and
-//! the facet benchmark. Runs from a workstation (`DATABASE_URL` = local
+//! Operational commands: migrations, the registry seed, the DAS backfill, the
+//! ownership rebuild and the facet benchmark. Runs from a workstation (`DATABASE_URL` = local
 //! compose or Railway's public URL) or as a one-off Railway job
 //! (`BIN=indexer-admin`).
 
@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use indexer_config::Config;
 use indexer_das::backfill::{self, BackfillOptions};
 use indexer_das::DasClient;
+use indexer_data_model::activity;
 use indexer_data_model::facets::{self, TraitSelection};
 use indexer_data_model::seed::{self, Outcome};
 use indexer_data_model::synth::{self, SyntheticSpec};
@@ -21,7 +22,7 @@ use indexer_data_model::{registry, PgPool};
 #[command(
     name = "indexer-admin",
     version,
-    about = "Operational commands: migrations, registry seed, DAS backfill, benchmarks"
+    about = "Operational commands: migrations, registry seed, DAS backfill, ownership rebuild, benchmarks"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -79,6 +80,24 @@ enum Cmd {
         /// Fail when anything would change — the "re-running changes nothing" proof.
         #[arg(long)]
         expect_unchanged: bool,
+    },
+    /// Re-derive ownership intervals from stored activity for assets the live
+    /// pipeline flagged (`ownership_dirty`), then clear the flag.
+    ///
+    /// This is the repair half of the writer contract: an out-of-order event is
+    /// stored but not applied, and something has to rebuild the history.
+    /// ALG-622 still owns classifying historical signatures — this only
+    /// re-derives from what is already classified.
+    RebuildOwnership {
+        /// One asset by address, instead of the flagged ones.
+        #[arg(long)]
+        address: Option<String>,
+        /// Stop after this many assets.
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+        /// Report what would be rebuilt without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Synthetic data + facet timings — the ALG-619 "< 100 ms" acceptance evidence.
     Bench {
@@ -205,6 +224,51 @@ async fn main() -> anyhow::Result<()> {
             {
                 bail!("backfill failed for {failed} (see backfill_state.last_error)");
             }
+        }
+        Cmd::RebuildOwnership {
+            address,
+            limit,
+            dry_run,
+        } => {
+            let targets = match &address {
+                Some(address) => activity::assets_by_address(&pool, std::slice::from_ref(address))
+                    .await?
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                None => activity::dirty_assets(&pool, limit).await?,
+            };
+            if targets.is_empty() {
+                println!("nothing to rebuild");
+            }
+            let mut totals = (0u64, 0u64);
+            for asset in &targets {
+                let mut tx = pool.begin().await?;
+                let rebuilt = activity::rebuild_ownership(&mut tx, asset.id).await?;
+                if dry_run {
+                    tx.rollback().await?;
+                } else {
+                    tx.commit().await?;
+                }
+                totals.0 += rebuilt.events;
+                totals.1 += rebuilt.intervals;
+                println!(
+                    "{:<44} events={:<5} intervals={:<5} was_dirty={}",
+                    asset.address, rebuilt.events, rebuilt.intervals, rebuilt.was_dirty
+                );
+            }
+            println!(
+                "\nrebuilt {} asset(s): {} events -> {} intervals{}",
+                targets.len(),
+                totals.0,
+                totals.1,
+                if dry_run {
+                    " (dry run, rolled back)"
+                } else {
+                    ""
+                }
+            );
+            let remaining = activity::dirty_count(&pool).await?;
+            println!("{remaining} asset(s) still flagged");
         }
         Cmd::Bench {
             assets,

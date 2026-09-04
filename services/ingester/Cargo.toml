@@ -1,0 +1,31 @@
+[package]
+name = "indexer-ingester"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The only place that needs all four crates at once: the registry and writers
+# (data-model), the transport (ingest), DAS for hydration and gap recovery
+# (das), and env config. The `lib` target exists so the integration test drives
+# the real pipeline rather than a copy of it.
+[dependencies]
+indexer-config = { workspace = true }
+indexer-das = { workspace = true }
+indexer-data-model = { workspace = true }
+indexer-ingest = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+dotenv = { workspace = true }
+env_logger = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+serde_json = { workspace = true }
+# `signal` for a real SIGTERM handler: the Dockerfile execs this binary as
+# PID 1, and PID 1 ignores SIGTERM unless it installs one — every redeploy
+# would otherwise wait out Railway's full grace period.
+tokio = { workspace = true, features = ["signal"] }
+
+[dev-dependencies]
+bs58 = { workspace = true }
+sqlx = { workspace = true }
+tokio-tungstenite = { workspace = true }

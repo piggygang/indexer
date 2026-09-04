@@ -91,5 +91,40 @@ export default defineRailway(() => {
     },
   });
 
-  return project("Indexer", { resources: [api, admin, Postgres, postgresVolume] });
+  // The live pipeline (ALG-623). It binds no port, so it gets no healthcheck
+  // and no domain — an unset healthcheck makes the deploy go Active as soon as
+  // the container starts, which is what a service that serves no traffic needs.
+  //
+  // Restart policy: the README used to promise ALWAYS here, but `deploy.*` is
+  // silently dropped by `config apply` (see the note above), so the binary
+  // supervises itself instead — it re-subscribes with capped backoff forever
+  // and reserves a non-zero exit for config/database failures. A watchdog
+  // exits if the checkpoint stops advancing, and Railway's default ON_FAILURE
+  // brings it back into a reconciling restart.
+  const ingester = service("ingester", {
+    source: github(REPO, { branch: "main", checkSuites: true }),
+    build: {
+      builder: "DOCKERFILE",
+      dockerfilePath: "Dockerfile",
+      watchPatterns: ["services/ingester/**", ...COMMON],
+    },
+    replicas: { [REGION]: 1 },
+    env: {
+      BIN: "indexer-ingester", // reaches the build only because the Dockerfile declares ARG BIN
+      DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
+      // preserve() keeps the live secret without writing it to source — but it
+      // does NOT copy a value between services. Set HELIUS_API_KEY on the
+      // `ingester` service FIRST, or the reconciler sees a variable that does
+      // not exist and plans a change.
+      HELIUS_API_KEY: preserve(),
+      RUST_LOG: "info",
+      // One connection for the live writer, one for the concurrent reconciler,
+      // one spare.
+      DATABASE_MAX_CONNECTIONS: "3",
+    },
+  });
+
+  return project("Indexer", {
+    resources: [api, admin, ingester, Postgres, postgresVolume],
+  });
 });

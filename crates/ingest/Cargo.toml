@@ -4,18 +4,31 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# ALG-623 adds the real transports as optional deps behind features:
-#   ws   = ["dep:tokio-tungstenite", ...]   Helius Enhanced WebSockets (primary)
-#   grpc = ["dep:helius-laserstream"]       LaserStream gRPC (Business-plan upgrade)
-# The mock stays unconditional — it is the test double other crates import.
+# `ws` (Helius Enhanced WebSockets) is the mainnet transport and is ON BY
+# DEFAULT: `cargo clippy --workspace --all-targets` does not enable non-default
+# features, so a gated adapter would only ever be linted as a side effect of
+# some other package depending on it — and `cargo clippy -p indexer-ingest`
+# would skip it entirely. `--no-default-features` still builds the interface
+# plus the mock. `grpc = ["dep:helius-laserstream"]` (the Business-plan upgrade)
+# is deliberately still absent; no stub modules before that issue.
+[features]
+default = ["ws"]
+ws = ["dep:futures-util", "dep:log", "dep:rustls", "dep:tokio-tungstenite", "tokio/net"]
 
 [dependencies]
 async-stream = { workspace = true }
 futures-core = { workspace = true }
+futures-util = { workspace = true, optional = true }
+log = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true, optional = true }
 
 [dev-dependencies]
+bs58 = { workspace = true }
 futures-util = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-tungstenite = { workspace = true }

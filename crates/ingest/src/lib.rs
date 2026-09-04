@@ -5,23 +5,28 @@
 //! on is an adapter detail:
 //!
 //! - `mock` (this crate, always compiled): scripted events for tests.
-//! - Helius Enhanced WebSockets — the chosen mainnet transport (Developer
-//!   plan). Added in ALG-623 as `#[cfg(feature = "ws")] pub mod ws;` with
-//!   `ws = ["dep:tokio-tungstenite", ...]`.
-//! - LaserStream gRPC — the Business-plan upgrade path. Added in ALG-623 as
-//!   `#[cfg(feature = "grpc")] pub mod grpc;` with
+//! - [`ws`] (feature `ws`, on by default): Helius Enhanced WebSockets, the
+//!   mainnet transport. Note this transport has **no replay** — `fromSlot` is
+//!   a LaserStream gRPC feature — so [`ResumeFrom::Slot`] is a floor, and the
+//!   consumer closes a gap by reconciling against DAS on
+//!   [`StreamStatus::Connected`].
+//! - LaserStream gRPC — the Business-plan upgrade path, still unbuilt. It
+//!   arrives as `#[cfg(feature = "grpc")] pub mod grpc;` with
 //!   `grpc = ["dep:helius-laserstream"]`.
 //!
 //! Swapping transports is a config change plus an adapter; pipeline code does
 //! not change. The one escape hatch is [`RawPayload`] on transaction events —
-//! and only a (future, ALG-623) `decode` module inside this crate may look
-//! inside it. Pipeline code matching on `RawPayload` variants re-couples the
-//! pipeline to a transport and is a review error.
+//! and only this crate's [`decode`] module may look inside it. Pipeline code
+//! matching on `RawPayload` variants re-couples the pipeline to a transport
+//! and is a review error.
 
+pub mod decode;
 mod event;
 mod mock;
 mod source;
 mod spec;
+#[cfg(feature = "ws")]
+pub mod ws;
 
 pub use event::{
     AccountUpdate, IngestEvent, RawPayload, Slot, SlotCheckpoint, StreamStatus, TransactionUpdate,

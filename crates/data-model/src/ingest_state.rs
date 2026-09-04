@@ -112,3 +112,14 @@ pub async fn put_backfill_state<'e>(
     .await?;
     Ok(())
 }
+
+/// The highest slot any DAS backfill recorded, used to seed a live cursor on a
+/// database that has never checkpointed — so the first reconciliation covers
+/// "since the backfill ran" rather than all of history.
+pub async fn backfilled_slot<'e>(exec: impl PgExecutor<'e>) -> sqlx::Result<Option<i64>> {
+    sqlx::query_scalar(
+        "SELECT max((progress->>'slot')::bigint) FROM backfill_state WHERE kind = 'das_assets'",
+    )
+    .fetch_one(exec)
+    .await
+}

@@ -94,8 +94,19 @@ impl Asset {
         self.content.as_ref()?.json_uri.as_deref()
     }
 
+    /// The current owner, or `None` when DAS does not know one.
+    ///
+    /// DAS returns an **empty string** rather than null for some assets
+    /// (observed on 65 of 17 820 pigs — closed token accounts). An empty
+    /// owner is not an owner: `is_pubkey` rejects it at the writer, so
+    /// treating it as a value made those assets disagree with the database
+    /// forever and re-queried them on every reconciliation.
     pub fn owner(&self) -> Option<&str> {
-        self.ownership.as_ref()?.owner.as_deref()
+        self.ownership
+            .as_ref()?
+            .owner
+            .as_deref()
+            .filter(|owner| !owner.is_empty())
     }
 
     /// `links.image` first, then the first image-ish file. Never a CDN URL —
@@ -335,6 +346,26 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(asset.image(), Some("https://example.invalid/1.png"));
+    }
+
+    /// Pins the empty-string case: it must read as "DAS does not know",
+    /// not as an owner, or the writer's `is_pubkey` guard and the
+    /// reconciliation diff disagree permanently.
+    #[test]
+    fn an_empty_owner_string_is_not_an_owner() {
+        let asset: Asset = serde_json::from_value(json!({
+            "id": "SYN",
+            "ownership": {"owner": "", "ownership_model": "single"},
+        }))
+        .unwrap();
+        assert_eq!(asset.owner(), None);
+
+        let owned: Asset = serde_json::from_value(json!({
+            "id": "SYN",
+            "ownership": {"owner": "SYNOWNER"},
+        }))
+        .unwrap();
+        assert_eq!(owned.owner(), Some("SYNOWNER"));
     }
 
     #[test]

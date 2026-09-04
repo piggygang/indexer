@@ -30,10 +30,17 @@ included in **Business ($499/mo)**. That is still disproportionate for this
 scale, so we start without LaserStream:
 
 - **Primary mainnet transport: Enhanced WebSockets** (`transactionSubscribe`,
-  `accountSubscribe`/`programSubscribe`). Included in Developer. Since
-  2026-03 these run on LaserStream infrastructure: ~24h replay, ordered
-  delivery, multi-region. Metered at 20 credits/MB (~$100/TB) from the plan's
-  10M monthly credits — tight filters are essential.
+  `accountSubscribe`/`programSubscribe`). Included in Developer — confirmed:
+  `transactionSubscribe` reached that tier on 2026-04-07, on the unified
+  `wss://mainnet.helius-rpc.com`, with 150 connections and 1 000 subscriptions
+  each. Since 2026-03 they run on LaserStream infrastructure: ordered delivery,
+  multi-region. Metered at 20 credits/MB (~$100/TB) from the plan's 10M monthly
+  credits — tight filters are essential.
+  **They do not offer replay.** `fromSlot` is a LaserStream *gRPC* parameter;
+  the WebSocket API exposes no replay and no resume (corrected 2026-09-03,
+  ALG-623 — this record previously attributed gRPC's 24h window to the
+  WebSocket transport). Gap recovery is therefore the durable cursor plus DAS
+  reconciliation, not the transport.
 - **Supplementary:** Helius webhooks (1 credit/event, up to 100k addresses,
   but 3-retries-then-lost delivery — never a source of truth) and DAS
   reconciliation sweeps (10 credits/call; a full ~25k-asset re-scan is ~250
@@ -46,17 +53,19 @@ swapping transports is a config change plus an adapter, zero pipeline edits):
 
 | Transport | Cost (2026-08-27) | Notes |
 |---|---|---|
-| Enhanced WebSockets (chosen) | in Developer $49/mo | 24h replay, ordered; JSON adapter |
+| Enhanced WebSockets (chosen) | in Developer $49/mo | ordered; JSON adapter; **no replay** — gaps are closed by DAS reconciliation |
 | LaserStream gRPC | Business $499/mo | 10 concurrent conns; free trial via contact form; same Yellowstone wire protocol |
 | Third-party Yellowstone gRPC | Triton PAYG $125 deposit + $0.08/GB; Chainstack ~$98/mo; Shyft $199/mo | wire-compatible URL+token swap; no Helius 24h replay |
 | Webhooks + DAS sweep | ~free (fits even lower tiers) | weakest delivery guarantees; DAS sweep becomes source of truth |
 
-**Replay caveats:** the ~24h replay window delivers finalized-only data beyond
-~20 minutes, and a disconnect mid-replay can skip slots (laserstream-sdk
-issue #115). Durable resume therefore never trusts transport replay: the
-consumer persists `last_processed_slot` in Postgres (`ingest_state`) and DAS
-reconciliation (ALG-624) is the safety net. Downtime beyond the replay window
-triggers targeted re-backfill.
+**Replay caveats:** the 24h replay window is a **LaserStream gRPC** feature —
+`fromSlot` on the `SubscribeRequest` — and even there it delivers
+finalized-only data beyond ~20 minutes, with a disconnect mid-replay able to
+skip slots (laserstream-sdk issue #115). On the WebSocket transport we actually
+use there is no replay at all, so durable resume never trusts the transport in
+the first place: the consumer persists `last_processed_slot` in `ingest_state`
+and reconciles `(cursor, tip]` against DAS on every reconnect (ALG-623), with
+the periodic sweep (ALG-624) as the standing safety net.
 
 ### Hosting + Postgres: Railway (EU West Metal, Amsterdam)
 
@@ -91,8 +100,7 @@ services/
   api/         indexer-api — REST API (today: /health, /ready)
 ```
 
-Future member (the workspace globs already cover it): `services/ingester`
-(ALG-623). The `api` service deliberately does not watch `config/**` or
+`services/ingester` (ALG-623) is the third binary. The `api` service deliberately does not watch `config/**` or
 `services/admin/**` — neither is part of the API image. The `admin` service
 watches both, because the registry seed ships inside *its* image.
 
@@ -154,7 +162,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `PORT` | no | `8080` | injected by Railway |
 | `HOST` | no | `::` | dual-stack bind; Railway private networking needs the IPv6 bind |
 | `RUST_LOG` | no | `info` | |
-| `HELIUS_API_KEY` | `admin backfill` | — | Helius Developer key. Read only by the subcommand that needs it, so `migrate`/`seed` still run without one; ALG-623 will need it too |
+| `HELIUS_API_KEY` | `admin backfill`, `ingester` | — | Helius Developer key. The admin CLI reads it only in the subcommand that needs it, so `migrate`/`seed` still run without one; the ingester requires it at boot |
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
@@ -623,6 +631,38 @@ psql "$DATABASE_URL" -c "SELECT c.slug, s.status, s.progress \
 Ids DAS does not know are counted and sampled into `progress.missing`, never
 invented as rows to make a supply count reconcile.
 
+### First full run (2026-09-02, mainnet)
+
+| collection | rule | members | burned | supply | holders | attrs | documents | elapsed |
+|---|---|---|---|---|---|---|---|---|
+| piggy-sol-gang | tm_allowlist | 10 000 | 1 847 | 8 153 | 2 817 | 89 775 | 9 975 | 247 s |
+| piggy-girl-gang | tm_allowlist | 5 000 | 0 | 5 000 | 1 883 | 45 000 | 5 000 | 68 s |
+| pig-mud | tm_allowlist | 2 073 | 0 | 2 073 | 915 | 2 068 | 0 | 32 s |
+| piggy-gang | core_collection | 747 | 2 | 745 | 103 | 4 965 | 747 | 21 s |
+
+`members` equals the registry mint count for all three allowlist collections, 0
+ids were unknown to DAS, and `integrity_allowlist_violation`,
+`integrity_symbol_mismatch` and `integrity_owner_mismatch` are all empty. The
+immediate re-run reported every asset `unchanged`, `--expect-unchanged` exited
+0, and `count(*) WHERE updated_at > $t0` was 0 on `assets` and 0 on
+`asset_documents` — the three independent forms of the no-op proof. PSG, PGG
+and the Core collection issued **zero** HTTP document requests on that second
+pass.
+
+Two things the run taught us that the config had wrong:
+
+- **Pig Mud is not trait-less.** DAS still serves metadata it cached before the
+  collection's host died, and it carries exactly one trait — a per-asset-unique
+  `Name` ("Pig Mud #348"). The backfill's facet-cardinality warning caught it on
+  a five-asset smoke run, and the fix was one `facet_exclude` line. Its documents
+  remain unfetchable: the on-chain URIs point at `storageapi.fleek.co`, which
+  answers **HTTP 530**, not 404 — so unlike a truly absent host each asset costs
+  the full retry budget, which is the whole 30 s of a pig-mud no-op run. That
+  disappears when the files are re-hosted.
+- **Burns do not track the Core swap.** 1 847 SOL Gang pigs are burned but only
+  747 Core assets exist, so roughly 1 100 were burned without a corresponding
+  Core mint. Worth knowing before anyone reads `supply` as "10 000 minus swaps".
+
 ### Running it on Railway
 
 Not wired up yet, and it needs two changes **in this order**, because IaC
@@ -644,13 +684,113 @@ one-off run overlaps.
 railway ssh --service admin -- indexer-admin backfill --slug piggy-sol-gang
 ```
 
+## Live pipeline (ALG-623)
+
+`indexer-ingester` keeps the database current from Helius Enhanced WebSockets:
+ownership changes, Core mints, metadata refreshes and the `activity` timeline.
+It is the first writer of `activity` and `ownership_history` in this repo.
+
+```sh
+cargo run -p indexer-ingester                       # needs HELIUS_API_KEY
+cargo run -p indexer-admin -- rebuild-ownership     # repair flagged assets
+```
+
+**One subscription, one connection.** `transactionSubscribe` with
+`accountInclude` = all 17 073 tracked mints plus the Core collection address —
+`accountInclude` accepts up to 50 000, so it fits, and server-side filtering
+means only our own transactions are delivered (~100 credits/day against 10M).
+One filter rather than one per collection because a swap burns a SOL Gang pig
+and mints a Core asset **in the same signature**: per-collection filters would
+deliver and bill for that transaction twice. Commitment is `confirmed`;
+`processed` can be rolled back and there is no un-write path for an activity
+row. The Core arm is why the address list is stable — Core passes the
+collection account on every member instruction, so one address catches
+transfers *and mints of assets that do not exist yet*, and individual Core
+asset addresses never enter the filter.
+
+**Classification comes from balances, not instruction shapes.** The decoder
+reads `meta.preTokenBalances`/`postTokenBalances`, so it is correct for
+`transfer` (which carries no mint), `transferChecked`, a CPI transfer inside a
+marketplace instruction, and token-2022 alike. It gates on
+`decimals == 0 && amount == "1"` so a SOL or `$PIGGY` leg in the same
+transaction is never read as an NFT move. No on-chain address appears in Rust:
+`jsonParsed` labels SPL instructions by name, and Metaplex Core is recognised
+structurally against the collection address the registry supplies.
+
+**Sales are not classified here.** A marketplace-mediated change is recorded
+honestly as a `transfer`, with the invoked program ids in `activity.details` so
+ALG-622 can reclassify it into a priced `sale` without re-fetching. Inventing a
+price to satisfy `activity_sale_has_price` would be worse than an honest
+transfer.
+
+**Gap recovery, because the transport has none.** There is no `fromSlot` on
+WebSockets, so `ResumeFrom::Slot` is honoured as a *floor* and the consumer
+reconciles `(cursor, tip]` on **every** `Connected` — cold start, crash restart
+and mid-run reconnect are one code path. Tier 1 sweeps every tracked asset
+through `getAssetBatch` (~18 calls, ~200 credits) into the backfill's own
+`upsert_batch`, whose `owner_slot` guard means a sweep can never clobber a
+newer live observation. Tier 2 takes the assets that disagree and walks
+`getSignaturesForAddress` back to the cursor, replaying each transaction
+through the *same* decoder and writer tagged `source = 'reconcile'`.
+
+What it cannot recover, stated rather than papered over: an ownership
+round-trip inside one gap (a state diff sees no change), and a transaction that
+never names the asset — a legacy `spl_token::transfer` between two existing
+ATAs carries no mint, so neither the filter nor `getSignaturesForAddress(mint)`
+sees it. In both cases the *state* is still corrected and no activity row is
+invented. Measure the second one before relying on the timeline being complete;
+if coverage is short, ALG-624's periodic sweep is load-bearing rather than
+optional.
+
+**Out-of-order events are flagged, not applied.** An event predating the
+asset's open interval — or one whose `from_owner` disagrees with it, which
+means an intermediate event was missed — is stored and sets
+`assets.ownership_dirty`. `indexer-admin rebuild-ownership` re-derives that
+asset's intervals from stored activity and clears the flag.
+
+**Operational notes.** The binary supervises itself (Railway's default
+`ON_FAILURE` gives up after ten retries, and `deploy.restartPolicyType` is
+silently dropped by `config apply`), installs a real SIGTERM handler because
+the Dockerfile execs it as PID 1, and exits if the checkpoint stops advancing
+so the restart policy brings it back into a reconciling start. Progress is
+durable in `ingest_state`, whose `updated_at` moves on every checkpoint even
+when the slot does not — so `now() - updated_at > 2 min` is an external
+"wedged" predicate for ALG-628.
+
+### First live run (2026-09-03/04, mainnet)
+
+Connected and subscribed with a single filter carrying 17 821 addresses (the
+~770 KB subscribe frame is accepted), `rootSubscribe` supplied checkpoints, and
+the first reconcile swept 17 820 assets and recovered 4 real transfers from the
+gap since the backfill, with matching `ownership_history` intervals and
+`integrity_owner_mismatch` empty. `kill -TERM` exited cleanly in under a
+second.
+
+That run also found a real bug worth recording: DAS returns `owner: ""` —
+an empty string, not null — for 65 of the 17 820 assets. The writer's
+`is_pubkey` guard correctly stored NULL, so the reconciliation diff compared
+`Some("")` against `None` and re-queried those assets on *every* reconnect
+forever. `Asset::owner()` now treats an empty string as "not known", and the
+candidate count fell from 65 to 1 — the 1 being a genuine ownership change.
+
+### Deploying it
+
+Same ordering hazard as the admin service, for the same reason:
+
+1. Set `HELIUS_API_KEY` on the `ingester` service. `preserve()` does not copy a
+   value between services, and a `preserve()` for a variable that does not
+   exist is a change the reconciler will plan.
+2. `railway config plan`, read every line, then `apply`. Never
+   `--confirm-destructive`. The `ingester` block is already in
+   `.railway/railway.ts` — **it has not been applied**.
+
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
 - ALG-620 — freeze v1 API contract (OpenAPI) + mock server for Explorer — done
 - ALG-621 — DAS backfill (assets, attributes, owners) — done
 - ALG-622 — historical activity backfill (archival API)
-- ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service
+- ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service — done
 - ALG-624 — reconciliation: periodic DAS diff + self-heal
 - ALG-625/626 — public REST API (browse/facets, detail/activity/portfolio)
 - ALG-627 — rarity scoring · ALG-628 — prod monitoring/alerting · ALG-629 — external collections

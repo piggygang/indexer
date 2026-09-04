@@ -31,6 +31,12 @@ pub const IMAGE_KIND: &str = "image_status";
 /// collection's `facet_exclude` — see [`CollectionReport::warnings`].
 const FACET_CARDINALITY_WARN_RATIO: f64 = 0.5;
 
+/// Below this many assets the ratio is noise, not signal: in a 25-asset smoke
+/// run an ordinary trait like "Head" shows 14 distinct values and trips a 0.5
+/// ratio, while over the full collection it settles near 23/10 000. Warning
+/// there would invite someone to `facet_exclude` a perfectly good facet.
+const FACET_CARDINALITY_MIN_ASSETS: i64 = 200;
+
 #[derive(Debug, Clone)]
 pub struct BackfillOptions {
     pub slug: Option<String>,
@@ -776,7 +782,11 @@ async fn facet_cardinality_warnings(
     let card = attributes::trait_cardinality(pool, collection.id).await?;
     Ok(card
         .into_iter()
-        .filter(|t| t.is_facet && t.values as f64 > t.assets as f64 * FACET_CARDINALITY_WARN_RATIO)
+        .filter(|t| {
+            t.is_facet
+                && t.assets >= FACET_CARDINALITY_MIN_ASSETS
+                && t.values as f64 > t.assets as f64 * FACET_CARDINALITY_WARN_RATIO
+        })
         .map(|t| {
             format!(
                 "{}: trait type {:?} has {} distinct values over {} assets — \
