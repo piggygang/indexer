@@ -243,6 +243,11 @@ impl Pipeline {
             kind,
             from_owner,
             to_owner,
+            // The live path never prices a sale: it has no venue registry and
+            // no reason to re-read a transaction. It records an honest
+            // transfer and hands the program ids to ALG-622 in `details`.
+            price_lamports: None,
+            marketplace: None,
             details: Some(details),
             source,
         };

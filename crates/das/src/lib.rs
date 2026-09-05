@@ -18,4 +18,4 @@ pub mod client;
 
 pub use asset::Asset;
 pub use backfill::{BackfillOptions, BackfillReport, BatchProgress, CollectionReport};
-pub use client::{DasClient, DasError, Reachability, SignatureInfo};
+pub use client::{ArchivedTx, DasClient, DasError, Reachability, SignatureInfo, TxPage};

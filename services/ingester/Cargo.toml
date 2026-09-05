@@ -12,7 +12,7 @@ publish = false
 indexer-config = { workspace = true }
 indexer-das = { workspace = true }
 indexer-data-model = { workspace = true }
-indexer-ingest = { workspace = true }
+indexer-ingest = { workspace = true, features = ["ws"] }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 dotenv = { workspace = true }

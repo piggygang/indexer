@@ -1,5 +1,5 @@
 //! Operational commands: migrations, the registry seed, the DAS backfill, the
-//! ownership rebuild and the facet benchmark. Runs from a workstation (`DATABASE_URL` = local
+//! historical activity backfill, the ownership rebuild and the facet benchmark. Runs from a workstation (`DATABASE_URL` = local
 //! compose or Railway's public URL) or as a one-off Railway job
 //! (`BIN=indexer-admin`).
 
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
+use indexer_activity::{self as activity_backfill, Venues};
 use indexer_config::Config;
 use indexer_das::backfill::{self, BackfillOptions};
 use indexer_das::DasClient;
@@ -77,6 +78,51 @@ enum Cmd {
         /// Re-probe images checked longer ago than this (with --check-images).
         #[arg(long, default_value_t = 30)]
         recheck_images_after_days: i32,
+        /// Fail when anything would change — the "re-running changes nothing" proof.
+        #[arg(long)]
+        expect_unchanged: bool,
+    },
+    /// Historical activity backfill (ALG-622): the full transaction timeline
+    /// per NFT from archival RPC — mints, transfers, priced sales, burns, and
+    /// the ownership intervals derived from them.
+    ///
+    /// Adaptive: one archival call covers most assets, and the crawl expands
+    /// to an asset's token accounts only when the timeline it derived
+    /// disagrees with itself or with DAS. Idempotent — re-running a crawled
+    /// collection writes nothing.
+    BackfillActivity {
+        /// Only this collection (default: every enabled collection).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Crawl one asset by address and stop — the hand-verification path.
+        #[arg(long)]
+        address: Option<String>,
+        /// Continue from backfill_state instead of restarting at the first asset.
+        #[arg(long)]
+        resume: bool,
+        /// Stop after this many assets per collection (smoke run).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Assets per cursor commit.
+        #[arg(long, default_value_t = 25)]
+        batch: usize,
+        /// Concurrent per-asset crawls (the RPC rate limit is shared across them).
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+        /// Archival RPC calls per second. The Helius Developer plan allows 10.
+        #[arg(long, default_value_t = 10)]
+        rps: u32,
+        /// Venue registry: marketplace program id -> label.
+        #[arg(long, default_value = "config/marketplaces.toml")]
+        marketplaces: PathBuf,
+        /// Throw away each asset's derived rows and re-derive them. The raw
+        /// signatures survive, so this re-fetches nothing it already has.
+        #[arg(long)]
+        reclassify: bool,
+        /// Database-only: promote stored transfers to sales using the current
+        /// venue registry. No network at all — use it after adding a venue.
+        #[arg(long)]
+        reprice_only: bool,
         /// Fail when anything would change — the "re-running changes nothing" proof.
         #[arg(long)]
         expect_unchanged: bool,
@@ -225,6 +271,63 @@ async fn main() -> anyhow::Result<()> {
                 bail!("backfill failed for {failed} (see backfill_state.last_error)");
             }
         }
+        Cmd::BackfillActivity {
+            slug,
+            address,
+            resume,
+            limit,
+            batch,
+            concurrency,
+            rps,
+            marketplaces,
+            reclassify,
+            reprice_only,
+            expect_unchanged,
+        } => {
+            let venues = Venues::load(&marketplaces)?;
+            println!(
+                "venues  {} marketplace(s) from {}",
+                venues.len(),
+                marketplaces.display()
+            );
+
+            // `--reprice-only` is a database pass: the price the classifier
+            // derived at crawl time is in `details`, so no key is needed.
+            let das = if reprice_only {
+                DasClient::with_endpoint("http://127.0.0.1:1", "")?
+            } else {
+                DasClient::new(config.helius.required_api_key()?)?.with_rate_limit(rps)
+            };
+            let options = activity_backfill::Options {
+                slug,
+                address,
+                resume,
+                limit,
+                batch,
+                concurrency,
+                reclassify,
+                reprice_only,
+            };
+            let report =
+                activity_backfill::run(&pool, &das, &venues, &options, print_activity_progress)
+                    .await?;
+            print_activity_report(&report);
+
+            if expect_unchanged && !report.is_noop() {
+                bail!(
+                    "activity backfill was expected to be a no-op but changed: {:?}",
+                    report.totals()
+                );
+            }
+            if let Some(failed) = report
+                .collections
+                .iter()
+                .find(|c| c.status == "failed")
+                .map(|c| c.slug.clone())
+            {
+                bail!("activity backfill failed for {failed} (see backfill_state.last_error)");
+            }
+        }
         Cmd::RebuildOwnership {
             address,
             limit,
@@ -326,6 +429,61 @@ fn print_seed_report(report: &seed::SeedReport) {
 
 /// One line per committed batch, so a long run is legible while it happens
 /// and `railway logs` shows the same thing a local terminal does.
+/// One line per committed batch of the activity crawl.
+fn print_activity_progress(p: &activity_backfill::BatchProgress) {
+    let c = p.counts;
+    println!(
+        "{:<17} {:>4} assets  sigs {:>6} events {:>5} sales {:>4} \
+expanded {:>4} rebuilt {:>4} mismatch {:>3}  {:>6.1}s",
+        p.slug,
+        p.assets,
+        c.signatures,
+        c.events,
+        c.sales,
+        c.expanded,
+        c.rebuilt,
+        c.mismatched,
+        p.elapsed.as_secs_f64(),
+    );
+}
+
+fn print_activity_report(report: &activity_backfill::Report) {
+    println!();
+    for collection in &report.collections {
+        let c = collection.counts;
+        println!(
+            "{:<17} {:<16} {:>6} assets  {:>7} sigs  {:>6} events  {:>5} sales  \
+{:>5} repriced  {:>6.1}s",
+            collection.slug,
+            collection.status,
+            c.assets,
+            c.signatures,
+            c.events,
+            c.sales,
+            c.repriced,
+            collection.elapsed.as_secs_f64(),
+        );
+        for warning in &collection.warnings {
+            println!("  WARN {warning}");
+        }
+    }
+    let totals = report.totals();
+    println!(
+        "\ntotal            {:>6} assets  {:>7} sigs  {:>6} events  {:>5} sales  \
+{:>5} repriced",
+        totals.assets, totals.signatures, totals.events, totals.sales, totals.repriced
+    );
+    // The acceptance criterion, printed where the operator will see it.
+    println!(
+        "cross-check      {} expanded to token accounts, {} still disagree with DAS, \
+{} unverifiable, {} rebuilt",
+        totals.expanded, totals.mismatched, totals.unverifiable, totals.rebuilt
+    );
+    for warning in &report.warnings {
+        println!("WARN {warning}");
+    }
+}
+
 fn print_batch_progress(p: &backfill::BatchProgress) {
     let of = match p.batches {
         Some(total) => format!("{:>3}/{:<3}", p.batch, total),

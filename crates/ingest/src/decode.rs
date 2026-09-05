@@ -14,7 +14,11 @@
 //!   from instruction arguments.** Balances are what actually moved, so the
 //!   same code is correct for `transfer` (which carries no mint), for
 //!   `transferChecked`, for a CPI transfer inside a marketplace instruction,
-//!   and for token-2022.
+//!   and for token-2022. The one thing balances cannot supply on their own is
+//!   the owner of a pre-2022 token account — the field did not exist yet — so
+//!   [`DecodeContext::token_account_owners`] fills that in for the archival
+//!   crawl, from the same transactions via
+//!   [`harvest_token_account_owners`].
 //! - **No on-chain address appears in this file.** `jsonParsed` labels SPL
 //!   instructions by *name*, so matching is on strings. Metaplex Core is not
 //!   parsed by the RPC, so it is recognised structurally against the
@@ -41,6 +45,18 @@ pub struct DecodeContext {
     /// on every member instruction, which is what lets one address identify
     /// transfers *and* mints of assets that do not exist yet.
     pub core_collections: BTreeSet<String>,
+    /// Token account → wallet, consulted wherever a token balance omits
+    /// `owner`.
+    ///
+    /// Solana only added `owner` to transaction token balances in late 2021;
+    /// before that the field is absent on every entry, so a transfer decoded
+    /// from a 2021 transaction has no receiver and is dropped by
+    /// `activity_transfer_shape`. The archival crawl (ALG-622) walks an
+    /// asset's history in slot order and can supply the map from the
+    /// `create` / `initializeAccount` instructions it has already seen — see
+    /// [`harvest_token_account_owners`]. Empty for the live path, where every
+    /// balance carries its own owner.
+    pub token_account_owners: BTreeMap<String, String>,
 }
 
 /// The ownership-bearing kinds this decoder can establish from a payload.
@@ -84,6 +100,23 @@ pub struct Decoded {
     pub fee_payer: Option<String>,
     pub events: Vec<TokenEvent>,
     pub core: Vec<CoreTouch>,
+    /// Net lamport movement per account, non-zero entries only, in account
+    /// order.
+    ///
+    /// The price signal, and the reason it lives here: a sale's amount is not
+    /// in any instruction argument this decoder can read — it is the SOL that
+    /// changed hands. Classification into `sale` is still ALG-622's call,
+    /// because it needs the venue registry to know a marketplace was
+    /// involved; this only reports what moved.
+    pub native_deltas: Vec<(String, i64)>,
+    /// `meta.fee`, so a payer-side price can be computed net of it.
+    pub fee: u64,
+    /// Every token account this transaction touched, any mint.
+    ///
+    /// Pricing needs it to tell payment from rent: funding a freshly created
+    /// token account is a lamport movement like any other, and counting it
+    /// would report a 1.95 SOL sale as 1.952.
+    pub token_accounts: Vec<String>,
 }
 
 impl Decoded {
@@ -140,11 +173,18 @@ pub fn decode_json(payload: &Value, ctx: &DecodeContext) -> Decoded {
     };
 
     let keys = account_keys(message, meta);
-    let pre = balances(meta, "preTokenBalances", &keys);
-    let post = balances(meta, "postTokenBalances", &keys);
+    let pre = balances(meta, "preTokenBalances", &keys, ctx);
+    let post = balances(meta, "postTokenBalances", &keys, ctx);
+
+    let mut token_accounts: Vec<String> = pre.keys().chain(post.keys()).cloned().collect();
+    token_accounts.sort();
+    token_accounts.dedup();
 
     let mut decoded = Decoded {
         fee_payer: keys.first().cloned(),
+        native_deltas: native_deltas(meta, &keys),
+        fee: meta.get("fee").and_then(Value::as_u64).unwrap_or_default(),
+        token_accounts,
         ..Decoded::default()
     };
     let mut seen_programs = BTreeSet::new();
@@ -304,9 +344,149 @@ fn account_keys(message: &Value, meta: &Value) -> Vec<String> {
     keys
 }
 
+/// Net lamport movement per account: `postBalances[i] - preBalances[i]`.
+///
+/// Only non-zero entries, so a transaction that moved no SOL costs nothing to
+/// carry. Both arrays are indexed like `keys`; a short or absent array yields
+/// nothing rather than a partial answer.
+fn native_deltas(meta: &Value, keys: &[String]) -> Vec<(String, i64)> {
+    let numbers = |field: &str| -> Vec<u64> {
+        meta.get(field)
+            .and_then(Value::as_array)
+            .map(|list| {
+                list.iter()
+                    .map(|v| v.as_u64().unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (pre, post) = (numbers("preBalances"), numbers("postBalances"));
+    if pre.len() != post.len() {
+        return Vec::new();
+    }
+    keys.iter()
+        .zip(pre.iter().zip(post.iter()))
+        .filter_map(|(key, (before, after))| {
+            let delta = i64::try_from(i128::from(*after) - i128::from(*before)).ok()?;
+            (delta != 0).then(|| (key.clone(), delta))
+        })
+        .collect()
+}
+
+/// Token account → wallet, from everything one transaction can tell us.
+///
+/// Three sources, in increasing order of desperation: a balance that carries
+/// `owner`; the Associated Token Account program's `create`/`createIdempotent`
+/// (which names the `wallet` it is created for); and `initializeAccount*`
+/// (which names the `owner` outright). Matching is on parsed instruction
+/// names, so no on-chain address enters this file.
+///
+/// The archival crawl accumulates these across an asset's whole history and
+/// feeds them back as [`DecodeContext::token_account_owners`].
+pub fn harvest_token_account_owners(payload: &Value) -> Vec<(String, String)> {
+    let Some(meta) = pick(payload, &["/transaction/meta", "/meta"]) else {
+        return Vec::new();
+    };
+    let Some(message) = pick(
+        payload,
+        &["/transaction/transaction/message", "/transaction/message"],
+    ) else {
+        return Vec::new();
+    };
+    let keys = account_keys(message, meta);
+    let mut out = Vec::new();
+
+    for field in ["preTokenBalances", "postTokenBalances"] {
+        let Some(list) = meta.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in list {
+            let (Some(index), Some(owner)) = (
+                entry.get("accountIndex").and_then(Value::as_u64),
+                entry.get("owner").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if let Some(address) = keys.get(index as usize) {
+                out.push((address.clone(), owner.to_string()));
+            }
+        }
+    }
+
+    for instruction in flatten_instructions(message, meta) {
+        let Some(parsed) = instruction.get("parsed") else {
+            continue;
+        };
+        let (Some(name), Some(info)) = (
+            parsed.get("type").and_then(Value::as_str),
+            parsed.get("info"),
+        ) else {
+            continue;
+        };
+        let wallet = match name {
+            "create" | "createIdempotent" => "wallet",
+            "initializeAccount" | "initializeAccount2" | "initializeAccount3" => "owner",
+            _ => continue,
+        };
+        if let (Some(account), Some(owner)) = (
+            info.get("account").and_then(Value::as_str),
+            info.get(wallet).and_then(Value::as_str),
+        ) {
+            out.push((account.to_string(), owner.to_string()));
+        }
+    }
+    out
+}
+
+/// Every token account of `mint` this transaction touched.
+///
+/// The archival crawl's expansion step: a plain `spl-token` `transfer` names
+/// neither the mint nor the wallets, so a transaction that moves an NFT
+/// between two existing token accounts is invisible to a query on the mint
+/// address. It *is* visible on the token accounts, and those are named here —
+/// which is what lets the crawl reach a fixpoint.
+pub fn token_accounts_for_mint(payload: &Value, mint: &str) -> Vec<String> {
+    let Some(meta) = pick(payload, &["/transaction/meta", "/meta"]) else {
+        return Vec::new();
+    };
+    let Some(message) = pick(
+        payload,
+        &["/transaction/transaction/message", "/transaction/message"],
+    ) else {
+        return Vec::new();
+    };
+    let keys = account_keys(message, meta);
+    let mut out = Vec::new();
+    for field in ["preTokenBalances", "postTokenBalances"] {
+        let Some(list) = meta.get(field).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in list {
+            if entry.get("mint").and_then(Value::as_str) != Some(mint) {
+                continue;
+            }
+            if let Some(address) = entry
+                .get("accountIndex")
+                .and_then(Value::as_u64)
+                .and_then(|index| keys.get(index as usize))
+            {
+                out.push(address.clone());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Token balances re-keyed from `accountIndex` to the token account address,
 /// which is what the parsed instructions actually name.
-fn balances(meta: &Value, field: &str, keys: &[String]) -> BTreeMap<String, Balance> {
+fn balances(
+    meta: &Value,
+    field: &str,
+    keys: &[String],
+    ctx: &DecodeContext,
+) -> BTreeMap<String, Balance> {
     let mut out = BTreeMap::new();
     let Some(list) = meta.get(field).and_then(Value::as_array) else {
         return out;
@@ -325,11 +505,13 @@ fn balances(meta: &Value, field: &str, keys: &[String]) -> BTreeMap<String, Bala
             address.clone(),
             Balance {
                 mint: mint.to_string(),
-                // "Omitted if the validator did not record it."
+                // "Omitted if the validator did not record it." — always, on
+                // pre-2022 transactions, hence the context fallback.
                 owner: entry
                     .get("owner")
                     .and_then(Value::as_str)
-                    .map(str::to_string),
+                    .map(str::to_string)
+                    .or_else(|| ctx.token_account_owners.get(address).cloned()),
                 amount: entry
                     .pointer("/uiTokenAmount/amount")
                     .and_then(Value::as_str)
@@ -427,6 +609,126 @@ mod tests {
 
     fn decode(payload: &Value) -> Decoded {
         decode_json(payload, &DecodeContext::default())
+    }
+
+    /// A token balance as a 2021 validator wrote it: no `owner` field at all.
+    fn undated_balance(index: u64, mint: &str, amount: &str) -> Value {
+        json!({
+            "accountIndex": index, "mint": mint,
+            "uiTokenAmount": {"amount": amount, "decimals": 0},
+        })
+    }
+
+    #[test]
+    fn a_2021_transfer_decodes_only_with_the_owner_map() {
+        let (mint, src, dst) = (pk(1), pk(2), pk(3));
+        let (seller, buyer) = (pk(4), pk(5));
+        let keys = vec![pk(50), src.clone(), dst.clone()];
+        let p = payload(
+            &keys,
+            vec![spl(
+                "transfer",
+                json!({"source": src, "destination": dst, "authority": seller}),
+            )],
+            vec![undated_balance(1, &mint, "1")],
+            vec![undated_balance(2, &mint, "1")],
+        );
+
+        // Solana only added `owner` to token balances in late 2021, so the
+        // decoder has no receiver and `activity_transfer_shape` forbids
+        // recording the transfer.
+        assert!(
+            decode(&p).events.is_empty(),
+            "a pre-2022 transfer has no owners to read"
+        );
+
+        let ctx = DecodeContext {
+            token_account_owners: [(src.clone(), seller.clone()), (dst.clone(), buyer.clone())]
+                .into_iter()
+                .collect(),
+            ..DecodeContext::default()
+        };
+        let events = decode_json(&p, &ctx).events;
+        assert_eq!(events.len(), 1, "the map supplies what the balances cannot");
+        assert_eq!(events[0].from_owner.as_deref(), Some(seller.as_str()));
+        assert_eq!(events[0].to_owner.as_deref(), Some(buyer.as_str()));
+    }
+
+    #[test]
+    fn the_owner_map_is_harvested_from_the_same_transactions() {
+        let (mint, ata) = (pk(1), pk(2));
+        let wallet = pk(6);
+        let keys = vec![pk(50), ata.clone()];
+        let mut p = payload(
+            &keys,
+            vec![json!({
+                "program": "spl-associated-token-account",
+                "programId": pk(91),
+                "parsed": {"type": "create", "info": {"account": ata, "mint": mint, "wallet": wallet}},
+            })],
+            vec![],
+            vec![undated_balance(1, &mint, "1")],
+        );
+        // A second account, named by initializeAccount rather than the ATA
+        // program, and reachable only through the inner instructions.
+        let (other, other_owner) = (pk(7), pk(8));
+        p["transaction"]["meta"]["innerInstructions"] = json!([{
+            "index": 0,
+            "instructions": [spl(
+                "initializeAccount",
+                json!({"account": other, "mint": mint, "owner": other_owner}),
+            )],
+        }]);
+
+        let harvested: std::collections::BTreeMap<String, String> =
+            harvest_token_account_owners(&p).into_iter().collect();
+        assert_eq!(harvested.get(&ata), Some(&wallet));
+        assert_eq!(harvested.get(&other), Some(&other_owner));
+    }
+
+    #[test]
+    fn token_accounts_of_the_mint_are_reported_for_expansion() {
+        let (mine, theirs) = (pk(1), pk(9));
+        let keys = vec![pk(50), pk(2), pk(3)];
+        let p = payload(
+            &keys,
+            vec![],
+            vec![balance(1, &mine, &pk(4), "1", 0)],
+            vec![balance(2, &theirs, &pk(5), "1", 0)],
+        );
+        assert_eq!(
+            token_accounts_for_mint(&p, &mine),
+            vec![keys[1].clone()],
+            "only accounts of the asked-for mint — a transaction touches many tokens"
+        );
+    }
+
+    #[test]
+    fn native_deltas_and_fee_carry_the_price_signal() {
+        let (mint, src, dst) = (pk(1), pk(2), pk(3));
+        let (seller, buyer) = (pk(4), pk(5));
+        let keys = vec![buyer.clone(), seller.clone(), src.clone(), dst.clone()];
+        let mut p = payload(
+            &keys,
+            vec![spl(
+                "transferChecked",
+                json!({"source": src, "destination": dst, "mint": mint}),
+            )],
+            vec![balance(2, &mint, &seller, "1", 0)],
+            vec![balance(3, &mint, &buyer, "1", 0)],
+        );
+        p["transaction"]["meta"]["fee"] = json!(5_000);
+        p["transaction"]["meta"]["preBalances"] = json!([3_000_000_000u64, 0, 0, 0]);
+        p["transaction"]["meta"]["postBalances"] =
+            json!([1_999_995_000u64, 1_000_000_000u64, 0, 0]);
+
+        let out = decode(&p);
+        assert_eq!(out.fee, 5_000);
+        assert_eq!(
+            out.native_deltas,
+            vec![(buyer, -1_000_005_000), (seller, 1_000_000_000),],
+            "non-zero movements only, in account order"
+        );
     }
 
     #[test]
@@ -611,6 +913,7 @@ mod tests {
         let (asset, collection) = (pk(10), pk(11));
         let ctx = DecodeContext {
             core_collections: [collection.clone()].into_iter().collect(),
+            ..DecodeContext::default()
         };
         let keys = vec![pk(50), asset.clone(), collection.clone()];
         let p = payload(
@@ -640,6 +943,7 @@ mod tests {
         let collection = pk(11);
         let ctx = DecodeContext {
             core_collections: [collection.clone()].into_iter().collect(),
+            ..DecodeContext::default()
         };
         let keys = vec![pk(50), collection.clone()];
         let p = payload(

@@ -283,5 +283,9 @@ pub async fn seed_cursor(pool: &PgPool, stream: &str) -> anyhow::Result<Option<u
 pub async fn context(pool: &PgPool) -> anyhow::Result<DecodeContext> {
     Ok(DecodeContext {
         core_collections: crate::spec::core_collections(pool).await?,
+        // Empty on the live path: every balance a 2026 validator produces
+        // carries its own `owner`. The map exists for the archival crawl,
+        // whose 2021 transactions predate that field.
+        token_account_owners: Default::default(),
     })
 }

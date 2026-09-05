@@ -5,6 +5,7 @@
 //! POSTs, while the SDK hard-depends on the whole `solana-sdk`/`solana-client`
 //! tree and defaults to `native-tls`, against this repo's rustls-only policy.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -45,6 +46,64 @@ pub struct BatchResult {
     /// Requested ids DAS does not know. Never silently dropped: the run
     /// reports them so nobody mistakes a short collection for a complete one.
     pub missing: Vec<String>,
+}
+
+/// One transaction from [`DasClient::get_transactions_for_address`].
+///
+/// `value` is the untouched `getTransaction`-shaped object, which is what
+/// lets the archival crawl feed the *same* decoder as the live path.
+#[derive(Debug, Clone)]
+pub struct ArchivedTx {
+    pub signature: String,
+    pub slot: i64,
+    /// Carried by the archival response itself, so the crawl never needs a
+    /// separate `getBlockTime`.
+    pub block_time: Option<DateTime<Utc>>,
+    pub value: Value,
+}
+
+/// One page of [`DasClient::get_transactions_for_address`].
+///
+/// Note the termination rule: Helius returns `pagination_token` **even on the
+/// last non-empty page**, so a caller that stops when the token is `None`
+/// stops one page early on some addresses and never at all on others. Page
+/// until `data` is empty.
+#[derive(Debug, Default)]
+pub struct TxPage {
+    pub data: Vec<ArchivedTx>,
+    pub pagination_token: Option<String>,
+}
+
+/// A minimum spacing between outbound RPC calls.
+///
+/// Hand-rolled for the same reason the retry loop is: one `Instant` and a
+/// mutex held only long enough to claim a slot, against a `governor`/`tower`
+/// dependency the workspace does not otherwise need. The lock is never held
+/// across the sleep, so N concurrent callers queue rather than serialize.
+#[derive(Debug)]
+struct RateLimiter {
+    interval: Duration,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl RateLimiter {
+    fn new(per_second: u32) -> Self {
+        Self {
+            interval: Duration::from_secs_f64(1.0 / f64::from(per_second.max(1))),
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        }
+    }
+
+    async fn acquire(&self) {
+        let deadline = {
+            let mut next = self.next.lock().await;
+            let now = tokio::time::Instant::now();
+            let deadline = (*next).max(now);
+            *next = deadline + self.interval;
+            deadline
+        };
+        tokio::time::sleep_until(deadline).await;
+    }
 }
 
 /// One entry of `getSignaturesForAddress`.
@@ -94,6 +153,9 @@ pub struct DasClient {
     endpoint: String,
     api_key: String,
     max_attempts: u32,
+    /// `None` = unthrottled, which is right for ALG-621's ~18 calls. The
+    /// per-asset archival crawl sets it.
+    limiter: Option<Arc<RateLimiter>>,
 }
 
 impl DasClient {
@@ -116,11 +178,23 @@ impl DasClient {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             max_attempts: 4,
+            limiter: None,
         })
     }
 
     pub fn with_max_attempts(mut self, attempts: u32) -> Self {
         self.max_attempts = attempts.max(1);
+        self
+    }
+
+    /// Caps outbound RPC at `per_second` calls. Shared across clones, so
+    /// handing the same client to N concurrent crawl tasks throttles the
+    /// fleet rather than each task.
+    ///
+    /// Retries pass through the limiter too: a 429 that is retried
+    /// immediately is what earns the next one.
+    pub fn with_rate_limit(mut self, per_second: u32) -> Self {
+        self.limiter = Some(Arc::new(RateLimiter::new(per_second)));
         self
     }
 
@@ -195,6 +269,55 @@ impl DasClient {
         ]);
         let value = self.rpc("getTransaction", params).await?;
         Ok((!value.is_null()).then_some(value))
+    }
+
+    /// Full transaction history for an address, oldest first, in one call.
+    ///
+    /// Helius-only (`getTransactionsForAddress`), and the reason the archival
+    /// crawl is affordable: it replaces `getSignaturesForAddress` plus one
+    /// `getTransaction` per signature with a single paged request, and the
+    /// entries it returns are the same `getTransaction` shape the decoder
+    /// already accepts. `blockTime` rides along, so no `getBlockTime` either.
+    ///
+    /// Page until [`TxPage::data`] is empty — see the note on [`TxPage`].
+    pub async fn get_transactions_for_address(
+        &self,
+        address: &str,
+        pagination_token: Option<&str>,
+        limit: u32,
+    ) -> Result<TxPage, DasError> {
+        let mut options = json!({
+            "transactionDetails": "full",
+            // Oldest first: the crawl derives an ownership chain, and
+            // `activity::record` applies an event only when it is at or after
+            // the asset's frontier. Walking backwards would flag every asset
+            // dirty and hand the whole collection to `rebuild-ownership`.
+            "sortOrder": "asc",
+            "limit": limit,
+            "commitment": "finalized",
+            "encoding": "jsonParsed",
+            "maxSupportedTransactionVersion": 0,
+        });
+        if let Some(token) = pagination_token {
+            options["paginationToken"] = json!(token);
+        }
+        let value = self
+            .rpc("getTransactionsForAddress", json!([address, options]))
+            .await?;
+
+        let pagination_token = value
+            .get("paginationToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let data = value
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|rows| rows.iter().filter_map(archived_tx).collect())
+            .unwrap_or_default();
+        Ok(TxPage {
+            data,
+            pagination_token,
+        })
     }
 
     /// Fetches up to [`MAX_BATCH`] assets, splitting the chunk when DAS
@@ -309,6 +432,9 @@ impl DasClient {
 
         let mut attempt = 1;
         loop {
+            if let Some(limiter) = &self.limiter {
+                limiter.acquire().await;
+            }
             let response = self.http.post(&url).json(&body).send().await;
             let outcome: Result<Value, DasError> = match response {
                 Ok(response) => {
@@ -441,6 +567,31 @@ struct RpcError {
 /// everything else is the server's considered answer. 404 in particular must
 /// be terminal — it is what a dead metadata host returns for every one of a
 /// collection's assets, and retrying would multiply that by `max_attempts`.
+/// One `getTransactionsForAddress` row.
+///
+/// The signature lives at `transaction.signatures[0]` rather than a top-level
+/// field — the row is a `getTransaction` result with `slot`/`blockTime`
+/// alongside, not an enhanced-transaction object. A row without a signature or
+/// a slot is dropped rather than guessed at: it could not be keyed in
+/// `activity` (`UNIQUE (asset_id, signature, seq)`) anyway.
+fn archived_tx(row: &Value) -> Option<ArchivedTx> {
+    let signature = row
+        .pointer("/transaction/signatures/0")
+        .and_then(Value::as_str)?
+        .to_string();
+    let slot = row.get("slot").and_then(Value::as_i64)?;
+    let block_time = row
+        .get("blockTime")
+        .and_then(Value::as_i64)
+        .and_then(|secs| Utc.timestamp_opt(secs, 0).single());
+    Some(ArchivedTx {
+        signature,
+        slot,
+        block_time,
+        value: row.clone(),
+    })
+}
+
 fn is_retryable(error: &DasError) -> bool {
     match error {
         DasError::Transport(_) => true,

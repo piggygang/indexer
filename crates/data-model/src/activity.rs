@@ -92,6 +92,13 @@ pub struct LiveEvent<'a> {
     pub to_owner: Option<&'a str>,
     /// Classifier extras — program ids, instruction name. Never load-bearing.
     pub details: Option<&'a Value>,
+    /// Sale price. `activity_sale_has_price` requires it on every `sale` and
+    /// `activity_price_only_sale` forbids it on every other kind, so a
+    /// marketplace transfer nobody could price stays an honest `transfer`.
+    pub price_lamports: Option<i64>,
+    /// Free-text venue, and only ever on a priced sale. `None` on a sale we
+    /// could not attribute — which the frozen contract explicitly permits.
+    pub marketplace: Option<&'a str>,
     /// `'live' | 'backfill' | 'reconcile' | 'manual'`.
     pub source: &'a str,
 }
@@ -155,8 +162,8 @@ pub async fn record(
     let activity_id: Option<i64> = sqlx::query_scalar(
         "INSERT INTO activity \
             (asset_id, collection_id, signature, seq, slot, block_time, kind, \
-             from_owner, to_owner, details, source) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             from_owner, to_owner, price_lamports, marketplace, details, source) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
          ON CONFLICT (asset_id, signature, seq) DO NOTHING \
          RETURNING id",
     )
@@ -169,6 +176,8 @@ pub async fn record(
     .bind(event.kind)
     .bind(event.from_owner)
     .bind(event.to_owner)
+    .bind(event.price_lamports)
+    .bind(event.marketplace)
     .bind(event.details)
     .bind(event.source)
     .fetch_optional(&mut **tx)
@@ -317,6 +326,276 @@ pub async fn park_signature<'e>(
     .execute(exec)
     .await?;
     Ok(())
+}
+
+/// One row for `asset_signatures`, as the archival crawl produces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawledSignature {
+    pub signature: String,
+    pub slot: i64,
+    /// The archival response carries `blockTime`, so unlike the live path
+    /// this is almost always known.
+    pub block_time: Option<DateTime<Utc>>,
+    pub failed: bool,
+}
+
+/// Stores the raw signatures a crawl saw for one asset.
+///
+/// This is what `asset_signatures` is for: the crawl's durable output, so
+/// reclassification never re-fetches. Re-crawling is a no-op except that a
+/// row parked by the live pipeline (which has no `blockTime` to give) gains
+/// one — that single `WHERE` is what keeps "re-running changes nothing" true.
+pub async fn record_signatures<'e>(
+    exec: impl PgExecutor<'e>,
+    asset_id: i64,
+    rows: &[CrawledSignature],
+) -> sqlx::Result<u64> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let signatures: Vec<&str> = rows.iter().map(|r| r.signature.as_str()).collect();
+    let slots: Vec<i64> = rows.iter().map(|r| r.slot).collect();
+    let block_times: Vec<Option<DateTime<Utc>>> = rows.iter().map(|r| r.block_time).collect();
+    let failed: Vec<bool> = rows.iter().map(|r| r.failed).collect();
+
+    let done = sqlx::query(
+        "INSERT INTO asset_signatures (asset_id, signature, slot, block_time, failed) \
+         SELECT $1, s, l, t, f \
+           FROM unnest($2::text[], $3::bigint[], $4::timestamptz[], $5::boolean[]) \
+                AS batch(s, l, t, f) \
+         ON CONFLICT (asset_id, signature) DO UPDATE \
+            SET block_time = EXCLUDED.block_time \
+          WHERE asset_signatures.block_time IS NULL \
+            AND EXCLUDED.block_time IS NOT NULL",
+    )
+    .bind(asset_id)
+    .bind(&signatures)
+    .bind(&slots)
+    .bind(&block_times)
+    .bind(&failed)
+    .execute(exec)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Marks signatures as classified. `classified_at IS NULL` is how
+/// `asset_signatures` documents "pending", and until now nothing ever cleared
+/// it — the partial index had no consumer.
+pub async fn mark_classified<'e>(
+    exec: impl PgExecutor<'e>,
+    asset_id: i64,
+    signatures: &[String],
+) -> sqlx::Result<u64> {
+    if signatures.is_empty() {
+        return Ok(0);
+    }
+    let done = sqlx::query(
+        "UPDATE asset_signatures SET classified_at = now() \
+          WHERE asset_id = $1 AND signature = ANY($2) AND classified_at IS NULL",
+    )
+    .bind(asset_id)
+    .bind(signatures)
+    .execute(exec)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Signatures this asset has stored but never classified, oldest first.
+pub async fn pending_signatures<'e>(
+    exec: impl PgExecutor<'e>,
+    asset_id: i64,
+) -> sqlx::Result<Vec<CrawledSignature>> {
+    sqlx::query_as(
+        "SELECT signature, slot, block_time, failed FROM asset_signatures \
+          WHERE asset_id = $1 AND classified_at IS NULL ORDER BY slot, signature",
+    )
+    .bind(asset_id)
+    .fetch_all(exec)
+    .await
+    .map(|rows: Vec<(String, i64, Option<DateTime<Utc>>, bool)>| {
+        rows.into_iter()
+            .map(|(signature, slot, block_time, failed)| CrawledSignature {
+                signature,
+                slot,
+                block_time,
+                failed,
+            })
+            .collect()
+    })
+}
+
+/// Throws away everything derived for one asset so it can be re-derived from
+/// the stored signatures.
+///
+/// The migration describes reclassification as "DELETE the (asset, signature)
+/// rows + re-insert, then rebuild". Doing it per signature leaves the asset's
+/// intervals half-derived from the old classification, so the whole-asset form
+/// is the honest one: intervals, activity, the activity-derived `assets`
+/// columns and the `classified_at` marks all go together, and the next crawl
+/// pass rebuilds them in slot order. The raw `asset_signatures` rows survive —
+/// that is the point of storing them.
+pub async fn reset_for_reclassify(
+    tx: &mut Transaction<'_, Postgres>,
+    asset_id: i64,
+) -> sqlx::Result<u64> {
+    sqlx::query("DELETE FROM ownership_history WHERE asset_id = $1")
+        .bind(asset_id)
+        .execute(&mut **tx)
+        .await?;
+    let removed = sqlx::query("DELETE FROM activity WHERE asset_id = $1")
+        .bind(asset_id)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+    // `activity_touch_assets` is an INSERT trigger, so a delete never moves
+    // these back; clearing them lets the re-insert set them afresh.
+    sqlx::query(
+        "UPDATE assets \
+            SET last_activity_slot = NULL, last_activity_at = NULL, ownership_dirty = false \
+          WHERE id = $1",
+    )
+    .bind(asset_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE asset_signatures SET classified_at = NULL WHERE asset_id = $1")
+        .bind(asset_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(removed)
+}
+
+/// Recomputes `assets.last_activity_*` from the surviving activity rows.
+///
+/// The `activity_touch_assets` trigger is monotonic on inserts only, which the
+/// migration flags: "a reclassification that deletes rows recomputes
+/// explicitly (ALG-622)". This is that recompute, for a caller that deleted
+/// some of an asset's events but not all of them.
+pub async fn recompute_last_activity<'e>(
+    exec: impl PgExecutor<'e>,
+    asset_id: i64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE assets a \
+            SET last_activity_slot = n.slot, last_activity_at = n.block_time \
+           FROM (SELECT max(slot) AS slot, max(block_time) AS block_time \
+                   FROM activity WHERE asset_id = $1) n \
+          WHERE a.id = $1 \
+            AND (a.last_activity_slot, a.last_activity_at) \
+                IS DISTINCT FROM (n.slot, n.block_time)",
+    )
+    .bind(asset_id)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
+/// A stored `transfer` that carries everything needed to become a `sale`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepriceCandidate {
+    pub id: i64,
+    pub asset_id: i64,
+    /// `details`, which carries the invoked program ids and the price the
+    /// classifier derived at crawl time.
+    pub details: Value,
+}
+
+/// Stored transfers a new venue could turn into sales, keyset-paged.
+///
+/// This is what makes reclassification a database-only pass: only signatures
+/// are stored, never transaction bodies, so without the price the classifier
+/// already computed, teaching the registry a new marketplace would mean
+/// crawling the chain a second time.
+pub async fn reprice_candidates<'e>(
+    exec: impl PgExecutor<'e>,
+    collection_id: i32,
+    after_id: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<RepriceCandidate>> {
+    sqlx::query_as(
+        "SELECT id, asset_id, details FROM activity \
+          WHERE collection_id = $1 AND id > $2 AND kind = 'transfer' \
+            AND details ? 'price_candidate' \
+          ORDER BY id LIMIT $3",
+    )
+    .bind(collection_id)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(exec)
+    .await
+    .map(|rows: Vec<(i64, i64, Value)>| {
+        rows.into_iter()
+            .map(|(id, asset_id, details)| RepriceCandidate {
+                id,
+                asset_id,
+                details,
+            })
+            .collect()
+    })
+}
+
+/// Promotes one stored transfer to a priced sale.
+///
+/// Ownership is untouched: a `sale` and a `transfer` carry the same sender and
+/// receiver and are treated identically by `rebuild_ownership`, so re-labelling
+/// one never needs the intervals rebuilt. The guard keeps a re-run a true
+/// no-op.
+pub async fn promote_to_sale<'e>(
+    exec: impl PgExecutor<'e>,
+    activity_id: i64,
+    price_lamports: i64,
+    marketplace: Option<&str>,
+) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE activity \
+            SET kind = 'sale', price_lamports = $2, marketplace = $3 \
+          WHERE id = $1 AND kind = 'transfer' \
+            AND (price_lamports, marketplace) IS DISTINCT FROM ($2, $3)",
+    )
+    .bind(activity_id)
+    .bind(price_lamports)
+    .bind(marketplace)
+    .execute(exec)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Does the asset's derived history agree with its observed owner?
+///
+/// Asks `integrity_owner_mismatch` about one asset, so a backfill's own
+/// self-check and the acceptance query (`SELECT count(*) FROM
+/// integrity_owner_mismatch`) can never drift apart. False only when the asset
+/// has history *and* its open interval disagrees — an asset with no history
+/// yet is not a disagreement.
+pub async fn owner_agrees<'e>(exec: impl PgExecutor<'e>, asset_id: i64) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT 1 FROM integrity_owner_mismatch WHERE asset_id = $1)",
+    )
+    .bind(asset_id)
+    .fetch_one(exec)
+    .await
+}
+
+/// One keyset page of a collection's assets, for a per-asset pass.
+///
+/// `assets_in_collection` loads the whole collection at once, which is right
+/// for a reconnect sweep and wrong for a crawl that commits a cursor every
+/// batch.
+pub async fn assets_after<'e>(
+    exec: impl PgExecutor<'e>,
+    collection_id: i32,
+    after_id: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<AssetRef>> {
+    sqlx::query_as(
+        "SELECT id, address, collection_id, owner, owner_slot, burned FROM assets \
+          WHERE collection_id = $1 AND id > $2 AND membership_status = 'member' \
+          ORDER BY id LIMIT $3",
+    )
+    .bind(collection_id)
+    .bind(after_id)
+    .bind(limit)
+    .fetch_all(exec)
+    .await
 }
 
 /// Assets whose history could not be applied in order, oldest flag first.
