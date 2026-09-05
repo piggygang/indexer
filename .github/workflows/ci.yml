@@ -38,10 +38,19 @@ jobs:
       # The Dockerfile stages config/ into the admin image with a literal
       # `${BIN}` = "indexer-admin" compare. A package rename would otherwise
       # produce a green build whose `seed` fails only at run time.
-      - name: Dockerfile config staging matches the admin package name
+      #
+      # The ingester needs the same guard for a different reason: `BIN` is a
+      # service variable set only in .railway/railway.ts, which is dockerignored,
+      # in no watchPatterns and never otherwise parsed here — and the IaC engine
+      # ships in the CLI, so there is no offline typecheck of that file. Without
+      # these greps a package rename is green in CI and fails on Railway with
+      # `no bin target named 'indexer-ingester'`.
+      - name: BIN literals match their package names
         run: |
           grep -qF 'name = "indexer-admin"' services/admin/Cargo.toml
           grep -qF '"${BIN}" = "indexer-admin"' Dockerfile
+          grep -qF 'name = "indexer-ingester"' services/ingester/Cargo.toml
+          grep -qF 'BIN: "indexer-ingester"' .railway/railway.ts
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # DB tests are #[ignore]d so a laptop without Postgres stays green;

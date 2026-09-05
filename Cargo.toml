@@ -21,6 +21,13 @@ indexer-ingest = { path = "crates/ingest" }
 # `cargo tree -d` must keep showing one rustls and one provider. (reqwest 0.13
 # would default to rustls-platform-verifier + aws-lc-rs, hence the 0.12 pin.)
 #
+# tokio-tungstenite is the trap: its `rustls-tls-webpki-roots` pulls
+# `rustls = { default-features = false }` with NO provider feature. A workspace
+# build gets ring anyway through reqwest's unification, but `cargo build -p
+# indexer-ingest` alone would link a provider-less rustls that panics at
+# connect. So rustls is declared here with `ring` explicitly and the ws adapter
+# installs it as the process default.
+#
 # ALG-621 deliberately does NOT use the `helius` SDK: it hard-depends on the
 # whole solana-sdk/solana-client tree and defaults to native-tls, for what is
 # a handful of JSON-RPC POSTs. crates/das speaks DAS directly over reqwest.
@@ -37,9 +44,11 @@ futures-core = "0.3"
 futures-util = "0.3"
 log = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "gzip", "rustls-tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate", "macros"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 toml = "0.8"

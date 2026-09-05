@@ -2,6 +2,12 @@
 
 This project defines its Railway infrastructure in code.
 
+> **This file is Railway's scaffold, kept as generated.** Where it disagrees
+> with the root `README.md`, the root README wins. Two places it does: this repo
+> never passes `--confirm-destructive` (needing it is the abort signal), and it
+> does not apply IaC from CI — there is no `railwayapp/config` workflow here, and
+> a merge applies nothing. `plan` and `apply` are run from a workstation.
+
 ```txt
 .railway/railway.ts
 ```

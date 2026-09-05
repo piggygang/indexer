@@ -30,10 +30,17 @@ included in **Business ($499/mo)**. That is still disproportionate for this
 scale, so we start without LaserStream:
 
 - **Primary mainnet transport: Enhanced WebSockets** (`transactionSubscribe`,
-  `accountSubscribe`/`programSubscribe`). Included in Developer. Since
-  2026-03 these run on LaserStream infrastructure: ~24h replay, ordered
-  delivery, multi-region. Metered at 20 credits/MB (~$100/TB) from the plan's
-  10M monthly credits — tight filters are essential.
+  `accountSubscribe`/`programSubscribe`). Included in Developer — confirmed:
+  `transactionSubscribe` reached that tier on 2026-04-07, on the unified
+  `wss://mainnet.helius-rpc.com`, with 150 connections and 1 000 subscriptions
+  each. Since 2026-03 they run on LaserStream infrastructure: ordered delivery,
+  multi-region. Metered at 20 credits/MB (~$100/TB) from the plan's 10M monthly
+  credits — tight filters are essential.
+  **They do not offer replay.** `fromSlot` is a LaserStream *gRPC* parameter;
+  the WebSocket API exposes no replay and no resume (corrected 2026-09-03,
+  ALG-623 — this record previously attributed gRPC's 24h window to the
+  WebSocket transport). Gap recovery is therefore the durable cursor plus DAS
+  reconciliation, not the transport.
 - **Supplementary:** Helius webhooks (1 credit/event, up to 100k addresses,
   but 3-retries-then-lost delivery — never a source of truth) and DAS
   reconciliation sweeps (10 credits/call; a full ~25k-asset re-scan is ~250
@@ -46,17 +53,19 @@ swapping transports is a config change plus an adapter, zero pipeline edits):
 
 | Transport | Cost (2026-08-27) | Notes |
 |---|---|---|
-| Enhanced WebSockets (chosen) | in Developer $49/mo | 24h replay, ordered; JSON adapter |
+| Enhanced WebSockets (chosen) | in Developer $49/mo | ordered; JSON adapter; **no replay** — gaps are closed by DAS reconciliation |
 | LaserStream gRPC | Business $499/mo | 10 concurrent conns; free trial via contact form; same Yellowstone wire protocol |
 | Third-party Yellowstone gRPC | Triton PAYG $125 deposit + $0.08/GB; Chainstack ~$98/mo; Shyft $199/mo | wire-compatible URL+token swap; no Helius 24h replay |
 | Webhooks + DAS sweep | ~free (fits even lower tiers) | weakest delivery guarantees; DAS sweep becomes source of truth |
 
-**Replay caveats:** the ~24h replay window delivers finalized-only data beyond
-~20 minutes, and a disconnect mid-replay can skip slots (laserstream-sdk
-issue #115). Durable resume therefore never trusts transport replay: the
-consumer persists `last_processed_slot` in Postgres (`ingest_state`) and DAS
-reconciliation (ALG-624) is the safety net. Downtime beyond the replay window
-triggers targeted re-backfill.
+**Replay caveats:** the 24h replay window is a **LaserStream gRPC** feature —
+`fromSlot` on the `SubscribeRequest` — and even there it delivers
+finalized-only data beyond ~20 minutes, with a disconnect mid-replay able to
+skip slots (laserstream-sdk issue #115). On the WebSocket transport we actually
+use there is no replay at all, so durable resume never trusts the transport in
+the first place: the consumer persists `last_processed_slot` in `ingest_state`
+and reconciles `(cursor, tip]` against DAS on every reconnect (ALG-623), with
+the periodic sweep (ALG-624) as the standing safety net.
 
 ### Hosting + Postgres: Railway (EU West Metal, Amsterdam)
 
@@ -91,8 +100,7 @@ services/
   api/         indexer-api — REST API (today: /health, /ready)
 ```
 
-Future member (the workspace globs already cover it): `services/ingester`
-(ALG-623). The `api` service deliberately does not watch `config/**` or
+`services/ingester` (ALG-623) is the third binary. The `api` service deliberately does not watch `config/**` or
 `services/admin/**` — neither is part of the API image. The `admin` service
 watches both, because the registry seed ships inside *its* image.
 
@@ -154,7 +162,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `PORT` | no | `8080` | injected by Railway |
 | `HOST` | no | `::` | dual-stack bind; Railway private networking needs the IPv6 bind |
 | `RUST_LOG` | no | `info` | |
-| `HELIUS_API_KEY` | `admin backfill` | — | Helius Developer key. Read only by the subcommand that needs it, so `migrate`/`seed` still run without one; ALG-623 will need it too |
+| `HELIUS_API_KEY` | `admin backfill`, `ingester` | — | Helius Developer key. The admin CLI reads it only in the subcommand that needs it, so `migrate`/`seed` still run without one; the ingester requires it at boot |
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
@@ -335,6 +343,7 @@ builds the Dockerfile → `/health` must return 200 → traffic cutover. Rollbac
 |---|---|---|---|---|
 | `api` | `indexer-api` (default `BIN`) | image `CMD` | `/health`, 120 s | serves traffic |
 | `admin` | `indexer-admin` (`BIN=indexer-admin`) | idles — see below | none | a container to `railway ssh` into and run `migrate` / `seed` against Postgres over the private network |
+| `ingester` | `indexer-ingester` (`BIN=indexer-ingester`) | image `CMD` | none — binds no port | the ALG-623 live pipeline: one long-lived `transactionSubscribe`, writing ownership and activity |
 
 **Deployment contract:** the Dockerfile builds workspace binary
 `${BIN}` (default `indexer-api`) and installs it under **its own name** at
@@ -345,10 +354,15 @@ build arg; `exec` hands PID 1 to the binary. There is deliberately **no
 `ENTRYPOINT`** — a Railway start command replaces the ENTRYPOINT, and whether
 an image `CMD` is then appended as arguments is undocumented. A service that
 serves traffic must listen on `[::]:$PORT`; `RAILWAY_GIT_COMMIT_SHA` is passed
-as a build arg and baked into `/health` as `commit`. The future ingester service
-reuses the same Dockerfile with service variable `BIN=indexer-ingester` and
-becomes a third `service()` in `.railway/railway.ts` (no healthcheck, restart
-policy `ALWAYS`).
+as a build arg and baked into `/health` as `commit`. The `ingester` service
+reuses the same Dockerfile with service variable `BIN=indexer-ingester`. It sets
+no healthcheck — unset means the deploy goes Active as soon as the container
+starts, which is what a service that binds no port needs — and **no restart
+policy**: `restartPolicyType`, `restartPolicyMaxRetries` and `sleepApplication`
+are the three fields `config apply` silently drops, so the binary supervises
+itself and leans on Railway's default `ON_FAILURE`. (The rest of the `deploy`
+block *does* reach the service — `healthcheckPath`, `healthcheckTimeout`,
+`multiRegionConfig` and `startCommand` are all live on `api` and `admin`.)
 
 The `admin` container idles on purpose. `indexer-admin` is a CLI with a
 *required* subcommand, so the image's default `CMD` would exit 2 immediately and
@@ -392,6 +406,15 @@ railway config pull                          # live project → authoring code
 railway config plan --detailed-exit-code     # read-only; 0 = no drift, 2 = pending
 railway config apply --plan <pinned> --yes
 ```
+
+**Nothing applies this file but you.** `plan`/`apply` read `.railway/railway.ts`
+from the working tree and reconcile the *linked* project — there is no
+`--environment` flag, the target comes from `railway link`. No CI job runs the
+CLI, and Railway's GitHub integration deploys images: it never reads `.railway/`,
+which is also dockerignored and in no service's watch patterns. So merging to
+`main` changes project config not at all — it only redeploys existing services
+whose watch patterns match. Treat `plan` exiting 0 as the standing drift check;
+if it does not, the committed file and production have diverged.
 
 **Always author `railway.ts` from `railway config pull`, never by hand and
 never from `railway config migrate`.** IaC treats omission as deletion, so a
@@ -623,18 +646,52 @@ psql "$DATABASE_URL" -c "SELECT c.slug, s.status, s.progress \
 Ids DAS does not know are counted and sampled into `progress.missing`, never
 invented as rows to make a supply count reconcile.
 
+### First full run (2026-09-02, mainnet)
+
+| collection | rule | members | burned | supply | holders | attrs | documents | elapsed |
+|---|---|---|---|---|---|---|---|---|
+| piggy-sol-gang | tm_allowlist | 10 000 | 1 847 | 8 153 | 2 817 | 89 775 | 9 975 | 247 s |
+| piggy-girl-gang | tm_allowlist | 5 000 | 0 | 5 000 | 1 883 | 45 000 | 5 000 | 68 s |
+| pig-mud | tm_allowlist | 2 073 | 0 | 2 073 | 915 | 2 068 | 0 | 32 s |
+| piggy-gang | core_collection | 747 | 2 | 745 | 103 | 4 965 | 747 | 21 s |
+
+`members` equals the registry mint count for all three allowlist collections, 0
+ids were unknown to DAS, and `integrity_allowlist_violation`,
+`integrity_symbol_mismatch` and `integrity_owner_mismatch` are all empty. The
+immediate re-run reported every asset `unchanged`, `--expect-unchanged` exited
+0, and `count(*) WHERE updated_at > $t0` was 0 on `assets` and 0 on
+`asset_documents` — the three independent forms of the no-op proof. PSG, PGG
+and the Core collection issued **zero** HTTP document requests on that second
+pass.
+
+Two things the run taught us that the config had wrong:
+
+- **Pig Mud is not trait-less.** DAS still serves metadata it cached before the
+  collection's host died, and it carries exactly one trait — a per-asset-unique
+  `Name` ("Pig Mud #348"). The backfill's facet-cardinality warning caught it on
+  a five-asset smoke run, and the fix was one `facet_exclude` line. Its documents
+  remain unfetchable: the on-chain URIs point at `storageapi.fleek.co`, which
+  answers **HTTP 530**, not 404 — so unlike a truly absent host each asset costs
+  the full retry budget, which is the whole 30 s of a pig-mud no-op run. That
+  disappears when the files are re-hosted.
+- **Burns do not track the Core swap.** 1 847 SOL Gang pigs are burned but only
+  747 Core assets exist, so roughly 1 100 were burned without a corresponding
+  Core mint. Worth knowing before anyone reads `supply` as "10 000 minus swaps".
+
 ### Running it on Railway
 
-Not wired up yet, and it needs two changes **in this order**, because IaC
-treats a `preserve()` for a variable that does not exist as a change to
-reconcile:
+Both halves are in place. `HELIUS_API_KEY` is set on the `admin` service —
+`preserve()` does not copy a value between services, so it had to be set there
+directly — and the `admin` env block in `.railway/railway.ts` now declares
+`HELIUS_API_KEY: preserve()` to match.
 
-1. Set `HELIUS_API_KEY` on the `admin` service (dashboard or
-   `railway variables --service admin --set ...`). Today the key exists only
-   on `api`; `preserve()` does not copy a value between services.
-2. Add `HELIUS_API_KEY: preserve()` to the `admin` env block in
-   `.railway/railway.ts`, then `railway config plan`, read every line, then
-   `apply`. Never `--confirm-destructive`.
+The second half was originally skipped, and the gap is the cautionary tale: IaC
+treats omission as deletion, so from the moment the key was set until the moment
+it was declared, every `railway config plan` carried a destructive
+`- Delete variable admin.HELIUS_API_KEY`. Nothing applied it — merging never
+applies IaC — but it made `plan` unusable as a drift check and it would have
+taken the key with it on the next apply. **Set the variable and declare it in
+the same change.**
 
 Also note `DATABASE_MAX_CONNECTIONS = "2"` on `admin`: enough for the backfill,
 which uses one pooled connection at a time, but leaves no headroom if a second
@@ -644,13 +701,164 @@ one-off run overlaps.
 railway ssh --service admin -- indexer-admin backfill --slug piggy-sol-gang
 ```
 
+## Live pipeline (ALG-623)
+
+`indexer-ingester` keeps the database current from Helius Enhanced WebSockets:
+ownership changes, Core mints, metadata refreshes and the `activity` timeline.
+It is the first writer of `activity` and `ownership_history` in this repo.
+
+```sh
+cargo run -p indexer-ingester                       # needs HELIUS_API_KEY
+cargo run -p indexer-admin -- rebuild-ownership     # repair flagged assets
+```
+
+**One subscription, one connection.** `transactionSubscribe` with
+`accountInclude` = all 17 073 tracked mints plus the Core collection address —
+`accountInclude` accepts up to 50 000, so it fits, and server-side filtering
+means only our own transactions are delivered (~100 credits/day against 10M).
+One filter rather than one per collection because a swap burns a SOL Gang pig
+and mints a Core asset **in the same signature**: per-collection filters would
+deliver and bill for that transaction twice. Commitment is `confirmed`;
+`processed` can be rolled back and there is no un-write path for an activity
+row. The Core arm is why the address list is stable — Core passes the
+collection account on every member instruction, so one address catches
+transfers *and mints of assets that do not exist yet*, and individual Core
+asset addresses never enter the filter.
+
+**Classification comes from balances, not instruction shapes.** The decoder
+reads `meta.preTokenBalances`/`postTokenBalances`, so it is correct for
+`transfer` (which carries no mint), `transferChecked`, a CPI transfer inside a
+marketplace instruction, and token-2022 alike. It gates on
+`decimals == 0 && amount == "1"` so a SOL or `$PIGGY` leg in the same
+transaction is never read as an NFT move. No on-chain address appears in Rust:
+`jsonParsed` labels SPL instructions by name, and Metaplex Core is recognised
+structurally against the collection address the registry supplies.
+
+**Sales are not classified here.** A marketplace-mediated change is recorded
+honestly as a `transfer`, with the invoked program ids in `activity.details` so
+ALG-622 can reclassify it into a priced `sale` without re-fetching. Inventing a
+price to satisfy `activity_sale_has_price` would be worse than an honest
+transfer.
+
+**Gap recovery, because the transport has none.** There is no `fromSlot` on
+WebSockets, so `ResumeFrom::Slot` is honoured as a *floor* and the consumer
+reconciles `(cursor, tip]` on **every** `Connected` — cold start, crash restart
+and mid-run reconnect are one code path. Tier 1 sweeps every tracked asset
+through `getAssetBatch` (~18 calls, ~200 credits) into the backfill's own
+`upsert_batch`, whose `owner_slot` guard means a sweep can never clobber a
+newer live observation. Tier 2 takes the assets that disagree and walks
+`getSignaturesForAddress` back to the cursor, replaying each transaction
+through the *same* decoder and writer tagged `source = 'reconcile'`.
+
+What it cannot recover, stated rather than papered over: an ownership
+round-trip inside one gap (a state diff sees no change), and a transaction that
+never names the asset — a legacy `spl_token::transfer` between two existing
+ATAs carries no mint, so neither the filter nor `getSignaturesForAddress(mint)`
+sees it. In both cases the *state* is still corrected and no activity row is
+invented. Measure the second one before relying on the timeline being complete;
+if coverage is short, ALG-624's periodic sweep is load-bearing rather than
+optional.
+
+**Out-of-order events are flagged, not applied.** An event predating the
+asset's open interval — or one whose `from_owner` disagrees with it, which
+means an intermediate event was missed — is stored and sets
+`assets.ownership_dirty`. `indexer-admin rebuild-ownership` re-derives that
+asset's intervals from stored activity and clears the flag.
+
+**Operational notes.** The binary supervises itself (Railway's default
+`ON_FAILURE` gives up after ten retries, and `deploy.restartPolicyType` is
+silently dropped by `config apply`), installs a real SIGTERM handler because
+the Dockerfile execs it as PID 1, and exits if the checkpoint stops advancing
+so the restart policy brings it back into a reconciling start. Progress is
+durable in `ingest_state`, whose `updated_at` moves on every checkpoint even
+when the slot does not — so `now() - updated_at > 2 min` is an external
+"wedged" predicate for ALG-628.
+
+### First live run (2026-09-03/04, mainnet)
+
+Connected and subscribed with a single filter carrying 17 821 addresses (the
+~770 KB subscribe frame is accepted), `rootSubscribe` supplied checkpoints, and
+the first reconcile swept 17 820 assets and recovered 4 real transfers from the
+gap since the backfill, with matching `ownership_history` intervals and
+`integrity_owner_mismatch` empty. `kill -TERM` exited cleanly in under a
+second.
+
+That run also found a real bug worth recording: DAS returns `owner: ""` —
+an empty string, not null — for 65 of the 17 820 assets. The writer's
+`is_pubkey` guard correctly stored NULL, so the reconciliation diff compared
+`Some("")` against `None` and re-queried those assets on *every* reconnect
+forever. `Asset::owner()` now treats an empty string as "not known", and the
+candidate count fell from 65 to 1 — the 1 being a genuine ownership change.
+
+### Deploying it
+
+The `ingester` block is in `.railway/railway.ts` — **it has not been applied**.
+Nothing applies it on merge: Railway's GitHub integration deploys images and
+never reads `.railway/`, so merging lands the code with no service to run it.
+Merging *does* rebuild `api` and `admin`, whose watch patterns match `crates/**`.
+
+Merge first, apply second. Merge-first leaves git ahead of Railway, so `plan`
+reads `1 to add, 0 to change, 0 to destroy` throughout the window — additive,
+and still usable as a drift check. Applying first would leave Railway ahead of
+git, where a `plan` from `main` proposes `- Delete service ingester`, and the
+service's source is pinned to `branch: "main"`, so its first build would fail
+with `no bin target named 'indexer-ingester'`.
+
+1. Merge, and wait for `api` and `admin` to reach a fresh ACTIVE deployment on
+   the merge commit. The `admin` redeploy replaces its container, so finish any
+   `railway ssh` session first.
+2. From a clean `main` checkout, `npm ci` (never `npm install`: `railway` is
+   pinned with a caret and the SDK's `postgres()` hardcodes the database image),
+   then pin and apply the plan:
+
+   ```sh
+   railway config plan --out ~/railway-plans/indexer-$(date +%F).json --verbose
+   railway config apply --plan ~/railway-plans/indexer-$(date +%F).json --yes
+   ```
+
+   Read every line first; expect only `+ Create service ingester`. Commit before
+   pinning — `--source-tree` defaults to `git rev-parse HEAD:.railway`, so an
+   artifact built from a dirty tree records a tree you did not plan. Never
+   `--confirm-destructive`: it is a whole-run gate, not a per-change one.
+3. The moment `apply` returns, set the key:
+
+   ```sh
+   printf '%s' '<helius key>' | railway variable set HELIUS_API_KEY --stdin --service ingester
+   ```
+
+   `--stdin` keeps it out of shell history, and omitting `--skip-deploys` is
+   deliberate — setting a variable triggers a deploy, so this starts the first
+   one with the key present. `preserve()` preserves nothing on a service that
+   did not exist a moment ago, and the binary requires the key at boot. The
+   first build is a cold cargo-chef cook, which is the window; miss it and it
+   crash-loops until Railway's default `ON_FAILURE`/10 gives up, and the
+   `variable set` redeploy recovers it.
+4. `railway config plan --detailed-exit-code` must exit **0**. That zero is the
+   acceptance test — committed and live config agree again.
+5. Seed the registry: this release changes `config/collections.toml`, and
+   rebuilding the admin image is not a seed.
+
+   ```sh
+   railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml
+   ```
+
+   `spec.rs` derives the subscription from the **database**, not from TOML, so a
+   collection that has never been backfilled contributes no addresses. The
+   consumer re-polls the registry and hot-swaps the spec, so seed and backfill
+   can follow the deploy without a restart.
+
+To back it out: `railway service delete --service ingester` **first**, then
+revert on `main`. Deleting the block from `railway.ts` first produces
+`- Delete service ingester`, which the abort list forbids applying; reverting
+the merge alone rebuilds the service into a `no bin target` failure.
+
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
 - ALG-620 — freeze v1 API contract (OpenAPI) + mock server for Explorer — done
 - ALG-621 — DAS backfill (assets, attributes, owners) — done
 - ALG-622 — historical activity backfill (archival API)
-- ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service
+- ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service — done
 - ALG-624 — reconciliation: periodic DAS diff + self-heal
 - ALG-625/626 — public REST API (browse/facets, detail/activity/portfolio)
 - ALG-627 — rarity scoring · ALG-628 — prod monitoring/alerting · ALG-629 — external collections

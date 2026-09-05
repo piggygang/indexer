@@ -15,6 +15,7 @@
 //! - Queries are runtime-checked (`sqlx::query`/`query_as`), so neither the
 //!   Docker build nor CI needs a database at compile time.
 
+pub mod activity;
 pub mod assets;
 pub mod attributes;
 pub mod facets;

@@ -57,8 +57,14 @@ verified_creator = "5uJo36TpiSjGCjLQXvyqCugZRJAPWs4F97m68hrxV6bJ"
 update_authority = "7NsngNMtXJNdHgeK4znQDZ5xVzT2nkGoGRGhMWApejCV"
 symbol = "PMUD"
 mints = { file = "seeds/pig-mud.mints.json", count = 2073 }
-# On-chain URIs point at shdw-drive (dead) and no re-host exists yet: add a
-# metadata_uri_template here once the files are re-hosted.
+# On-chain URIs point at storageapi.fleek.co, which answers HTTP 530 (origin
+# unreachable) for every asset — so the backfill retries each one and stores no
+# document. Add a metadata_uri_template here once the files are re-hosted and
+# the next run fills them in; no code change needed.
+# DAS still serves metadata it cached before that host died, and the only trait
+# it carries is a per-asset-unique "Name" ("Pig Mud #348") — stored and shown on
+# the detail page, never a facet. Surfaced by the backfill's cardinality warning.
+facet_exclude = ["Name"]
 
 [[collections]]
 slug = "piggy-gang"

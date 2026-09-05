@@ -6,7 +6,7 @@ pub type Slot = u64;
 /// stage (ALG-623). Pipeline code MUST NOT match on the variants — only the
 /// ingest crate's own decode module may. That containment is the abstraction
 /// boundary.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RawPayload {
     /// Enhanced WebSockets notification (jsonParsed transaction + meta).
     Json(serde_json::Value),
@@ -59,7 +59,7 @@ pub struct AccountUpdate {
     pub txn_signature: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TransactionUpdate {
     /// Which [`crate::SubscriptionSpec`] entries matched this event.
     pub filters: Vec<FilterId>,

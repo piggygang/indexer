@@ -550,3 +550,20 @@ pub async fn stored_documents<'e>(
     .fetch_all(exec)
     .await
 }
+
+/// Member addresses of one collection — the subscription filter for a
+/// `tm_collection`, whose certified collection mint never appears in a
+/// member's transfer, so the members themselves must be the filter.
+pub async fn member_addresses<'e>(
+    exec: impl PgExecutor<'e>,
+    collection_id: i32,
+) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar(
+        "SELECT address FROM assets \
+          WHERE collection_id = $1 AND membership_status = 'member' \
+          ORDER BY address",
+    )
+    .bind(collection_id)
+    .fetch_all(exec)
+    .await
+}
