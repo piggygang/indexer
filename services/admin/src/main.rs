@@ -1,6 +1,7 @@
-//! Operational commands: migrations, the registry seed and the facet
-//! benchmark. Runs from a workstation (`DATABASE_URL` = local compose or
-//! Railway's public URL) or as a one-off Railway job (`BIN=indexer-admin`).
+//! Operational commands: migrations, the registry seed, the DAS backfill and
+//! the facet benchmark. Runs from a workstation (`DATABASE_URL` = local
+//! compose or Railway's public URL) or as a one-off Railway job
+//! (`BIN=indexer-admin`).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -9,6 +10,8 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use indexer_config::Config;
+use indexer_das::backfill::{self, BackfillOptions};
+use indexer_das::DasClient;
 use indexer_data_model::facets::{self, TraitSelection};
 use indexer_data_model::seed::{self, Outcome};
 use indexer_data_model::synth::{self, SyntheticSpec};
@@ -18,7 +21,7 @@ use indexer_data_model::{registry, PgPool};
 #[command(
     name = "indexer-admin",
     version,
-    about = "Operational commands: migrations, registry seed, benchmarks"
+    about = "Operational commands: migrations, registry seed, DAS backfill, benchmarks"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -42,6 +45,40 @@ enum Cmd {
         /// Permit changing standard/address/verified_creator of a collection that has assets.
         #[arg(long)]
         allow_identity_change: bool,
+    },
+    /// DAS backfill: assets, attributes and owners (ALG-621). Idempotent —
+    /// re-running an unchanged collection writes nothing and fetches nothing.
+    Backfill {
+        /// Only this collection (default: every enabled collection).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Continue from backfill_state instead of restarting at the first member.
+        #[arg(long)]
+        resume: bool,
+        /// Stop after this many members per collection (smoke run; leaves status = running).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Members per DAS call and per transaction (DAS caps getAssetBatch at 1000).
+        #[arg(long, default_value_t = 1000)]
+        batch: usize,
+        /// Concurrent off-chain metadata fetches.
+        #[arg(long, default_value_t = 16)]
+        fetch_concurrency: usize,
+        /// Skip the off-chain metadata fetch — write only what DAS returns.
+        #[arg(long)]
+        das_only: bool,
+        /// Re-fetch documents even when metadata_source_uri already matches.
+        #[arg(long)]
+        refetch_documents: bool,
+        /// Extra pass: probe image_uri reachability, set image_status/image_checked_at.
+        #[arg(long)]
+        check_images: bool,
+        /// Re-probe images checked longer ago than this (with --check-images).
+        #[arg(long, default_value_t = 30)]
+        recheck_images_after_days: i32,
+        /// Fail when anything would change — the "re-running changes nothing" proof.
+        #[arg(long)]
+        expect_unchanged: bool,
     },
     /// Synthetic data + facet timings — the ALG-619 "< 100 ms" acceptance evidence.
     Bench {
@@ -125,6 +162,50 @@ async fn main() -> anyhow::Result<()> {
                 println!("seed is a no-op, as expected");
             }
         }
+        Cmd::Backfill {
+            slug,
+            resume,
+            limit,
+            batch,
+            fetch_concurrency,
+            das_only,
+            refetch_documents,
+            check_images,
+            recheck_images_after_days,
+            expect_unchanged,
+        } => {
+            // Resolved here, not at boot: `migrate` and `seed` must keep
+            // working on a machine with no Helius key.
+            let das = DasClient::new(config.helius.required_api_key()?)?;
+            let options = BackfillOptions {
+                slug,
+                resume,
+                limit,
+                batch,
+                fetch_concurrency,
+                das_only,
+                refetch_documents,
+                check_images,
+                recheck_images_after_days,
+            };
+            let report = backfill::run(&pool, &das, &options, print_batch_progress).await?;
+            print_backfill_report(&report);
+
+            if expect_unchanged && !report.is_noop() {
+                bail!(
+                    "backfill was expected to be a no-op but changed: {:?}",
+                    report.totals()
+                );
+            }
+            if let Some(failed) = report
+                .collections
+                .iter()
+                .find(|c| c.status == "failed")
+                .map(|c| c.slug.clone())
+            {
+                bail!("backfill failed for {failed} (see backfill_state.last_error)");
+            }
+        }
         Cmd::Bench {
             assets,
             iterations,
@@ -176,6 +257,88 @@ fn print_seed_report(report: &seed::SeedReport) {
     }
     if report.dry_run {
         println!("dry run: rolled back, nothing persisted");
+    }
+}
+
+/// One line per committed batch, so a long run is legible while it happens
+/// and `railway logs` shows the same thing a local terminal does.
+fn print_batch_progress(p: &backfill::BatchProgress) {
+    let of = match p.batches {
+        Some(total) => format!("{:>3}/{:<3}", p.batch, total),
+        // A dynamic Core collection has no known size until it is walked.
+        None => format!("{:>3}/?  ", p.batch),
+    };
+    println!(
+        "{:<17} batch {of}  slot {:<12} ins {:>5} upd {:>5} unch {:>5} miss {:<4} \
+docs {}/{}  attrs +{} -{}  {:>6.1}s",
+        p.slug,
+        p.slot,
+        p.counts.inserted,
+        p.counts.updated,
+        p.counts.unchanged,
+        p.missing,
+        p.documents_wanted - p.documents_failed,
+        p.documents_wanted,
+        p.counts.attributes_written,
+        p.counts.attributes_removed,
+        p.elapsed.as_secs_f64(),
+    );
+}
+
+fn print_backfill_report(report: &backfill::BackfillReport) {
+    println!(
+        "\n{:<17} {:<16} {:>8} {:>9} {:>8} {:>8} {:>8} {:>6} {:>7} {:>9}",
+        "collection",
+        "rule",
+        "members",
+        "inserted",
+        "updated",
+        "unchang",
+        "missing",
+        "docs",
+        "attrs",
+        "elapsed"
+    );
+    for c in &report.collections {
+        println!(
+            "{:<17} {:<16} {:>8} {:>9} {:>8} {:>8} {:>8} {:>6} {:>7} {:>8.1}s  {}",
+            c.slug,
+            format!("{:?}", c.rule),
+            c.members,
+            c.counts.inserted,
+            c.counts.updated,
+            c.counts.unchanged,
+            c.missing_total,
+            c.counts.documents,
+            c.counts.attributes_written,
+            c.elapsed.as_secs_f64(),
+            c.status,
+        );
+    }
+    for c in &report.collections {
+        if c.images_ok + c.images_dead > 0 {
+            println!(
+                "images     {:<17} ok={} dead={}",
+                c.slug, c.images_ok, c.images_dead
+            );
+        }
+        // The exact count is always reported; a sample of the ids makes it
+        // actionable without inventing rows to make supply reconcile.
+        if c.missing_total > 0 {
+            let sample: Vec<&str> = c.missing.iter().take(5).map(String::as_str).collect();
+            println!(
+                "WARN {}: {} member(s) unknown to DAS, e.g. {}",
+                c.slug,
+                c.missing_total,
+                sample.join(", ")
+            );
+        }
+        for w in &c.warnings {
+            println!("WARN {w}");
+        }
+    }
+    for w in &report.warnings {
+        println!("WARN {w}");
     }
 }
 

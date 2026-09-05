@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 indexer-config = { workspace = true }
+indexer-das = { workspace = true }
 indexer-data-model = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

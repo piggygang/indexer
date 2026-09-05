@@ -28,9 +28,21 @@ pub struct ServerConfig {
 
 #[derive(Debug, Clone)]
 pub struct HeliusConfig {
-    /// Not needed by the API service yet; ingest/backfill work (ALG-621/623)
-    /// validates its presence where required.
+    /// Not needed by the API service; the backfill (ALG-621) and the future
+    /// ingester (ALG-623) call [`HeliusConfig::required_api_key`] in the
+    /// subcommand that needs it, so a missing key never breaks `migrate` or
+    /// `seed`.
     pub api_key: Option<String>,
+}
+
+impl HeliusConfig {
+    /// The key, or a hard error naming the variable — same idiom as
+    /// [`DatabaseConfig::required_url`].
+    pub fn required_api_key(&self) -> Result<&str> {
+        self.api_key
+            .as_deref()
+            .context("HELIUS_API_KEY is required for this command (see .env.example)")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -176,5 +188,24 @@ mod tests {
         );
 
         clear();
+    }
+
+    /// Constructed directly rather than through the environment: the env test
+    /// above is deliberately sequential because env vars are process-global,
+    /// and this needs no env at all.
+    #[test]
+    fn required_api_key_names_the_variable() {
+        let err = HeliusConfig { api_key: None }
+            .required_api_key()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("HELIUS_API_KEY"),
+            "unexpected error: {err:#}"
+        );
+
+        let helius = HeliusConfig {
+            api_key: Some("k".into()),
+        };
+        assert_eq!(helius.required_api_key().unwrap(), "k");
     }
 }

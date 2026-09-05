@@ -1,6 +1,7 @@
 //! Postgres data model for the indexer (ALG-619): embedded migrations, the
 //! connection pool, the typed collections registry, the seed loader, ingest
-//! cursors and the facet queries the public API is built on.
+//! cursors, the asset/attribute writers the backfill uses, and the facet
+//! queries the public API is built on.
 //!
 //! Conventions that every downstream issue relies on:
 //!
@@ -14,6 +15,7 @@
 //! - Queries are runtime-checked (`sqlx::query`/`query_as`), so neither the
 //!   Docker build nor CI needs a database at compile time.
 
+pub mod assets;
 pub mod attributes;
 pub mod facets;
 pub mod ingest_state;

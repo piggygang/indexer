@@ -1,0 +1,29 @@
+[package]
+name = "indexer-das"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Request/response only. This crate talks to Helius DAS over JSON-RPC and to
+# the collections' off-chain metadata hosts over plain HTTPS; it deliberately
+# does NOT depend on indexer-ingest, whose IngestSource is the *streaming*
+# interface with a slot cursor. It also does not depend on indexer-config —
+# the caller passes the API key as a &str, exactly as data-model::connect
+# takes the database URL.
+[dependencies]
+indexer-data-model = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `net`/`io-util` on top of the workspace features: the integration test
+# serves a fake Helius from a loopback listener.
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+bs58 = { workspace = true }
+sqlx = { workspace = true }
