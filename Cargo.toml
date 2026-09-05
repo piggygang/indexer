@@ -40,11 +40,18 @@ actix-cors = "0.7"
 actix-web = "4.11"
 anyhow = "1.0"
 async-stream = "0.3"
+# base64 (the contract's cursors are base64url-unpadded) and sha2 (weak ETags
+# and the cursor's filter fingerprint) were already in Cargo.lock as
+# transitives, so declaring them adds no new subtree.
+base64 = "0.22"
 bs58 = "0.5"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dotenv = "0.15"
 env_logger = "0.11"
+# Already vendored by actix-web; declared because services/api parses the
+# repeated `trait[...]` keys directly, which `web::Query` cannot represent.
+form_urlencoded = "1"
 futures-core = "0.3"
 futures-util = "0.3"
 log = "0.4"
@@ -52,6 +59,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "htt
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate", "macros"] }
 thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

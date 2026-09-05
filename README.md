@@ -176,6 +176,9 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
   `{"status":"ok","service":"indexer-api","version":"0.1.0","commit":"<git sha>"}`
 - `GET /ready` — readiness: `SELECT 1` with a 2 s bound → `200 {"status":"ready"}`
   or `503 {"status":"unavailable","reason":…}`. Outside `/v1` and outside the API contract.
+- `GET /v1/collections` · `/v1/collections/{slug}` · `/v1/collections/{slug}/nfts`
+  · `/v1/collections/{slug}/facets` — the browse half of the contract (ALG-625);
+  see below.
 
 ## API contract (ALG-620)
 
@@ -1064,6 +1067,105 @@ the asset was back to its true owner, `backfill_state` carried
 `candidates=1, corrections=1` for that collection and 0 for the other three,
 and the following sweep was back to `corrections=0`.
 
+## Browse API (ALG-625)
+
+The registry, the grid and the facet sidebar — the browse half of the frozen
+contract. Every SQL statement lives in `indexer-data-model`
+(`browse.rs`, `facets.rs`, `stats.rs`); `services/api` holds the DTOs, the
+query parsing and the HTTP concerns, so the queries stay testable without an
+HTTP stack.
+
+```sh
+cargo run -p indexer-api    # :8080
+curl -s 'localhost:8080/v1/collections/piggy-sol-gang/facets' | jq '.total'
+curl -s 'localhost:8080/v1/collections/piggy-sol-gang/nfts?trait%5BBackground%5D=Red&sort=-activity' | jq
+```
+
+### Filters, and why the grid and the sidebar cannot disagree
+
+`?trait[Background]=Pink&trait[Background]=Blue&trait[Head]=Crown` — repeating a
+type ORs its values, distinct types AND together. Brackets may be literal or
+percent-encoded; the Explorer's serializer sends one and CI sends the other, so
+both are parsed. `web::Query` cannot represent this at all (it collapses
+repeated keys), so the raw query string is parsed directly.
+
+The page query, the filtered `total` and the facet counts are all bound from
+one place — `facets::binds` — and the page and the total share a single
+`FILTERED_BASE` SQL fragment. That is what makes "the grid and the sidebar
+never disagree" structural rather than a thing to remember. Verified on the
+real collection: under a three-value filter, `facets.total` is 1105 and paging
+the grid to exhaustion yields exactly 1105 distinct addresses over 12 pages.
+
+Facet counts are **disjunctive**: each trait type is counted with its own
+filter removed and every other filter applied, so adding a second value inside
+a type is never a dead end. `total`, by contrast, applies every filter — two
+predicates in one response, which is what the sidebar needs.
+
+Unknown input is never a 4xx, so a bookmarked URL survives a metadata refresh.
+An unknown trait **type** yields an empty page and `facets: []`; an unknown
+**value** still counts its type as selected, so it matches nothing and every
+other type's counts collapse to zero while its own values stay visible.
+
+### Pagination
+
+Keyset, never offset. `ORDER BY` matches an `assets_browse_*` index expression
+exactly, including the NULL sentinels (`coalesce(number, 2147483647)`,
+`coalesce(last_activity_slot, -1)`) that exist so a cursor cannot lose the NULL
+rows. The page asks for one row more than it needs, so `hasMore` is never a
+`COUNT`.
+
+Cursors are base64url and opaque by contract, carrying
+`{v, s, k, f}` — version, sort, the `(key, id)` tuple, and a fingerprint of
+collection + sort + filters + `q`. The fingerprint is what makes "valid only
+for the sort and filter set that issued it" enforceable: change a filter and
+the cursor is `400 invalid_cursor`, which the contract calls a normal
+recoverable condition rather than an outage.
+
+### Caching, validators and CORS
+
+Every response carries a weak `ETag` and a short `Cache-Control`;
+`If-None-Match` gets a `304` with the validators repeated. A small in-process
+TTL cache sits in front, hand-rolled rather than pulling in a cache crate — the
+key space is four collections times a handful of filter combinations. Latency
+is not the motive (see below); the shared five-connection pool is.
+
+CORS is `Access-Control-Allow-Origin: *`, GET/HEAD only, no credentials. The
+API is public, unauthenticated and read-only, so an allowlist protects nothing
+and would break on every Explorer preview deployment, which gets a fresh origin
+per push.
+
+`X-RateLimit-*` and `429` are declared in the contract but **not implemented**:
+the headers are not `required`, so omitting them conforms, and advertising a
+limit nothing enforces would not. ALG-628 owns it.
+
+### Performance (acceptance: p95 < 150 ms)
+
+`indexer-admin bench --slug piggy-sol-gang` now gates on **p95** rather than
+p50 and times the browse page alongside the facet query. Measured on the real
+collection (10 000 assets, 90 000 attribute rows, release, 200 iterations):
+
+| scenario | facets p50 | facets p95 | page p95 |
+|---|---|---|---|
+| no filters | 22.1 ms | 24.2 ms | 0.6 ms |
+| two trait types | 23.5 ms | 25.0 ms | 2.3 ms |
+| three types, one rare | 21.0 ms | 22.8 ms | 26.5 ms |
+| text search | 6.1 ms | 6.8 ms | 1.5 ms |
+
+Roughly 5× headroom against the 150 ms target. Note the default iteration count
+moved from 20 to 200: p95 is nearest-rank, so at 20 samples it was just the
+maximum.
+
+### Conformance
+
+Two gates, from both sides of the same three URLs. The `openapi` CI job mocks
+the contract with Prism and proves it is servable; the `check` job now runs
+Prism in **proxy** mode in front of the real binary, validating each response
+against the schema. And because Prism ignores the `trait` parameter entirely,
+filter wiring is only ever testable in Rust — `services/api/tests/browse.rs`
+covers AND/OR, the two unknown-input behaviours, cursor validity, `304`, facet
+ordering, and that a disabled collection (every `bench-*` fixture) is a `404`
+rather than something the public API will happily browse.
+
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
@@ -1072,5 +1174,6 @@ and the following sweep was back to `corrections=0`.
 - ALG-622 — historical activity backfill (archival API) — done
 - ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service — done
 - ALG-624 — reconciliation: periodic DAS diff + self-heal — done
-- ALG-625/626 — public REST API (browse/facets, detail/activity/portfolio)
+- ALG-625 — public REST API: browse, facets, search — done
+- ALG-626 — public REST API: detail, activity, portfolio
 - ALG-627 — rarity scoring · ALG-628 — prod monitoring/alerting · ALG-629 — external collections

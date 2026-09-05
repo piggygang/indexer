@@ -110,16 +110,23 @@ WHERE coalesce(pa.ok_count, 0) = $5
 GROUP BY tt.id, tt.name, tv.id, tv.value
 ORDER BY tt.name, count DESC, tv.value";
 
-struct Binds {
-    types: Vec<i32>,
-    values: Vec<i32>,
-    distinct_types: Vec<i32>,
-    q: Option<String>,
-    like: Option<String>,
-    prefix: Option<String>,
+/// The bound form of one filter set: the selections flattened into parallel
+/// arrays plus `q` and its two LIKE patterns.
+///
+/// `pub(crate)` so the browse page query, the filtered total and the facet
+/// counts bind the *same* thing. The contract promises the grid and the
+/// sidebar can never disagree; one predicate is how that stays true instead of
+/// being maintained in three places.
+pub(crate) struct Binds {
+    pub(crate) types: Vec<i32>,
+    pub(crate) values: Vec<i32>,
+    pub(crate) distinct_types: Vec<i32>,
+    pub(crate) q: Option<String>,
+    pub(crate) like: Option<String>,
+    pub(crate) prefix: Option<String>,
 }
 
-fn binds(selections: &[TraitSelection], q: Option<&str>) -> Binds {
+pub(crate) fn binds(selections: &[TraitSelection], q: Option<&str>) -> Binds {
     let mut types = Vec::new();
     let mut values = Vec::new();
     let mut distinct_types = Vec::new();

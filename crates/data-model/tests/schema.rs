@@ -68,7 +68,18 @@ async fn migrations_rerun_is_noop(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(applied, 5);
+    // Bumped whenever a migration is added, deliberately: migrations are
+    // forward-only and never edited once merged, so this count only ever grows
+    // and a surprise change to it means one was rewritten.
+    let on_disk = std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .is_ok_and(|e| e.path().extension().is_some_and(|x| x == "sql"))
+        })
+        .count() as i64;
+    assert_eq!(applied, on_disk);
+    assert_eq!(applied, 6);
 }
 
 #[sqlx::test]

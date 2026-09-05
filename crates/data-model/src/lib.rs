@@ -18,11 +18,13 @@
 pub mod activity;
 pub mod assets;
 pub mod attributes;
+pub mod browse;
 pub mod facets;
 pub mod ingest_state;
 pub mod integrity;
 pub mod registry;
 pub mod seed;
+pub mod stats;
 pub mod synth;
 pub mod types;
 

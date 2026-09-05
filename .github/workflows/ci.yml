@@ -61,6 +61,39 @@ jobs:
           cargo run -p indexer-admin -- migrate
           cargo run -p indexer-admin -- seed
           cargo run -p indexer-admin -- seed --expect-unchanged
+      # The `openapi` job proves the CONTRACT is servable, by mocking it. This
+      # proves the API SERVES the contract, by putting Prism in front of the
+      # real binary in proxy mode: it forwards each request upstream and
+      # validates the response that comes back against the schema, so a
+      # response that has drifted is a failed build rather than a surprise in
+      # the Explorer.
+      #
+      # It lives in this job because it needs Rust and Postgres, which the
+      # `openapi` job has neither of; only Node is missing here. A new job
+      # would be fine, a new workflow file would not — Railway waits on the
+      # commit's check suites and one workflow is one suite.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.19.0"
+      - name: The API conforms to the frozen contract
+        run: |
+          cargo run -p indexer-api &
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:8080/health >/dev/null && break
+            sleep 1
+          done
+          npx --yes @stoplight/prism-cli@5.15.10 proxy \
+            -h 127.0.0.1 -p 4011 --errors openapi/v1.yaml http://127.0.0.1:8080 &
+          for _ in $(seq 1 60); do
+            curl -sf http://127.0.0.1:4011/v1/collections >/dev/null && break
+            sleep 1
+          done
+          # The same three shapes the mock is exercised with, so the contract is
+          # checked from both sides against one set of URLs.
+          curl -sf http://127.0.0.1:4011/v1/collections | grep -q piggy-sol-gang
+          curl -sf http://127.0.0.1:4011/v1/collections/piggy-sol-gang >/dev/null
+          curl -sf http://127.0.0.1:4011/v1/collections/piggy-sol-gang/facets >/dev/null
+          curl -sf 'http://127.0.0.1:4011/v1/collections/piggy-sol-gang/nfts?trait%5BHead%5D=Crown&sort=-activity' >/dev/null
 
   # The frozen v1 API contract (ALG-620). A separate job with no `needs:`, so it
   # runs in parallel with `check` and adds no wall-clock time — `check` compiles

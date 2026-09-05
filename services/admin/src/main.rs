@@ -14,6 +14,7 @@ use indexer_config::Config;
 use indexer_das::backfill::{self, BackfillOptions};
 use indexer_das::DasClient;
 use indexer_data_model::activity;
+use indexer_data_model::browse;
 use indexer_data_model::facets::{self, TraitSelection};
 use indexer_data_model::seed::{self, Outcome};
 use indexer_data_model::synth::{self, SyntheticSpec};
@@ -150,10 +151,13 @@ enum Cmd {
         /// Assets per synthetic collection (bench-pgg gets half, plus a unique trait).
         #[arg(long, default_value_t = 10_000)]
         assets: i64,
-        #[arg(long, default_value_t = 20)]
+        /// Samples per scenario. p95 is nearest-rank, so below ~100 it is
+        /// just the maximum and says nothing about the tail.
+        #[arg(long, default_value_t = 200)]
         iterations: u32,
-        /// Fail (non-zero exit) when any scenario's p50 exceeds this.
-        #[arg(long, default_value_t = 100)]
+        /// Fail (non-zero exit) when any scenario's p95 exceeds this.
+        /// ALG-625's acceptance criterion is 150 ms on the full dataset.
+        #[arg(long, default_value_t = 150)]
         max_ms: u64,
         /// Remove every bench-* collection instead of benchmarking.
         #[arg(long)]
@@ -726,18 +730,48 @@ async fn bench(pool: &PgPool, options: BenchOptions) -> anyhow::Result<()> {
                         .len();
                 samples.push(started.elapsed().as_secs_f64() * 1000.0);
             }
+            // The browse page under the same filters — the grid and the
+            // sidebar are one request pair in the Explorer, so timing only the
+            // facets would understate what a page load costs.
+            let browse_query = browse::BrowseQuery {
+                collection_id: collection.id,
+                selections: selections.clone(),
+                q: scenario.q.map(str::to_owned),
+                sort: browse::Sort::Number,
+                after: None,
+                limit: 25,
+            };
+            let mut page_samples = Vec::with_capacity(options.iterations as usize);
+            for _ in 0..options.iterations.max(1) {
+                let started = Instant::now();
+                browse::browse(pool, &browse_query).await?;
+                page_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            page_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let page_p95 =
+                page_samples[(page_samples.len() * 95 / 100).min(page_samples.len() - 1)];
+
             samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let p50 = samples[samples.len() / 2];
             let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
             let max = samples[samples.len() - 1];
-            let over = p50 > options.max_ms as f64;
+            // Gated on p95, not p50: a median under budget with a fat tail is
+            // exactly the shape a browse endpoint must not ship.
+            let over = p95 > options.max_ms as f64;
             let verdict = if over { "FAIL" } else { "ok" };
             println!(
-                "{verdict:<4} {:<52} p50 {p50:7.1} ms  p95 {p95:7.1} ms  max {max:7.1} ms  rows {rows}",
+                "{verdict:<4} {:<52} p50 {p50:7.1} ms  p95 {p95:7.1} ms  max {max:7.1} ms  \
+                 rows {rows}  page p95 {page_p95:6.1} ms",
                 scenario.name
             );
+            if page_p95 > options.max_ms as f64 {
+                failed.push(format!(
+                    "{slug}: {} browse p95 {page_p95:.1} ms",
+                    scenario.name
+                ));
+            }
             if over {
-                failed.push(format!("{slug}: {} p50 {p50:.1} ms", scenario.name));
+                failed.push(format!("{slug}: {} p95 {p95:.1} ms", scenario.name));
             }
             if scenario.filters.len() == 2 {
                 explain_for = Some(selections);
@@ -752,11 +786,11 @@ async fn bench(pool: &PgPool, options: BenchOptions) -> anyhow::Result<()> {
     }
     if !failed.is_empty() {
         bail!(
-            "facet p50 exceeded {} ms:\n  {}",
+            "p95 exceeded {} ms:\n  {}",
             options.max_ms,
             failed.join("\n  ")
         );
     }
-    println!("\nall scenarios under {} ms (p50)", options.max_ms);
+    println!("\nall scenarios under {} ms (p95)", options.max_ms);
     Ok(())
 }
