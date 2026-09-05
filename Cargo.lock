@@ -1407,6 +1407,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "277ff51754a3f68f12f58446c5d006aa8baa4914ea273cce24a599cfaff33d4f"
 
 [[package]]
+name = "indexer-activity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bs58",
+ "chrono",
+ "futures-util",
+ "indexer-das",
+ "indexer-data-model",
+ "indexer-ingest",
+ "log",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "indexer-admin"
 version = "0.1.0"
 dependencies = [
@@ -1414,6 +1433,7 @@ dependencies = [
  "clap",
  "dotenv",
  "env_logger",
+ "indexer-activity",
  "indexer-config",
  "indexer-das",
  "indexer-data-model",

@@ -3,7 +3,7 @@
 //! Ignored without a database: `cargo test --workspace -- --include-ignored`.
 
 use chrono::{DateTime, TimeZone, Utc};
-use indexer_data_model::activity::{self, Applied, LiveEvent};
+use indexer_data_model::activity::{self, Applied, CrawledSignature, LiveEvent};
 use indexer_data_model::types::EventKind;
 use indexer_data_model::PgPool;
 
@@ -68,6 +68,8 @@ async fn write(
             kind,
             from_owner: from,
             to_owner: to,
+            price_lamports: None,
+            marketplace: None,
             details: None,
             source: "live",
         },
@@ -710,4 +712,365 @@ async fn an_unclassifiable_signature_is_parked(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(activity_rows, 0, "parked, never guessed at");
+}
+
+// --- ALG-622: the archival crawl's writer surface -------------------------
+
+/// The crawl's own signature rows, as `record_signatures` takes them.
+fn crawled(seed: u8, slot: i64, block_time: Option<i64>, failed: bool) -> CrawledSignature {
+    CrawledSignature {
+        signature: sig(seed),
+        slot,
+        block_time: block_time.map(ts),
+        failed,
+    }
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_sale_carries_its_price_and_venue(pool: PgPool) {
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+    let (seller, buyer) = (pk(50), pk(51));
+
+    let mut tx = pool.begin().await.unwrap();
+    activity::record(
+        &mut tx,
+        &LiveEvent {
+            asset_id,
+            collection_id,
+            signature: &sig(1),
+            seq: 0,
+            slot: 100,
+            block_time: ts(100),
+            kind: EventKind::Sale,
+            from_owner: Some(&seller),
+            to_owner: Some(&buyer),
+            price_lamports: Some(580_000_000),
+            marketplace: Some("Magic Eden"),
+            details: None,
+            source: "backfill",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let (price, marketplace, source): (Option<i64>, Option<String>, String) = sqlx::query_as(
+        "SELECT price_lamports, marketplace, source FROM activity WHERE asset_id = $1",
+    )
+    .bind(asset_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(price, Some(580_000_000));
+    assert_eq!(marketplace.as_deref(), Some("Magic Eden"));
+    assert_eq!(source, "backfill");
+    // A sale still moves ownership like any other transfer.
+    assert_eq!(
+        owner_of(&pool, asset_id).await.0.as_deref(),
+        Some(buyer.as_str())
+    );
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn crawled_signatures_are_stored_and_marked(pool: PgPool) {
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+
+    let rows = vec![
+        crawled(1, 100, Some(100), false),
+        crawled(2, 200, Some(200), true),
+    ];
+    assert_eq!(
+        activity::record_signatures(&pool, asset_id, &rows)
+            .await
+            .unwrap(),
+        2
+    );
+    // Re-crawling is a true no-op: same rows, nothing written.
+    assert_eq!(
+        activity::record_signatures(&pool, asset_id, &rows)
+            .await
+            .unwrap(),
+        0,
+        "a second crawl of an unchanged asset must write nothing"
+    );
+
+    let pending = activity::pending_signatures(&pool, asset_id).await.unwrap();
+    assert_eq!(pending.len(), 2, "nothing is classified yet");
+    assert_eq!(pending[0], rows[0], "ordered by slot, block times intact");
+
+    assert_eq!(
+        activity::mark_classified(&pool, asset_id, &[sig(1)])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        activity::mark_classified(&pool, asset_id, &[sig(1)])
+            .await
+            .unwrap(),
+        0,
+        "marking twice changes nothing"
+    );
+    let pending = activity::pending_signatures(&pool, asset_id).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].signature, sig(2));
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_parked_signature_gains_its_block_time_from_the_crawl(pool: PgPool) {
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+
+    // The live pipeline parks what it cannot date; the archival response
+    // carries `blockTime`, so the crawl repairs the row rather than colliding
+    // with it.
+    activity::park_signature(&pool, asset_id, &sig(1), 100, false)
+        .await
+        .unwrap();
+    let before: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT block_time FROM asset_signatures WHERE asset_id = $1")
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(before.is_none());
+
+    activity::record_signatures(&pool, asset_id, &[crawled(1, 100, Some(100), false)])
+        .await
+        .unwrap();
+    let after = activity::pending_signatures(&pool, asset_id).await.unwrap();
+    assert_eq!(after[0].block_time, Some(ts(100)));
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn reclassifying_clears_everything_derived_but_keeps_the_signatures(pool: PgPool) {
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+    let (a, b) = (pk(50), pk(51));
+
+    activity::record_signatures(&pool, asset_id, &[crawled(1, 100, Some(100), false)])
+        .await
+        .unwrap();
+    write(
+        &pool,
+        asset_id,
+        collection_id,
+        &sig(1),
+        100,
+        EventKind::Mint,
+        None,
+        Some(&a),
+    )
+    .await;
+    write(
+        &pool,
+        asset_id,
+        collection_id,
+        &sig(2),
+        200,
+        EventKind::Transfer,
+        Some(&a),
+        Some(&b),
+    )
+    .await;
+    activity::mark_classified(&pool, asset_id, &[sig(1)])
+        .await
+        .unwrap();
+    assert_eq!(intervals(&pool, asset_id).await.len(), 2);
+
+    let mut tx = pool.begin().await.unwrap();
+    let removed = activity::reset_for_reclassify(&mut tx, asset_id)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(removed, 2);
+
+    assert!(intervals(&pool, asset_id).await.is_empty());
+    let (owner, _, _) = owner_of(&pool, asset_id).await;
+    assert_eq!(
+        owner.as_deref(),
+        Some(b.as_str()),
+        "assets.owner is DAS's, not ours to clear"
+    );
+    let last: Option<i64> =
+        sqlx::query_scalar("SELECT last_activity_slot FROM assets WHERE id = $1")
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(last.is_none(), "the INSERT-only trigger cannot undo itself");
+    // The raw crawl output survives — that is the point of storing it.
+    let pending = activity::pending_signatures(&pool, asset_id).await.unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the signature is back to pending, not gone"
+    );
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_transfer_is_repriced_into_a_sale_without_the_network(pool: PgPool) {
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+    let (a, b) = (pk(50), pk(51));
+
+    let mut tx = pool.begin().await.unwrap();
+    let details = serde_json::json!({
+        "programs": [pk(92)],
+        "price_candidate": {"lamports": 580_000_000, "source": "buyer"},
+    });
+    activity::record(
+        &mut tx,
+        &LiveEvent {
+            asset_id,
+            collection_id,
+            signature: &sig(1),
+            seq: 0,
+            slot: 100,
+            block_time: ts(100),
+            kind: EventKind::Transfer,
+            from_owner: Some(&a),
+            to_owner: Some(&b),
+            price_lamports: None,
+            marketplace: None,
+            details: Some(&details),
+            source: "backfill",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let candidates = activity::reprice_candidates(&pool, collection_id, 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].details["price_candidate"]["lamports"],
+        580_000_000
+    );
+
+    assert!(
+        activity::promote_to_sale(&pool, candidates[0].id, 580_000_000, Some("Magic Eden"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !activity::promote_to_sale(&pool, candidates[0].id, 580_000_000, Some("Magic Eden"))
+            .await
+            .unwrap(),
+        "repricing twice changes nothing"
+    );
+
+    let (kind, price): (String, Option<i64>) =
+        sqlx::query_as("SELECT kind, price_lamports FROM activity WHERE id = $1")
+            .bind(candidates[0].id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((kind.as_str(), price), ("sale", Some(580_000_000)));
+    assert!(
+        activity::reprice_candidates(&pool, collection_id, 0, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a promoted row is no longer a candidate"
+    );
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn last_activity_is_recomputed_after_a_partial_delete(pool: PgPool) {
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+    let (a, b) = (pk(50), pk(51));
+    write(
+        &pool,
+        asset_id,
+        collection_id,
+        &sig(1),
+        100,
+        EventKind::Mint,
+        None,
+        Some(&a),
+    )
+    .await;
+    write(
+        &pool,
+        asset_id,
+        collection_id,
+        &sig(2),
+        200,
+        EventKind::Transfer,
+        Some(&a),
+        Some(&b),
+    )
+    .await;
+
+    sqlx::query("DELETE FROM activity WHERE asset_id = $1 AND signature = $2")
+        .bind(asset_id)
+        .bind(sig(2))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let stale: Option<i64> =
+        sqlx::query_scalar("SELECT last_activity_slot FROM assets WHERE id = $1")
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stale,
+        Some(200),
+        "the trigger is INSERT-only, so the delete left it stale"
+    );
+
+    activity::recompute_last_activity(&pool, asset_id)
+        .await
+        .unwrap();
+    let fixed: Option<i64> =
+        sqlx::query_scalar("SELECT last_activity_slot FROM assets WHERE id = $1")
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(fixed, Some(100));
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn assets_are_paged_by_keyset_for_the_crawl(pool: PgPool) {
+    let collection_id = collection(&pool).await;
+    let ids: Vec<i64> = futures_lite_join(&pool, collection_id).await;
+
+    let first = activity::assets_after(&pool, collection_id, 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(first.iter().map(|a| a.id).collect::<Vec<_>>(), ids[..2]);
+    let next = activity::assets_after(&pool, collection_id, ids[1], 2)
+        .await
+        .unwrap();
+    assert_eq!(next.iter().map(|a| a.id).collect::<Vec<_>>(), ids[2..]);
+    assert!(
+        activity::assets_after(&pool, collection_id, *ids.last().unwrap(), 2)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+async fn futures_lite_join(pool: &PgPool, collection_id: i32) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for seed in 1..=3u8 {
+        ids.push(asset(pool, collection_id, seed).await);
+    }
+    ids.sort_unstable();
+    ids
 }

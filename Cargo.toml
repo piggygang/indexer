@@ -6,10 +6,15 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
+indexer-activity = { path = "crates/activity" }
 indexer-config = { path = "crates/config" }
 indexer-das = { path = "crates/das" }
 indexer-data-model = { path = "crates/data-model" }
-indexer-ingest = { path = "crates/ingest" }
+# default-features off HERE so a dependent can take just the decoder; the ws
+# adapter is still `indexer-ingest`'s own default, so `cargo clippy --workspace
+# --all-targets` lints it as a member exactly as before. Dependents that need
+# the transport ask for it (`features = ["ws"]`).
+indexer-ingest = { path = "crates/ingest", default-features = false }
 
 # actix-cors is an inert version pin for ALG-625 (public API); nothing depends
 # on it yet.

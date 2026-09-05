@@ -1,0 +1,35 @@
+[package]
+name = "indexer-activity"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The historical activity backfill (ALG-622): archival crawl in, `activity`
+# and `ownership_history` out.
+#
+# It is the one crate that needs the decoder AND the DAS client at once, which
+# is why it is not part of either: `crates/das` is forbidden from depending on
+# `indexer-ingest`, and `services/admin` has no reason to grow a transport
+# dependency. Like `crates/das` it holds NO SQL — every statement lives in
+# `indexer_data_model::activity`, so the writer invariants stay provable
+# against Postgres with no network.
+#
+# `indexer-ingest` arrives without the `ws` feature: `decode` is always
+# compiled (the containment rule), so this gets the decoder and none of the
+# WebSocket stack.
+[dependencies]
+indexer-das = { workspace = true }
+indexer-data-model = { workspace = true }
+indexer-ingest = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+bs58 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }

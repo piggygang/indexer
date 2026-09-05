@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+indexer-activity = { workspace = true }
 indexer-config = { workspace = true }
 indexer-das = { workspace = true }
 indexer-data-model = { workspace = true }

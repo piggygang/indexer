@@ -1,0 +1,68 @@
+# Marketplace venue registry (ALG-622).
+#
+# Apply with:  cargo run -p indexer-admin -- backfill-activity
+# After adding an entry:  cargo run -p indexer-admin -- backfill-activity --reprice-only
+# — that pass is database-only. The classifier stores the price it derived in
+# `activity.details.price_candidate` at crawl time, so teaching it a new venue
+# never re-reads the chain.
+#
+# On-chain addresses live ONLY here and in config/collections.toml and
+# config/seeds/ — never in Rust, SQL or tests. That is the whole reason the
+# decoder captures every invoked program id as *data*: naming a marketplace is
+# a config change, not a code change.
+#
+# `label` is served verbatim as `ActivityEvent.marketplace`, which the frozen
+# v1 contract types as free text precisely so venues can be added without a
+# contract change. Only add a program you can actually attribute: the contract
+# permits a null marketplace, and an honest `transfer` beats a wrong brand.
+version = 1
+
+# Verified against this collection's own history: Helius parses transactions
+# invoking this program as NFT_SALE / MAGIC_EDEN, and its escrow authority
+# (1BWutmTvYPwDtmw9abTkS4Ssr8no61spGAvW1X6NDix) shows up holding listed pigs.
+[[marketplaces]]
+program_id = "M2mx93ekt1fmXSVkTrUL9xVFHkmME8HTUi5Cyc5aF7K"
+label = "Magic Eden"
+note = "v2 (Haus). The v1 program below predates it."
+
+[[marketplaces]]
+program_id = "MEisE1HzehtrDpAAT8PnLHjpSSkRYakotTuJRPjTpo8"
+label = "Magic Eden"
+note = "v1, the 2021 escrow-era program."
+
+# Verified the same way: NFT_SALE / SOLANART, on a 8 SOL sale of a SOL Gang pig.
+[[marketplaces]]
+program_id = "CJsLwbP1iu5DuUikHEJnLfANgKy6stB2uFgvBBHoyxwz"
+label = "Solanart"
+
+[[marketplaces]]
+program_id = "A7p8451ktDCHq5yYaHczeLMYsjRsAkzc3hCXcSrwYHU7"
+label = "DigitalEyes"
+
+[[marketplaces]]
+program_id = "617jbWo616ggkDxvW1Le8pV38XLbVSyWY8ae6QUmGBAU"
+label = "Solsea"
+
+[[marketplaces]]
+program_id = "TSWAPaqyCSx2KABk68Shruf4rp7CxcNi8hAsbdwmHbN"
+label = "Tensor"
+
+[[marketplaces]]
+program_id = "HYPERfwdTjyJ2SCaKHmpF2MtrXqWxrsotYDsTrshHWq8"
+label = "Hyperspace"
+
+# ---------------------------------------------------------------------------
+# Deliberately NOT enabled: HZaWndaNWHFDd9Dhk5pqUUtsmoBCqzb1MLu3NAh1VX6B
+#
+# It is certainly an escrow marketplace, and a busy one in this collection's
+# 2021-22 history: listings move the pig to the constant escrow wallet
+# 4pUQS4Jo2dsfWzt3VgHXy3H6RYnEDd11oWPiaM2rdAPw, and its sales pay a royalty to
+# the collection's update authority. Its instructions include `Unlist`.
+#
+# What could not be established is *whose* it is. Helius does not parse it and
+# it is in no public program-address mapping, so any label here would be a
+# guess — and `marketplace` is served verbatim to API clients. Its sales are
+# therefore recorded as honest transfers with the price already derived in
+# `details.price_candidate`, so identifying it later costs one line here plus
+# `backfill-activity --reprice-only`. No re-crawl.
+# ---------------------------------------------------------------------------

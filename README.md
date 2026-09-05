@@ -701,6 +701,131 @@ one-off run overlaps.
 railway ssh --service admin -- indexer-admin backfill --slug piggy-sol-gang
 ```
 
+## Historical activity backfill (ALG-622)
+
+`indexer-admin backfill-activity` builds the full timeline per NFT from
+archival RPC — mint, transfers, priced sales, burns — and the
+`ownership_history` intervals derived from them. Until it runs,
+`/nfts/{id}/activity` is empty, `heldSince` and `MintInfo` are null, and
+`ActivitySummary` cannot be served at all; the frozen contract promises all
+four.
+
+```sh
+cargo run -p indexer-admin -- backfill-activity --slug piggy-sol-gang --limit 40
+cargo run -p indexer-admin -- backfill-activity --address <mint>   # one asset
+cargo run -p indexer-admin -- backfill-activity --reprice-only     # no network
+```
+
+### One call per asset, expanding only when it has to
+
+The transport is Helius's `getTransactionsForAddress`: it returns full
+transactions in the same `jsonParsed` shape the WebSocket delivers, so the
+crawl feeds the *same* decoder as the live path, and each row carries
+`blockTime`, so it never calls `getBlockTime`. One paged call replaces
+`getSignaturesForAddress` plus a `getTransaction` per signature, at ~10 credits
+per 100 transactions. Page until `data` is empty, **never** until the
+`paginationToken` is null — the endpoint returns one on the last non-empty page
+too.
+
+Querying the mint address is not enough, and this is measured rather than
+assumed. A plain `spl-token` `transfer` names neither the mint nor the wallets,
+so an escrow-era marketplace move is invisible there. On one 2021 pig the mint
+address returned 40 transactions and its token accounts revealed **3 more that
+moved the token** — the Magic Eden and Solanart escrow moves, which are exactly
+the sales worth pricing.
+
+So the crawl is adaptive. It derives the ownership chain from what the asset's
+own address returned and stops if the chain is contiguous *and* ends on the
+owner DAS reports — the issue's own acceptance criterion, used as the stop
+condition. Otherwise it expands to the token accounts named in the
+transactions it already has and goes round again. The fixpoint closes in two
+rounds; measured over 40 SOL Gang pigs, 16 needed the expansion and 24 did not.
+
+### Pre-2022 transactions carry no owner
+
+Solana only added `owner` to transaction token balances in late 2021. Across
+2021-era pig transactions the field is present on **0 of 65** token balances
+and on **94 of 94** from 2022 on. The live decoder reads it and requires a
+receiver, so without help every 2021 transfer decodes to nothing — precisely
+the assets this issue exists for.
+
+The crawl therefore harvests a token-account → wallet map from the same
+transactions (the ATA program's `create` names the wallet; `initializeAccount`
+names the owner) and hands it to the decoder as
+`DecodeContext::token_account_owners`. On the pig above that resolved 11 of 11
+token accounts and produced a contiguous chain ending on the DAS owner.
+
+### Pricing a sale
+
+`price_lamports` is **what the buyer's wallet actually paid**: their lamport
+outflow, less their transaction fee, less the rent they funded into token
+accounts. Rent is the whole difficulty — a sale moves price, fee and account
+rent through the same balances. Checked against Helius's own parser on 25 sales
+it can price, 19 match to the lamport. The six that differ are Magic Eden
+charging a taker fee or royalty *on top* of the list price (+0.3% to +7.5%), so
+our number is the larger, and one Solanart sale differs by a single lamport of
+rent rounding. We also price 20 sales Helius's parser cannot attribute at all.
+
+A marketplace move we cannot price stays an honest `transfer`:
+`activity_sale_has_price` forbids a priceless sale, and inventing one would be
+worse. The derived amount goes into `details.price_candidate` either way —
+which is what makes `--reprice-only` a **database-only** pass. Adding a venue
+to `config/marketplaces.toml` and re-running it turned 30 transfers into priced
+sales in 0.1 s against a deliberately unroutable RPC endpoint.
+
+Only rows this backfill wrote carry a candidate; the live pipeline records the
+program ids but no amount, so repricing a transfer the *ingester* stored means
+re-crawling that asset (`--address <mint> --reclassify`) rather than
+`--reprice-only`.
+
+### Venues live in config, never in Rust
+
+Marketplace program ids are on-chain addresses, so they live in
+`config/marketplaces.toml` like every other address. That is the whole reason
+the decoder captures invoked program ids as *data*. `label` is served verbatim
+as `ActivityEvent.marketplace`, which the contract types as free text so venues
+can be learned without a contract change.
+
+Two entries were confirmed against this collection's own history (Helius parses
+their transactions as `NFT_SALE/MAGIC_EDEN` and `NFT_SALE/SOLANART`); the rest
+come from public program-address mappings. One busy escrow program
+(`HZaWnda…`) is deliberately **left out**: it is certainly a marketplace — pigs
+list into a constant escrow wallet and its sales pay the collection's royalty —
+but no public mapping names it, and a guessed brand would be served to API
+clients as fact. Its sales are honest transfers with the price already derived,
+so identifying it costs one line plus `--reprice-only`.
+
+### Escrow custody is recorded honestly
+
+An escrow-era listing physically moves the pig to a marketplace-owned account,
+so the chain shows the escrow as owner for the listing period. That is what the
+chain says, and it is what keeps the derived history consistent with
+`assets.owner` — DAS reports the escrow as owner too — so
+`integrity_owner_mismatch` stays empty.
+
+### Metaplex Core is stored, not classified
+
+Core instructions are Borsh and the RPC does not parse them, so a Core asset
+yields signatures but no ownership events. Those are stored raw and reported as
+`unverifiable` rather than guessed at; the live pipeline covers Core going
+forward.
+
+### Verifying a run
+
+```sh
+SELECT count(*) FROM integrity_owner_mismatch;   -- must be 0
+```
+
+That is the acceptance criterion, and the backfill asks the same view per asset
+after writing, so its `still disagree with DAS` count and this query cannot
+drift apart. Over 40 SOL Gang pigs: 1 055 signatures, 295 events, 45 sales,
+**0 mismatches**, and a second run with `--expect-unchanged` writes nothing.
+
+An out-of-order event — one older than what the live pipeline already recorded
+— is stored but not applied, exactly as the writer contract says; the crawl
+then runs `rebuild_ownership` for that asset itself, so a backfill over a
+running system converges instead of leaving `ownership_dirty` set.
+
 ## Live pipeline (ALG-623)
 
 `indexer-ingester` keeps the database current from Helius Enhanced WebSockets:
@@ -857,7 +982,7 @@ the merge alone rebuilds the service into a `no bin target` failure.
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
 - ALG-620 — freeze v1 API contract (OpenAPI) + mock server for Explorer — done
 - ALG-621 — DAS backfill (assets, attributes, owners) — done
-- ALG-622 — historical activity backfill (archival API)
+- ALG-622 — historical activity backfill (archival API) — done
 - ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service — done
 - ALG-624 — reconciliation: periodic DAS diff + self-heal
 - ALG-625/626 — public REST API (browse/facets, detail/activity/portfolio)
