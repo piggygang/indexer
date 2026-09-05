@@ -343,6 +343,7 @@ builds the Dockerfile → `/health` must return 200 → traffic cutover. Rollbac
 |---|---|---|---|---|
 | `api` | `indexer-api` (default `BIN`) | image `CMD` | `/health`, 120 s | serves traffic |
 | `admin` | `indexer-admin` (`BIN=indexer-admin`) | idles — see below | none | a container to `railway ssh` into and run `migrate` / `seed` against Postgres over the private network |
+| `ingester` | `indexer-ingester` (`BIN=indexer-ingester`) | image `CMD` | none — binds no port | the ALG-623 live pipeline: one long-lived `transactionSubscribe`, writing ownership and activity |
 
 **Deployment contract:** the Dockerfile builds workspace binary
 `${BIN}` (default `indexer-api`) and installs it under **its own name** at
@@ -353,10 +354,15 @@ build arg; `exec` hands PID 1 to the binary. There is deliberately **no
 `ENTRYPOINT`** — a Railway start command replaces the ENTRYPOINT, and whether
 an image `CMD` is then appended as arguments is undocumented. A service that
 serves traffic must listen on `[::]:$PORT`; `RAILWAY_GIT_COMMIT_SHA` is passed
-as a build arg and baked into `/health` as `commit`. The future ingester service
-reuses the same Dockerfile with service variable `BIN=indexer-ingester` and
-becomes a third `service()` in `.railway/railway.ts` (no healthcheck, restart
-policy `ALWAYS`).
+as a build arg and baked into `/health` as `commit`. The `ingester` service
+reuses the same Dockerfile with service variable `BIN=indexer-ingester`. It sets
+no healthcheck — unset means the deploy goes Active as soon as the container
+starts, which is what a service that binds no port needs — and **no restart
+policy**: `restartPolicyType`, `restartPolicyMaxRetries` and `sleepApplication`
+are the three fields `config apply` silently drops, so the binary supervises
+itself and leans on Railway's default `ON_FAILURE`. (The rest of the `deploy`
+block *does* reach the service — `healthcheckPath`, `healthcheckTimeout`,
+`multiRegionConfig` and `startCommand` are all live on `api` and `admin`.)
 
 The `admin` container idles on purpose. `indexer-admin` is a CLI with a
 *required* subcommand, so the image's default `CMD` would exit 2 immediately and
@@ -400,6 +406,15 @@ railway config pull                          # live project → authoring code
 railway config plan --detailed-exit-code     # read-only; 0 = no drift, 2 = pending
 railway config apply --plan <pinned> --yes
 ```
+
+**Nothing applies this file but you.** `plan`/`apply` read `.railway/railway.ts`
+from the working tree and reconcile the *linked* project — there is no
+`--environment` flag, the target comes from `railway link`. No CI job runs the
+CLI, and Railway's GitHub integration deploys images: it never reads `.railway/`,
+which is also dockerignored and in no service's watch patterns. So merging to
+`main` changes project config not at all — it only redeploys existing services
+whose watch patterns match. Treat `plan` exiting 0 as the standing drift check;
+if it does not, the committed file and production have diverged.
 
 **Always author `railway.ts` from `railway config pull`, never by hand and
 never from `railway config migrate`.** IaC treats omission as deletion, so a
@@ -665,16 +680,18 @@ Two things the run taught us that the config had wrong:
 
 ### Running it on Railway
 
-Not wired up yet, and it needs two changes **in this order**, because IaC
-treats a `preserve()` for a variable that does not exist as a change to
-reconcile:
+Both halves are in place. `HELIUS_API_KEY` is set on the `admin` service —
+`preserve()` does not copy a value between services, so it had to be set there
+directly — and the `admin` env block in `.railway/railway.ts` now declares
+`HELIUS_API_KEY: preserve()` to match.
 
-1. Set `HELIUS_API_KEY` on the `admin` service (dashboard or
-   `railway variables --service admin --set ...`). Today the key exists only
-   on `api`; `preserve()` does not copy a value between services.
-2. Add `HELIUS_API_KEY: preserve()` to the `admin` env block in
-   `.railway/railway.ts`, then `railway config plan`, read every line, then
-   `apply`. Never `--confirm-destructive`.
+The second half was originally skipped, and the gap is the cautionary tale: IaC
+treats omission as deletion, so from the moment the key was set until the moment
+it was declared, every `railway config plan` carried a destructive
+`- Delete variable admin.HELIUS_API_KEY`. Nothing applied it — merging never
+applies IaC — but it made `plan` unusable as a drift check and it would have
+taken the key with it on the next apply. **Set the variable and declare it in
+the same change.**
 
 Also note `DATABASE_MAX_CONNECTIONS = "2"` on `admin`: enough for the backfill,
 which uses one pooled connection at a time, but leaves no headroom if a second
@@ -775,14 +792,65 @@ candidate count fell from 65 to 1 — the 1 being a genuine ownership change.
 
 ### Deploying it
 
-Same ordering hazard as the admin service, for the same reason:
+The `ingester` block is in `.railway/railway.ts` — **it has not been applied**.
+Nothing applies it on merge: Railway's GitHub integration deploys images and
+never reads `.railway/`, so merging lands the code with no service to run it.
+Merging *does* rebuild `api` and `admin`, whose watch patterns match `crates/**`.
 
-1. Set `HELIUS_API_KEY` on the `ingester` service. `preserve()` does not copy a
-   value between services, and a `preserve()` for a variable that does not
-   exist is a change the reconciler will plan.
-2. `railway config plan`, read every line, then `apply`. Never
-   `--confirm-destructive`. The `ingester` block is already in
-   `.railway/railway.ts` — **it has not been applied**.
+Merge first, apply second. Merge-first leaves git ahead of Railway, so `plan`
+reads `1 to add, 0 to change, 0 to destroy` throughout the window — additive,
+and still usable as a drift check. Applying first would leave Railway ahead of
+git, where a `plan` from `main` proposes `- Delete service ingester`, and the
+service's source is pinned to `branch: "main"`, so its first build would fail
+with `no bin target named 'indexer-ingester'`.
+
+1. Merge, and wait for `api` and `admin` to reach a fresh ACTIVE deployment on
+   the merge commit. The `admin` redeploy replaces its container, so finish any
+   `railway ssh` session first.
+2. From a clean `main` checkout, `npm ci` (never `npm install`: `railway` is
+   pinned with a caret and the SDK's `postgres()` hardcodes the database image),
+   then pin and apply the plan:
+
+   ```sh
+   railway config plan --out ~/railway-plans/indexer-$(date +%F).json --verbose
+   railway config apply --plan ~/railway-plans/indexer-$(date +%F).json --yes
+   ```
+
+   Read every line first; expect only `+ Create service ingester`. Commit before
+   pinning — `--source-tree` defaults to `git rev-parse HEAD:.railway`, so an
+   artifact built from a dirty tree records a tree you did not plan. Never
+   `--confirm-destructive`: it is a whole-run gate, not a per-change one.
+3. The moment `apply` returns, set the key:
+
+   ```sh
+   printf '%s' '<helius key>' | railway variable set HELIUS_API_KEY --stdin --service ingester
+   ```
+
+   `--stdin` keeps it out of shell history, and omitting `--skip-deploys` is
+   deliberate — setting a variable triggers a deploy, so this starts the first
+   one with the key present. `preserve()` preserves nothing on a service that
+   did not exist a moment ago, and the binary requires the key at boot. The
+   first build is a cold cargo-chef cook, which is the window; miss it and it
+   crash-loops until Railway's default `ON_FAILURE`/10 gives up, and the
+   `variable set` redeploy recovers it.
+4. `railway config plan --detailed-exit-code` must exit **0**. That zero is the
+   acceptance test — committed and live config agree again.
+5. Seed the registry: this release changes `config/collections.toml`, and
+   rebuilding the admin image is not a seed.
+
+   ```sh
+   railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml
+   ```
+
+   `spec.rs` derives the subscription from the **database**, not from TOML, so a
+   collection that has never been backfilled contributes no addresses. The
+   consumer re-polls the registry and hot-swaps the spec, so seed and backfill
+   can follow the deploy without a restart.
+
+To back it out: `railway service delete --service ingester` **first**, then
+revert on `main`. Deleting the block from `railway.ts` first produces
+`- Delete service ingester`, which the abort list forbids applying; reverting
+the merge alone rebuilds the service into a `no bin target` failure.
 
 ## Roadmap
 

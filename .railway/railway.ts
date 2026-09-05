@@ -86,6 +86,11 @@ export default defineRailway(() => {
     env: {
       BIN: "indexer-admin", // reaches the build only because the Dockerfile declares ARG BIN
       DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
+      // Set live on `admin` for the DAS backfill. Declared here because IaC
+      // treats omission as deletion: while this line was missing, every
+      // `config plan` carried a destructive `- Delete variable
+      // admin.HELIUS_API_KEY`, which made the drift check unusable.
+      HELIUS_API_KEY: preserve(),
       RUST_LOG: "info",
       DATABASE_MAX_CONNECTIONS: "2", // interactive, one-off; leave headroom for api
     },
@@ -95,12 +100,13 @@ export default defineRailway(() => {
   // and no domain — an unset healthcheck makes the deploy go Active as soon as
   // the container starts, which is what a service that serves no traffic needs.
   //
-  // Restart policy: the README used to promise ALWAYS here, but `deploy.*` is
-  // silently dropped by `config apply` (see the note above), so the binary
-  // supervises itself instead — it re-subscribes with capped backoff forever
-  // and reserves a non-zero exit for config/database failures. A watchdog
-  // exits if the checkpoint stops advancing, and Railway's default ON_FAILURE
-  // brings it back into a reconciling restart.
+  // Restart policy: the README used to promise ALWAYS here, but
+  // `restartPolicyType` is one of the three fields `config apply` silently
+  // drops (see the note above), so the binary supervises itself instead — it
+  // re-subscribes with capped backoff forever and reserves a non-zero exit for
+  // config/database failures. A watchdog exits if the checkpoint stops
+  // advancing, and Railway's default ON_FAILURE brings it back into a
+  // reconciling restart.
   const ingester = service("ingester", {
     source: github(REPO, { branch: "main", checkSuites: true }),
     build: {
@@ -113,9 +119,11 @@ export default defineRailway(() => {
       BIN: "indexer-ingester", // reaches the build only because the Dockerfile declares ARG BIN
       DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
       // preserve() keeps the live secret without writing it to source — but it
-      // does NOT copy a value between services. Set HELIUS_API_KEY on the
-      // `ingester` service FIRST, or the reconciler sees a variable that does
-      // not exist and plans a change.
+      // preserves nothing on a service that does not exist yet, and does NOT
+      // copy a value between services. On the apply that first creates this
+      // service, set the key the moment `apply` returns (see the README) —
+      // the cold cargo-chef build is the window, and until the variable
+      // exists `config plan` keeps reporting a pending change.
       HELIUS_API_KEY: preserve(),
       RUST_LOG: "info",
       // One connection for the live writer, one for the concurrent reconciler,
