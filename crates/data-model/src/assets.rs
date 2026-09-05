@@ -526,6 +526,42 @@ pub async fn member_count<'e>(exec: impl PgExecutor<'e>, collection_id: i32) -> 
     .await
 }
 
+/// Flips membership for a batch of addresses, returning how many rows moved.
+///
+/// The one writer of `membership_status`, which the migration reserves for
+/// reconciliation: *"Core assets can leave a collection (update authority
+/// moves them); reconciliation (ALG-624) flips this instead of deleting
+/// history."* Deleting the asset would take its activity and ownership
+/// intervals with it; the row stays and drops out of the browse population.
+///
+/// `removed_at` moves with the status because `assets_removed_pair` requires
+/// the two to agree, and the `IS DISTINCT FROM` guard keeps a re-run a true
+/// no-op — the same discipline every other writer here follows.
+pub async fn set_membership<'e>(
+    exec: impl PgExecutor<'e>,
+    collection_id: i32,
+    addresses: &[String],
+    removed: bool,
+) -> sqlx::Result<u64> {
+    if addresses.is_empty() {
+        return Ok(0);
+    }
+    let done = sqlx::query(
+        "UPDATE assets \
+            SET membership_status = CASE WHEN $3 THEN 'removed' ELSE 'member' END, \
+                removed_at = CASE WHEN $3 THEN now() ELSE NULL END \
+          WHERE collection_id = $1 AND address = ANY($2::text[]) \
+            AND membership_status IS DISTINCT FROM \
+                (CASE WHEN $3 THEN 'removed' ELSE 'member' END)",
+    )
+    .bind(collection_id)
+    .bind(addresses)
+    .bind(removed)
+    .execute(exec)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// Documents already stored for a batch of addresses, as
 /// `(address, source_uri, metadata_json)`.
 ///

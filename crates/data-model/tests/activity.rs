@@ -1074,3 +1074,137 @@ async fn futures_lite_join(pool: &PgPool, collection_id: i32) -> Vec<i64> {
     ids.sort_unstable();
     ids
 }
+
+// --- ALG-624: the integrity snapshot and membership -----------------------
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_integrity_snapshot_counts_a_real_disagreement(pool: PgPool) {
+    use indexer_data_model::integrity;
+
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+    let (a, b) = (pk(50), pk(51));
+
+    // The fixture asset is filed under an allowlist collection but is not on
+    // its allowlist, which is exactly what `integrity_allowlist_violation`
+    // exists to catch — so the snapshot is wired to all four views, not just
+    // the owner one.
+    let seeded = integrity::snapshot(&pool).await.unwrap();
+    assert_eq!(seeded.allowlist_violation, 1);
+    assert!(!seeded.is_healthy());
+
+    let address: String = sqlx::query_scalar("SELECT address FROM assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO collection_mints (mint, collection_id) VALUES ($1, $2)")
+        .bind(&address)
+        .bind(collection_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        integrity::snapshot(&pool).await.unwrap().is_healthy(),
+        "on the allowlist, nothing disagrees"
+    );
+
+    write(
+        &pool,
+        asset_id,
+        collection_id,
+        &sig(1),
+        100,
+        EventKind::Mint,
+        None,
+        Some(&a),
+    )
+    .await;
+    assert!(integrity::snapshot(&pool).await.unwrap().is_healthy());
+
+    // Move the observed owner behind the derived one's back — exactly the
+    // shape a dropped event leaves, and what the sweep exists to catch.
+    sqlx::query("UPDATE assets SET owner = $2 WHERE id = $1")
+        .bind(asset_id)
+        .bind(&b)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let drifted = integrity::snapshot(&pool).await.unwrap();
+    assert_eq!(drifted.owner_mismatch, 1);
+    assert!(
+        !drifted.is_healthy(),
+        "the metric must not be vacuously green"
+    );
+
+    // And `ownership_dirty` is counted too — the overflow path's queue.
+    activity::mark_dirty(&pool, asset_id).await.unwrap();
+    assert_eq!(integrity::snapshot(&pool).await.unwrap().ownership_dirty, 1);
+}
+
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn membership_flips_without_losing_the_asset(pool: PgPool) {
+    use indexer_data_model::assets;
+
+    let collection_id = collection(&pool).await;
+    let asset_id = asset(&pool, collection_id, 1).await;
+    let address: String = sqlx::query_scalar("SELECT address FROM assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    write(
+        &pool,
+        asset_id,
+        collection_id,
+        &sig(1),
+        100,
+        EventKind::Mint,
+        None,
+        Some(&pk(50)),
+    )
+    .await;
+
+    let removed =
+        assets::set_membership(&pool, collection_id, std::slice::from_ref(&address), true)
+            .await
+            .unwrap();
+    assert_eq!(removed, 1);
+    assert_eq!(
+        assets::set_membership(&pool, collection_id, std::slice::from_ref(&address), true)
+            .await
+            .unwrap(),
+        0,
+        "flipping a status that already agrees writes nothing"
+    );
+
+    // The row and its history survive — the migration's reason for a status
+    // column rather than a delete.
+    let (status, has_activity): (String, i64) = sqlx::query_as(
+        "SELECT a.membership_status, (SELECT count(*) FROM activity x WHERE x.asset_id = a.id) \
+           FROM assets a WHERE a.id = $1",
+    )
+    .bind(asset_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((status.as_str(), has_activity), ("removed", 1));
+
+    assert_eq!(
+        assets::set_membership(&pool, collection_id, &[address], false)
+            .await
+            .unwrap(),
+        1,
+        "an asset that comes back is a member again"
+    );
+    let removed_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT removed_at FROM assets WHERE id = $1")
+            .bind(asset_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(removed_at.is_none(), "assets_removed_pair demands the pair");
+}

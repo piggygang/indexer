@@ -113,6 +113,49 @@ pub async fn put_backfill_state<'e>(
     Ok(())
 }
 
+/// When every collection last finished a pass of this `kind`.
+///
+/// `None` means at least one enabled collection has never finished one — a
+/// fresh database, a newly added collection, or a run that failed — and the
+/// caller should treat the job as due. Taking the **minimum** rather than the
+/// maximum is what makes a single lagging collection re-trigger the job
+/// instead of hiding behind its siblings.
+pub async fn last_finished<'e>(
+    exec: impl PgExecutor<'e>,
+    kind: &str,
+) -> sqlx::Result<Option<DateTime<Utc>>> {
+    let finished: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT min(s.finished_at) FROM collections c \
+           LEFT JOIN backfill_state s ON s.collection_id = c.id AND s.kind = $1 \
+          WHERE c.enabled",
+    )
+    .bind(kind)
+    .fetch_one(exec)
+    .await?;
+    Ok(finished)
+}
+
+/// Marks a periodic job as "last finished now" for every enabled collection
+/// that has no record of it, and reports how many rows it seeded.
+///
+/// Without this a job whose row does not exist yet is due immediately, so the
+/// first tick after a fresh deploy runs it regardless of its configured
+/// interval — which for the weekly deep pass means a full document re-fetch a
+/// minute after boot. Seeding makes the first run land one interval out, which
+/// is what the interval says. Existing rows are never touched, so this cannot
+/// delay a job that is genuinely overdue.
+pub async fn seed_schedule<'e>(exec: impl PgExecutor<'e>, kind: &str) -> sqlx::Result<u64> {
+    let done = sqlx::query(
+        "INSERT INTO backfill_state (collection_id, kind, status, finished_at) \
+         SELECT c.id, $1, 'idle', now() FROM collections c WHERE c.enabled \
+         ON CONFLICT (collection_id, kind) DO NOTHING",
+    )
+    .bind(kind)
+    .execute(exec)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// The highest slot any DAS backfill recorded, used to seed a live cursor on a
 /// database that has never checkpointed — so the first reconciliation covers
 /// "since the backfill ran" rather than all of history.

@@ -293,8 +293,11 @@ async fn a_replayed_transaction_is_recorded_as_reconcile(pool: PgPool) {
         "meta": ws["transaction"]["meta"].clone(),
     });
 
-    let recorded = pipeline.replay(&sig(1), 443_800_000, &rpc).await.unwrap();
-    assert_eq!(recorded, 1);
+    let outcome = pipeline.replay(&sig(1), 443_800_000, &rpc).await.unwrap();
+    assert_eq!(outcome.recorded, 1);
+    // The recovery reports its whole outcome, not just the row count: ALG-624
+    // counts a parked signature or a flagged asset as a correction too.
+    assert_eq!((outcome.parked, outcome.dirty), (0, 0));
 
     let source: String = sqlx::query_scalar("SELECT source FROM activity WHERE asset_id = $1")
         .bind(id)

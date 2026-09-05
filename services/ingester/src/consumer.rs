@@ -83,99 +83,94 @@ impl Consumer {
 
         loop {
             tokio::select! {
-                biased;
+                            biased;
 
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        log::info!("shutdown requested; flushing");
-                        break;
-                    }
-                }
-
-                _ = poll.tick() => {
-                    // A registry change (a new collection, or Core assets the
-                    // backfill added) reaches the socket without a restart.
-                    match spec::build(&self.pool).await {
-                        Ok(next) => {
-                            spec_tx.send_if_modified(|current| {
-                                let changed = *current != next;
-                                if changed {
-                                    *current = next;
+                            _ = shutdown.changed() => {
+                                if *shutdown.borrow() {
+                                    log::info!("shutdown requested; flushing");
+                                    break;
                                 }
-                                changed
-                            });
-                        }
-                        Err(error) => log::warn!("rebuilding the subscription spec: {error:#}"),
-                    }
-                    if let Ok(context) = reconcile::context(&self.pool).await {
-                        *pipeline.context_mut() = context;
-                    }
-                    if last_progress.elapsed() > WATCHDOG {
-                        anyhow::bail!(
-                            "no checkpoint in {}s — exiting so the restart policy reconnects \
-                             and reconciles",
-                            last_progress.elapsed().as_secs()
-                        );
-                    }
-                }
+                            }
 
-                item = stream.next() => {
-                    let Some(item) = item else {
-                        log::warn!("stream ended");
-                        break;
-                    };
-                    // A terminal error is the adapter giving up; the service
-                    // decides the restart policy, not the adapter.
-                    let event = item?;
+                            _ = poll.tick() => {
+                                // A registry change (a new collection, or Core assets the
+                                // backfill added) reaches the socket without a restart.
+                                match spec::build(&self.pool).await {
+                                    Ok(next) => {
+                                        spec_tx.send_if_modified(|current| {
+                                            let changed = *current != next;
+                                            if changed {
+                                                *current = next;
+                                            }
+                                            changed
+                                        });
+                                    }
+                                    Err(error) => log::warn!("rebuilding the subscription spec: {error:#}"),
+                                }
+                                if let Ok(context) = reconcile::context(&self.pool).await {
+                                    *pipeline.context_mut() = context;
+                                }
+                                if last_progress.elapsed() > WATCHDOG {
+                                    anyhow::bail!(
+                                        "no checkpoint in {}s — exiting so the restart policy reconnects \
+                                         and reconciles",
+                                        last_progress.elapsed().as_secs()
+                                    );
+                                }
+                            }
 
-                    match event {
-                        IngestEvent::Transaction(update) => {
-                            stats.events += 1;
-                            match pipeline.handle(&update).await {
-                                Ok(outcome) => stats.outcome.add_public(outcome),
-                                Err(error) => {
-                                    log::error!("{}: {error:#}", update.signature);
-                                    return Err(error);
+                            item = stream.next() => {
+                                let Some(item) = item else {
+                                    log::warn!("stream ended");
+                                    break;
+                                };
+                                // A terminal error is the adapter giving up; the service
+                                // decides the restart policy, not the adapter.
+                                let event = item?;
+
+                                match event {
+                                    IngestEvent::Transaction(update) => {
+                                        stats.events += 1;
+                                        match pipeline.handle(&update).await {
+                                            Ok(outcome) => stats.outcome.add(outcome),
+                                            Err(error) => {
+                                                log::error!("{}: {error:#}", update.signature);
+                                                return Err(error);
+                                            }
+                                        }
+                                    }
+                                    IngestEvent::SlotCheckpoint(checkpoint) => {
+                                        last_progress = Instant::now();
+                                        pending_checkpoint = Some(checkpoint.slot);
+                                        if last_checkpoint_write.elapsed() >= CHECKPOINT_EVERY {
+                                            self.checkpoint(&mut pending_checkpoint).await?;
+                                            last_checkpoint_write = Instant::now();
+                                        }
+                                    }
+                                    IngestEvent::Status(StreamStatus::Connected) => {
+                                        // Reconcile on EVERY connect, so cold start, crash
+                                        // restart and mid-run reconnect are one path.
+                                        stats.reconciles += 1;
+                                        let from = ingest_state::last_processed_slot(&self.pool, STREAM).await?;
+                                        let report = reconcile::run(&self.pool, &self.das, &pipeline, from)
+                                            .await?;
+            report.log("reconcile");
+                                        last_progress = Instant::now();
+                                    }
+                                    IngestEvent::Status(StreamStatus::Reconnecting { attempt }) => {
+                                        stats.reconnects += 1;
+                                        log::warn!("transport reconnecting (attempt {attempt})");
+                                    }
+                                    IngestEvent::Status(StreamStatus::Lagged { dropped }) => {
+                                        log::warn!("dropped {dropped} event(s); the reconnect will reconcile");
+                                    }
+                                    IngestEvent::Status(StreamStatus::Resubscribed) => {
+                                        log::info!("subscriptions updated without a reconnect");
+                                    }
+                                    IngestEvent::Account(_) => {}
                                 }
                             }
                         }
-                        IngestEvent::SlotCheckpoint(checkpoint) => {
-                            last_progress = Instant::now();
-                            pending_checkpoint = Some(checkpoint.slot);
-                            if last_checkpoint_write.elapsed() >= CHECKPOINT_EVERY {
-                                self.checkpoint(&mut pending_checkpoint).await?;
-                                last_checkpoint_write = Instant::now();
-                            }
-                        }
-                        IngestEvent::Status(StreamStatus::Connected) => {
-                            // Reconcile on EVERY connect, so cold start, crash
-                            // restart and mid-run reconnect are one path.
-                            stats.reconciles += 1;
-                            let from = ingest_state::last_processed_slot(&self.pool, STREAM).await?;
-                            let report = reconcile::run(&self.pool, &self.das, &pipeline, from)
-                                .await?;
-                            log::info!(
-                                "reconcile finished: swept={} candidates={} signatures={} \
-                                 recorded={} overflowed={}",
-                                report.swept, report.candidates, report.signatures,
-                                report.recorded, report.overflowed
-                            );
-                            last_progress = Instant::now();
-                        }
-                        IngestEvent::Status(StreamStatus::Reconnecting { attempt }) => {
-                            stats.reconnects += 1;
-                            log::warn!("transport reconnecting (attempt {attempt})");
-                        }
-                        IngestEvent::Status(StreamStatus::Lagged { dropped }) => {
-                            log::warn!("dropped {dropped} event(s); the reconnect will reconcile");
-                        }
-                        IngestEvent::Status(StreamStatus::Resubscribed) => {
-                            log::info!("subscriptions updated without a reconnect");
-                        }
-                        IngestEvent::Account(_) => {}
-                    }
-                }
-            }
         }
 
         self.checkpoint(&mut pending_checkpoint).await?;
@@ -187,17 +182,6 @@ impl Consumer {
             ingest_state::checkpoint(&self.pool, STREAM, slot).await?;
         }
         Ok(())
-    }
-}
-
-impl Outcome {
-    fn add_public(&mut self, other: Outcome) {
-        self.recorded += other.recorded;
-        self.redelivered += other.redelivered;
-        self.dirty += other.dirty;
-        self.parked += other.parked;
-        self.hydrated += other.hydrated;
-        self.untracked += other.untracked;
     }
 }
 
