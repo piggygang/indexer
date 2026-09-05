@@ -166,6 +166,9 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
+| `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). `0` disables the schedule, leaving the on-`Connected` reconcile |
+| `RECONCILE_DEEP_INTERVAL_SECS` | no | `604800` | ingester only: the weekly deep pass — supply, burned assets, attribute changes |
+| `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling for the sweep, which shares the Helius budget with live ingestion |
 
 ## Endpoints
 
@@ -977,6 +980,90 @@ revert on `main`. Deleting the block from `railway.ts` first produces
 `- Delete service ingester`, which the abort list forbids applying; reverting
 the merge alone rebuilds the service into a `no bin target` failure.
 
+## Reconciliation (ALG-624)
+
+The stream misses things — downtime past the replay window, edge-case
+transactions — and this transport has no replay at all, so something has to go
+back and look. The ingester reconciles on every `Connected`, and since ALG-624
+it also reconciles **on a schedule**: a process that stays connected for a week
+would otherwise never reconcile at all.
+
+| | cadence | what it does |
+|---|---|---|
+| state sweep | `RECONCILE_INTERVAL_SECS`, default 3600 | `getAssetBatch` / `searchAssets` over every tracked asset → `upsert_batch`; assets that disagree get their signatures walked and replayed as `source = 'reconcile'`; Core departures flip `membership_status`; flagged assets get their intervals rebuilt |
+| deep pass | `RECONCILE_DEEP_INTERVAL_SECS`, default 604800 | the DAS backfill itself — supply, burned assets, attribute changes. It re-fetches only documents whose URI changed, so an unchanged collection issues zero HTTP |
+
+Measured on mainnet: a full sweep of 17 820 assets is ~20 DAS calls and about
+40 s, so hourly costs roughly 144k credits a month.
+
+### It is a spawned task, and its cadence is durable
+
+Spawned rather than another arm of the consumer's `select!`: the `Connected`
+reconcile is `await`ed inline and stalls event handling for the length of a
+sweep, which is tolerable once at startup and not on a timer.
+`.railway/railway.ts` already budgeted the connection for it — *"one for the
+live writer, one for the concurrent reconciler, one spare"*.
+
+Due-ness lives in `backfill_state.finished_at`, not an in-memory timer, because
+the supervisor restarts the consumer with a backoff and a flapping ingester
+would otherwise either never reconcile or reconcile constantly. A job with no
+record is **seeded** as "finished now" rather than treated as due, so a fresh
+deploy does not kick off a full deep pass a minute after boot.
+
+### The drift metric
+
+Every run records itself per collection under `backfill_state`
+(`kind = 'reconcile'` and `'reconcile_deep'`) — the column comment reserved it:
+*"Counters for logs/metrics (processed, corrections-per-run, ...)"*.
+
+```sh
+psql "$DATABASE_URL" -c "SELECT c.slug, s.finished_at, s.progress->>'corrections' \
+  FROM backfill_state s JOIN collections c ON c.id = s.collection_id \
+ WHERE s.kind = 'reconcile';"
+```
+
+`corrections` is deliberately the same definition the backfills use for
+`--expect-unchanged` — rows the sweep changed, plus activity the recovery had
+to write — so "corrections trend to zero" and "re-running changes nothing" are
+one claim measured one way. On a healthy stream it is 0; a spike means the
+stream is losing events, and `overflowed` means more than 2 000 assets
+disagreed at once. That is ALG-628's alert predicate, alongside the existing
+`now() - ingest_state.updated_at > 2 min`.
+
+Each run also snapshots the integrity views, so `integrity(owner=… allowlist=…
+symbol=… dirty=…)` in the log is the same number `SELECT count(*) FROM
+integrity_owner_mismatch` gives. A non-zero owner count that the sweep cannot
+clear means the stored activity is genuinely incomplete — re-crawl that asset
+with `backfill-activity --address <mint> --reclassify`.
+
+### Self-healing, and its limits
+
+An asset the writer flagged `ownership_dirty` (an event that arrived out of
+order, stored but not applied) has its intervals re-derived by the sweep. Over
+`MAX_CANDIDATES` (2 000) disagreeing assets, the sweep is still written, the
+first 2 000 are recovered and the rest are flagged dirty for the next run — the
+cursor keeps advancing on purpose, because holding it back would replay an
+ever-growing span of history without ever catching up.
+
+What it still cannot recover is unchanged from ALG-623: an ownership round-trip
+inside one gap (the state diff sees no change), and a transaction that never
+names the asset. Neither invents an activity row.
+
+### Verified end to end (2026-09-05, mainnet)
+
+With `RECONCILE_INTERVAL_SECS=60`, an asset's owner was corrupted by hand to
+simulate a dropped transfer. The boot sweep read clean (`swept=17820
+candidates=0 corrections=0`); the next scheduled sweep logged
+
+```
+scheduled reconcile finished: swept=17820 candidates=1 corrections=1 ...
+scheduled reconcile corrected piggy-sol-gang: 1 change(s) — updated=1 ...
+```
+
+the asset was back to its true owner, `backfill_state` carried
+`candidates=1, corrections=1` for that collection and 0 for the other three,
+and the following sweep was back to `corrections=0`.
+
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
@@ -984,6 +1071,6 @@ the merge alone rebuilds the service into a `no bin target` failure.
 - ALG-621 — DAS backfill (assets, attributes, owners) — done
 - ALG-622 — historical activity backfill (archival API) — done
 - ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service — done
-- ALG-624 — reconciliation: periodic DAS diff + self-heal
+- ALG-624 — reconciliation: periodic DAS diff + self-heal — done
 - ALG-625/626 — public REST API (browse/facets, detail/activity/portfolio)
 - ALG-627 — rarity scoring · ALG-628 — prod monitoring/alerting · ALG-629 — external collections

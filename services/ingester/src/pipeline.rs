@@ -47,7 +47,13 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn add(&mut self, other: Outcome) {
+    /// Did this produce any change at all? The reconciliation metric's
+    /// definition of a correction, alongside `BatchCounts::is_noop`.
+    pub fn is_noop(&self) -> bool {
+        self.recorded == 0 && self.dirty == 0 && self.parked == 0 && self.hydrated == 0
+    }
+
+    pub fn add(&mut self, other: Outcome) {
         self.recorded += other.recorded;
         self.redelivered += other.redelivered;
         self.dirty += other.dirty;
@@ -89,7 +95,7 @@ impl Pipeline {
         signature: &str,
         slot: i64,
         transaction: &Value,
-    ) -> anyhow::Result<u64> {
+    ) -> anyhow::Result<Outcome> {
         let update = TransactionUpdate {
             filters: Vec::new(),
             slot: slot as u64,
@@ -98,7 +104,10 @@ impl Pipeline {
             account_keys: Vec::new(),
             raw: indexer_ingest::RawPayload::Json(transaction.clone()),
         };
-        Ok(self.handle_as(&update, "reconcile").await?.recorded)
+        // The whole `Outcome`, not just `recorded`: a recovery that parked a
+        // signature or flagged an asset dirty corrected something too, and the
+        // drift metric counts all of it.
+        self.handle_as(&update, "reconcile").await
     }
 
     async fn handle_as(&self, update: &TransactionUpdate, source: &str) -> anyhow::Result<Outcome> {

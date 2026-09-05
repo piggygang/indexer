@@ -15,6 +15,35 @@ pub struct Config {
     pub server: ServerConfig,
     pub helius: HeliusConfig,
     pub database: DatabaseConfig,
+    pub reconcile: ReconcileConfig,
+}
+
+/// Cadence of the ingester's periodic reconciliation (ALG-624).
+///
+/// Env rather than CLI flags because the ingester has no CLI. Both intervals
+/// are affordable: a full sweep is ~20 DAS calls and ~200 credits, so hourly
+/// costs about 144k credits a month, and the deep pass re-fetches only the
+/// documents whose URI changed.
+#[derive(Debug, Clone)]
+pub struct ReconcileConfig {
+    /// `RECONCILE_INTERVAL_SECS`, default 3600. The state sweep plus targeted
+    /// activity recovery. Zero disables the schedule — reconciliation then
+    /// happens only on `Connected`, as it did before ALG-624.
+    pub interval_secs: u64,
+    /// `RECONCILE_DEEP_INTERVAL_SECS`, default 604800 (7 days). Supply,
+    /// burned assets and attribute changes, through the DAS backfill.
+    pub deep_interval_secs: u64,
+    /// `RECONCILE_RPS`, default 10 — the Helius Developer plan's limit. The
+    /// sweep shares a rate budget with the live path, so it is throttled where
+    /// the live consumer is not.
+    pub rps: u32,
+}
+
+impl ReconcileConfig {
+    /// Is the periodic schedule on at all?
+    pub fn enabled(&self) -> bool {
+        self.interval_secs > 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +118,11 @@ impl Config {
                 api_key: env::var("HELIUS_API_KEY").ok().filter(|v| !v.is_empty()),
             },
             database,
+            reconcile: ReconcileConfig {
+                interval_secs: parsed_or("RECONCILE_INTERVAL_SECS", 3_600)?,
+                deep_interval_secs: parsed_or("RECONCILE_DEEP_INTERVAL_SECS", 604_800)?,
+                rps: parsed_or("RECONCILE_RPS", 10)?,
+            },
         })
     }
 }
@@ -118,13 +152,16 @@ where
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 6] = [
+    const KEYS: [&str; 9] = [
         "HOST",
         "PORT",
         "HELIUS_API_KEY",
         "DATABASE_URL",
         "DATABASE_MAX_CONNECTIONS",
         "DATABASE_CONNECT_TIMEOUT_SECS",
+        "RECONCILE_INTERVAL_SECS",
+        "RECONCILE_DEEP_INTERVAL_SECS",
+        "RECONCILE_RPS",
     ];
 
     fn clear() {

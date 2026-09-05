@@ -15,6 +15,7 @@ use indexer_config::Config;
 use indexer_das::DasClient;
 use indexer_ingest::ws::HeliusWs;
 use indexer_ingester::consumer::{self, Consumer};
+use indexer_ingester::schedule;
 
 /// Backoff between supervisor restarts, so a persistent upstream outage does
 /// not become a hot loop.
@@ -46,6 +47,18 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let shutdown = consumer::shutdown_signal();
+
+    // Spawned once, outside the supervisor loop: the schedule is not part of
+    // the consumer's lifecycle, and re-spawning it on every restart would let
+    // a flapping stream either starve reconciliation or run it constantly.
+    // Due-ness lives in `backfill_state`, so it survives the restarts anyway.
+    let reconciler = tokio::spawn(schedule::run(
+        consumer.pool.clone(),
+        consumer.das.clone(),
+        config.reconcile.clone(),
+        shutdown.clone(),
+    ));
+
     let mut restarts = 0usize;
 
     loop {
@@ -81,6 +94,11 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(wait)).await;
     }
 
+    // The schedule watches the same shutdown signal, so this is a join, not
+    // a wait: a sweep in flight finishes its current step and returns.
+    if let Err(error) = reconciler.await {
+        log::warn!("reconciliation schedule ended abnormally: {error}");
+    }
     log::info!("ingester stopped cleanly");
     Ok(())
 }
