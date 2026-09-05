@@ -7,9 +7,26 @@ publish = false
 [dependencies]
 indexer-config = { workspace = true }
 indexer-data-model = { workspace = true }
+actix-cors = { workspace = true }
 actix-web = { workspace = true }
 anyhow = { workspace = true }
+base64 = { workspace = true }
+form_urlencoded = { workspace = true }
+chrono = { workspace = true }
 dotenv = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+# Not for writing SQL — every statement still lives in indexer-data-model.
+# This crate only needs the error type, so a failed query can become the
+# contract's generic `internal` without leaking the database's own message.
+sqlx = { workspace = true }
+thiserror = { workspace = true }
+
+# `#[sqlx::test]` gives each integration test a freshly-migrated throwaway
+# database; bs58 supplies the synthetic keys tests are required to use.
+[dev-dependencies]
+bs58 = { workspace = true }
+tokio = { workspace = true }

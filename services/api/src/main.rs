@@ -1,8 +1,8 @@
-mod handlers;
-
 use std::time::Duration;
 
 use actix_web::{middleware::Logger, web, App, HttpServer};
+use indexer_api::cache::ResponseCache;
+use indexer_api::handlers;
 use indexer_config::Config;
 
 #[actix_web::main]
@@ -33,10 +33,28 @@ async fn main() -> anyhow::Result<()> {
         config.server.port
     );
     let pool = web::Data::new(pool);
+    // One cache for the whole process, not one per worker thread: the point is
+    // that a burst of identical requests costs one query, and per-worker caches
+    // would multiply that by the worker count.
+    let cache = web::Data::new(ResponseCache::default());
     HttpServer::new(move || {
         App::new()
             .app_data(pool.clone())
+            .app_data(cache.clone())
             .wrap(Logger::default())
+            // Public, unauthenticated, read-only: there are no credentials or
+            // cookies to protect, and the Explorer's preview deployments get a
+            // fresh origin on every push, which an allowlist would break.
+            .wrap(
+                actix_cors::Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "HEAD", "OPTIONS"])
+                    .allowed_headers(vec![
+                        actix_web::http::header::IF_NONE_MATCH,
+                        actix_web::http::header::ACCEPT,
+                    ])
+                    .max_age(3600),
+            )
             .configure(handlers::configure)
             .default_service(web::route().to(handlers::not_found))
     })
