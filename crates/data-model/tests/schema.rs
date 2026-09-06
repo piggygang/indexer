@@ -79,7 +79,7 @@ async fn migrations_rerun_is_noop(pool: PgPool) {
         })
         .count() as i64;
     assert_eq!(applied, on_disk);
-    assert_eq!(applied, 6);
+    assert_eq!(applied, 7);
 }
 
 #[sqlx::test]

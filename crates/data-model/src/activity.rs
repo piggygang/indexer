@@ -686,10 +686,11 @@ pub async fn rebuild_ownership(
     let events: Vec<HistoryEvent> = sqlx::query_as(
         "SELECT id, slot, block_time, kind, to_owner \
            FROM activity \
-          WHERE asset_id = $1 AND kind IN ('mint', 'transfer', 'sale', 'burn') \
+          WHERE asset_id = $1 AND kind = ANY($2::text[]) \
           ORDER BY slot, seq, id",
     )
     .bind(asset_id)
+    .bind(EventKind::public_strings())
     .fetch_all(&mut **tx)
     .await?;
 

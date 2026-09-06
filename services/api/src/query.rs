@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use actix_web::http::StatusCode;
 use indexer_data_model::browse::Sort;
+use indexer_data_model::types::EventKind;
 use serde_json::json;
 
 use crate::error::{ApiError, Code};
@@ -26,6 +27,7 @@ const MAX_TRAIT_TYPES: usize = 16;
 const MAX_TRAIT_VALUES: usize = 64;
 const MAX_VALUE_LEN: usize = 128;
 const MAX_Q_LEN: usize = 64;
+const MAX_SLUG_LEN: usize = 64;
 pub const DEFAULT_LIMIT: i64 = 24;
 pub const MAX_LIMIT: i64 = 100;
 
@@ -147,7 +149,8 @@ pub fn sort(query: &str) -> Result<Sort, ApiError> {
     Err(ApiError::invalid("sort", format!("unknown sort `{raw}`")))
 }
 
-/// `limit`, defaulting to 24.
+/// `limit`, defaulting to 24 with a maximum of 100 — the shared `Limit`
+/// parameter.
 ///
 /// `over_limit` is the *status* for a value above the maximum: browse is the
 /// only endpoint that declares `422`, so everywhere else an out-of-range limit
@@ -155,8 +158,20 @@ pub fn sort(query: &str) -> Result<Sort, ApiError> {
 /// `invalid_parameter` either way — it is the parameter that is wrong, not the
 /// sort. Never silently clamped.
 pub fn limit(query: &str, over_limit: StatusCode) -> Result<i64, ApiError> {
+    limit_with(query, DEFAULT_LIMIT, MAX_LIMIT, over_limit)
+}
+
+/// The same rules for the two endpoints that declare their `limit` inline
+/// rather than reusing the shared parameter: `/holders` (default 25, max 100)
+/// and `/search` (default 10, max 25).
+pub fn limit_with(
+    query: &str,
+    default: i64,
+    maximum: i64,
+    over_limit: StatusCode,
+) -> Result<i64, ApiError> {
     let Some(raw) = scalar(query, "limit") else {
-        return Ok(DEFAULT_LIMIT);
+        return Ok(default);
     };
     let value: i64 = raw
         .parse()
@@ -164,15 +179,105 @@ pub fn limit(query: &str, over_limit: StatusCode) -> Result<i64, ApiError> {
     if value < 1 {
         return Err(ApiError::invalid("limit", "`limit` must be at least 1"));
     }
-    if value > MAX_LIMIT {
+    if value > maximum {
         return Err(ApiError::new(
             Code::InvalidParameter,
-            format!("`limit` must be at most {MAX_LIMIT}"),
-            json!({"parameter": "limit", "maximum": MAX_LIMIT}),
+            format!("`limit` must be at most {maximum}"),
+            json!({"parameter": "limit", "maximum": maximum}),
         )
         .with_status(over_limit));
     }
     Ok(value)
+}
+
+/// The repeated `?kind=` filter, defaulting to every public kind.
+///
+/// Repetition is the point (`?kind=sale&kind=transfer` ORs), so this walks the
+/// raw query string for the same reason `filters` does. Duplicates are deduped
+/// rather than refused — a repeated member expresses the same intent — but an
+/// unknown one is `400`: the request enum is closed, and unlike a trait value
+/// there is no data-driven reading of `?kind=listing`.
+pub fn kinds(query: &str) -> Result<Vec<String>, ApiError> {
+    let mut selected: Vec<String> = Vec::new();
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        if key != "kind" {
+            continue;
+        }
+        let kind = EventKind::PUBLIC
+            .iter()
+            .find(|k| k.as_str() == value)
+            .ok_or_else(|| {
+                ApiError::new(
+                    Code::InvalidParameter,
+                    format!("unknown activity kind `{value}`"),
+                    json!({
+                        "parameter": "kind",
+                        "supported": EventKind::PUBLIC.map(|k| k.as_str()),
+                    }),
+                )
+            })?;
+        let kind = kind.as_str().to_string();
+        if !selected.contains(&kind) {
+            selected.push(kind);
+        }
+    }
+    Ok(if selected.is_empty() {
+        EventKind::public_strings()
+    } else {
+        selected
+    })
+}
+
+/// A slug-shaped query parameter (`?collection=`), validated against the
+/// contract's pattern so a malformed one is a named `400` rather than a
+/// silently empty result.
+pub fn slug(query: &str, name: &str) -> Result<Option<String>, ApiError> {
+    let Some(value) = scalar(query, name).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let shaped = value.len() <= MAX_SLUG_LEN
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && !value.contains("--")
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    if !shaped {
+        return Err(ApiError::invalid(name, format!("`{name}` is not a slug")));
+    }
+    Ok(Some(value))
+}
+
+/// `/search`'s required `q`.
+pub fn required_q(query: &str) -> Result<String, ApiError> {
+    let value = scalar(query, "q").unwrap_or_default().trim().to_string();
+    if value.is_empty() {
+        return Err(ApiError::invalid("q", "`q` is required"));
+    }
+    if value.chars().count() > MAX_Q_LEN {
+        return Err(ApiError::invalid("q", "`q` is longer than 64 characters"));
+    }
+    Ok(value)
+}
+
+/// A path parameter that must be a base58 Solana address.
+///
+/// The contract types `{id}` and `{address}` with a pattern, so a malformed one
+/// is `400 invalid_parameter` naming the parameter — never a `404`, which would
+/// claim we looked and found nothing.
+pub fn address<'a>(value: &'a str, parameter: &str) -> Result<&'a str, ApiError> {
+    let shaped = (32..=44).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() && !b"0OIl".contains(&b));
+    if shaped {
+        Ok(value)
+    } else {
+        Err(ApiError::invalid(
+            parameter,
+            format!("`{parameter}` is not a base58 Solana address"),
+        ))
+    }
 }
 
 pub fn cursor(query: &str) -> Option<String> {

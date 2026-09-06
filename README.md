@@ -176,9 +176,8 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
   `{"status":"ok","service":"indexer-api","version":"0.1.0","commit":"<git sha>"}`
 - `GET /ready` — readiness: `SELECT 1` with a 2 s bound → `200 {"status":"ready"}`
   or `503 {"status":"unavailable","reason":…}`. Outside `/v1` and outside the API contract.
-- `GET /v1/collections` · `/v1/collections/{slug}` · `/v1/collections/{slug}/nfts`
-  · `/v1/collections/{slug}/facets` — the browse half of the contract (ALG-625);
-  see below.
+- `/v1/**` — the whole frozen contract, eleven paths: the browse half
+  (ALG-625) and the detail half (ALG-626). Listed under **API contract** below.
 
 ## API contract (ALG-620)
 
@@ -1166,6 +1165,131 @@ covers AND/OR, the two unknown-input behaviours, cursor validity, `304`, facet
 ordering, and that a disabled collection (every `bench-*` fixture) is a `404`
 rather than something the public API will happily browse.
 
+## Detail API (ALG-626)
+
+The other seven paths, which complete `/v1`: one NFT, its timeline, its
+ownership history, a wallet portfolio, the collection feed, the holder list and
+search. Same layering as the browse half — every statement lives in
+`indexer-data-model` (`nft.rs`, `timeline.rs`, `wallet.rs`, `search.rs`, and
+`stats.rs` for the ranking), `services/api` holds only DTOs and HTTP concerns.
+
+```sh
+curl -s localhost:8080/v1/nfts/<mint> | jq '.ownership, .mint, .activitySummary'
+curl -s 'localhost:8080/v1/nfts/<mint>/activity?kind=sale&limit=10' | jq
+curl -s 'localhost:8080/v1/wallets/<wallet>/nfts' | jq '.totalCount, .collections'
+curl -s 'localhost:8080/v1/search?q=%231' | jq '.interpretedAs, .route'
+```
+
+Four indexes created back in the activity migration existed for exactly these
+reads and had no consumer until now: `activity_asset_timeline`,
+`ownership_history_asset`, `ownership_history_open` and
+`assets_owner_collection`. The one new index (migration 7,
+`activity_collection_slot`) is the collection feed's: it orders by `(slot, id)`
+and neither existing index could serve that — `activity_collection_time` orders
+by `block_time`, and `activity_collection_kind_slot` puts `kind` ahead of
+`slot`.
+
+### The population rules differ per endpoint, on purpose
+
+`/v1/nfts/{id}` is the one endpoint that steps **outside** the browse
+population: a removed or burned asset "remains a valid page with valid
+history", so there is no `membership_status = 'member'` predicate — only
+`collections.enabled`, applied inside the query. That is the address-keyed
+equivalent of the slug-keyed `enabled_collection` guard, and it is what keeps
+the `bench-*` fixtures invisible to detail, portfolio *and* search.
+
+The portfolio steps outside it the other way: a burned asset has no owner
+(`assets_burned_has_no_owner`), so it can never appear in one. `?collection=`
+narrows only the grid — `collections` and `totalCount` ignore it — and an
+unknown slug there yields an empty grid rather than a `404`, because unknown
+*filter* input never becomes an error.
+
+`heldSince` is nulled when the open ownership interval disagrees with the
+observed `assets.owner` — the same predicate `integrity_owner_mismatch`
+encodes. The card still reports the observed owner; it just refuses to date the
+wrong wallet. Verified against a real drifted asset, not only a fixture.
+
+### Cursors across five feeds
+
+The ALG-625 codec was typed to `(collection_id, Sort)`, which a per-asset
+timeline does not have. `fingerprint` now hashes an arbitrary list of scope
+parts, so each feed binds its own: the asset address plus the `kind` set, the
+collection id plus the `kind` set, the asset address alone, or the wallet plus
+the `?collection=` filter. One deliberate divergence from the frozen examples:
+the `-slot` and `wallet` cursors there carry no `f`, and we emit one anyway —
+without it a `?kind=sale` cursor replayed on an unfiltered timeline would be
+accepted and would silently skip rows, which is the exact failure the
+contract's own rule exists to prevent. The cursor stays a conformant
+`^[A-Za-z0-9_-]{8,512}$` and clients never decode one.
+
+`RANK()`, not `DENSE_RANK()` — "ties share the lower rank and skip the next
+values". `/holders` and a portfolio's `holderRank` share one windowed CTE, so
+they cannot disagree about a wallet's position.
+
+### Acceptance
+
+**A 2021-era pig with 50+ events does not exist.** The criterion assumed
+signature count ≈ event count; it is not close. Crawling the four busiest mints
+a 400-mint scan could find (445, 440, 386 and 293 signatures) yielded 24, 21, 9
+and 3 events — most signatures are listings, delistings and bids, not ownership
+changes. A wider crawl of 400 `piggy-sol-gang` assets (9 611 signatures, 2 741
+events) put the maximum at **30**, with 23 assets above 20 and none above 30.
+So pagination is proven twice: against the deepest real pig
+(30 events, 6 pages at `limit=5`, and at `limit=7`/`24` too — every page size
+reproduces the ordered scan exactly, no duplicate, no gap, strictly descending
+on `(slot, id)`), and against a synthetic 60-event asset in
+`services/api/tests/detail.rs`, so the "50+" number is still actually exercised.
+
+**The wallet endpoint matches DAS exactly** — for the three test wallets the
+criterion asks for and then some:
+
+| wallet | endpoint | DAS | |
+|---|---|---|---|
+| `CZk74oMn…` | 23 | 23 | match |
+| `J7jnrbnM…` | 23 | 23 | match |
+| `4pjqD8zV…` | 23 | 23 | match |
+| `7iqZCone…` | 12 | 12 | match |
+| `1BWutmTv…` | 433 | 433 | match, over 5 pages |
+
+and, run over the whole tracked set, **0 of 17 820 assets disagree**.
+
+Two traps are worth recording, because both produce a convincing false
+mismatch. First, **`searchAssets` by `ownerAddress` is not ground truth**: it
+omitted 23 assets that `getAssetBatch` confirms the same wallet owns, and
+returned three different totals for one wallet depending on the `burnt` /
+`tokenType` filters (766, 826, 952). Per-asset `getAssetBatch` over the tracked
+set is the authoritative comparison. Second, **DAS says "ownerless" two ways** —
+the `burnt` flag, and an empty owner string on an asset it has not flagged yet —
+while the schema stores both as `NULL`. Treating only the first as ownerless
+reports every burned pig as drift (1 847 of them, which is exactly
+`piggy-sol-gang`'s burned count).
+
+### Conformance
+
+The `check` job's Prism proxy now covers **every path in the document**, not
+three. A registry-only database would leave the detail half serving empty pages
+that validate nothing, so the job first inserts one synthetic asset and two
+events (a mint and a priced sale) — every key copied from the contract's own
+examples, so no on-chain address enters the repo outside `config/`. That
+exercises `NftDetail`, `ActivitySummary` and both branches of `ActivityEvent`'s
+kind-dependent nullability. Locally, all twelve proxied endpoints validate with
+zero response violations.
+
+Malformed-input checks go at the API **directly**, not through the proxy: Prism
+validates the request first and answers its own `422`, so a bad `{id}`, an
+over-large `limit` or an unknown `?kind=` never reaches the binary. The proxy
+can only validate error bodies for well-formed requests that fail upstream,
+which is why the `404` check stays on it and the `400`s do not.
+
+`services/api/tests/detail.rs` covers what a schema check structurally cannot
+see: page-size-invariant exhaustion, cursor rejection across all five feeds,
+the `heldSince` disagreement rule, burned/removed/never-crawled assets, rank
+ties, the four search interpretations, and that a disabled collection is
+invisible to every one of them. `crates/data-model/tests/reads.rs` adds the
+read-layer invariants: a keyset page is exactly a slice of the ordered scan at
+every page size, the detail page shows traits `/facets` excludes, and a search
+for `100%` is a literal.
+
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
@@ -1175,5 +1299,5 @@ rather than something the public API will happily browse.
 - ALG-623 — live pipeline: `ws` adapter (Enhanced WebSockets), ingester service — done
 - ALG-624 — reconciliation: periodic DAS diff + self-heal — done
 - ALG-625 — public REST API: browse, facets, search — done
-- ALG-626 — public REST API: detail, activity, portfolio
+- ALG-626 — public REST API: detail, activity, portfolio — done (`/v1` complete)
 - ALG-627 — rarity scoring · ALG-628 — prod monitoring/alerting · ALG-629 — external collections

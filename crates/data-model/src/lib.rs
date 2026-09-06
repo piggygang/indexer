@@ -22,11 +22,15 @@ pub mod browse;
 pub mod facets;
 pub mod ingest_state;
 pub mod integrity;
+pub mod nft;
 pub mod registry;
+pub mod search;
 pub mod seed;
 pub mod stats;
 pub mod synth;
+pub mod timeline;
 pub mod types;
+pub mod wallet;
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};

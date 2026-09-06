@@ -89,6 +89,16 @@ impl EventKind {
         EventKind::Burn,
     ];
 
+    /// The public kinds as bindable text — one definition for every query
+    /// that filters on them (`kind = ANY($n::text[])`), so no statement spells
+    /// the list out a second time.
+    pub fn public_strings() -> Vec<String> {
+        Self::PUBLIC
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect()
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Mint => "mint",
