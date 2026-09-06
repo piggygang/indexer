@@ -52,6 +52,18 @@ pub struct AssetRef {
     pub owner: Option<String>,
     pub owner_slot: Option<i64>,
     pub burned: bool,
+    /// The newest slot we have an `activity` row for, maintained by the
+    /// `activity_touch_assets` trigger. `None` means we have never recorded
+    /// anything for this asset.
+    ///
+    /// This is the **recovery floor**: "walk this asset's signatures back to
+    /// the last event we already know about". Reconciliation used to walk back
+    /// to the live stream cursor instead, which on a healthy ingester is
+    /// always *now* — so a transfer the WebSocket dropped was, by definition,
+    /// below the floor and could never be recovered. A per-asset floor is the
+    /// only one that is correct for both the on-connect sweep and the
+    /// scheduled one.
+    pub last_activity_slot: Option<i64>,
 }
 
 /// Resolves addresses seen on chain to assets we track. Addresses we do not
@@ -66,7 +78,8 @@ pub async fn assets_by_address<'e>(
     addresses: &[String],
 ) -> sqlx::Result<Vec<AssetRef>> {
     sqlx::query_as(
-        "SELECT a.id, a.address, a.collection_id, a.owner, a.owner_slot, a.burned \
+        "SELECT a.id, a.address, a.collection_id, a.owner, a.owner_slot, a.burned, \
+                a.last_activity_slot \
            FROM assets a \
            JOIN collections c ON c.id = a.collection_id \
           WHERE a.address = ANY($1::text[]) AND c.enabled",
@@ -587,7 +600,8 @@ pub async fn assets_after<'e>(
     limit: i64,
 ) -> sqlx::Result<Vec<AssetRef>> {
     sqlx::query_as(
-        "SELECT id, address, collection_id, owner, owner_slot, burned FROM assets \
+        "SELECT id, address, collection_id, owner, owner_slot, burned, last_activity_slot \
+           FROM assets \
           WHERE collection_id = $1 AND id > $2 AND membership_status = 'member' \
           ORDER BY id LIMIT $3",
     )
@@ -604,11 +618,61 @@ pub async fn dirty_assets<'e>(
     limit: i64,
 ) -> sqlx::Result<Vec<AssetRef>> {
     sqlx::query_as(
-        "SELECT a.id, a.address, a.collection_id, a.owner, a.owner_slot, a.burned \
+        "SELECT a.id, a.address, a.collection_id, a.owner, a.owner_slot, a.burned, \
+                a.last_activity_slot \
            FROM assets a WHERE a.ownership_dirty ORDER BY a.id LIMIT $1",
     )
     .bind(limit)
     .fetch_all(exec)
+    .await
+}
+
+/// Assets whose recorded history contradicts their observed owner.
+///
+/// Exactly `integrity_owner_mismatch`: the asset *has* ownership history, and
+/// its open interval names someone other than `assets.owner`. That is a state
+/// which is provably wrong — a transfer moved the asset, a DAS state sweep
+/// patched the owner column, and the event that moved it was never recorded.
+///
+/// Deliberately **not** "has an owner and no history at all". Measured on
+/// production, 35% of tracked assets are in that state, because the archival
+/// activity backfill has never been run over the whole catalogue — so it means
+/// "not crawled yet", not "the stream dropped something". Folding it in here
+/// would turn every hourly reconciliation into an archival crawl of 2,000
+/// assets against a 10 rps budget. `backfill-activity --slug` is the tool for
+/// that; this is the tool for a timeline that disagrees with itself.
+///
+/// Read by both the reconciliation sweep and `backfill-activity --drifted`,
+/// for the reason [`owner_agrees`] states about its own predicate: the metric
+/// and the repair must not be able to drift apart.
+pub async fn drifted_assets<'e>(
+    exec: impl PgExecutor<'e>,
+    limit: i64,
+) -> sqlx::Result<Vec<AssetRef>> {
+    sqlx::query_as(
+        "SELECT a.id, a.address, a.collection_id, a.owner, a.owner_slot, a.burned, \
+                a.last_activity_slot \
+           FROM assets a \
+           JOIN collections c ON c.id = a.collection_id \
+           JOIN integrity_owner_mismatch m ON m.asset_id = a.id \
+          WHERE c.enabled AND a.membership_status = 'member' \
+          ORDER BY a.id LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(exec)
+    .await
+}
+
+/// How many assets [`drifted_assets`] would return — the backlog, for a report
+/// line that does not need the rows.
+pub async fn drifted_count<'e>(exec: impl PgExecutor<'e>) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM assets a \
+           JOIN collections c ON c.id = a.collection_id \
+           JOIN integrity_owner_mismatch m ON m.asset_id = a.id \
+          WHERE c.enabled AND a.membership_status = 'member'",
+    )
+    .fetch_one(exec)
     .await
 }
 
@@ -628,7 +692,7 @@ pub async fn assets_in_collection<'e>(
     collection_id: i32,
 ) -> sqlx::Result<Vec<AssetRef>> {
     sqlx::query_as(
-        "SELECT id, address, collection_id, owner, owner_slot, burned \
+        "SELECT id, address, collection_id, owner, owner_slot, burned, last_activity_slot \
            FROM assets WHERE collection_id = $1",
     )
     .bind(collection_id)
