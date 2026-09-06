@@ -15,7 +15,9 @@ use crate::browse::AssetCard;
 
 /// One card plus the collection it belongs to, so a cross-collection grid can
 /// attach the right badge without a second lookup.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+///
+/// No `Eq`: the embedded card carries an `Option<f64>` rarity score.
+#[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct PortfolioCard {
     pub collection_id: i32,
     #[sqlx(flatten)]
@@ -30,7 +32,7 @@ pub struct Holding {
 }
 
 const CARD_COLUMNS: &str = "a.collection_id, a.id, a.address, a.name, a.number, a.image_uri, \
-     a.image_status, a.burned, a.owner, a.last_activity_at, \
+     a.image_status, a.burned, a.owner, a.last_activity_at, a.rarity_score, a.rarity_rank, \
      0::bigint AS sort_number, ''::text AS sort_text";
 
 /// Assets held across every enabled collection — the contract's `totalCount`,

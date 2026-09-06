@@ -14,8 +14,10 @@ use indexer_config::Config;
 use indexer_das::backfill::{self, BackfillOptions};
 use indexer_das::DasClient;
 use indexer_data_model::activity;
+use indexer_data_model::assets as data_model_assets;
 use indexer_data_model::browse;
 use indexer_data_model::facets::{self, TraitSelection};
+use indexer_data_model::rarity;
 use indexer_data_model::seed::{self, Outcome};
 use indexer_data_model::synth::{self, SyntheticSpec};
 use indexer_data_model::{registry, PgPool};
@@ -145,6 +147,34 @@ enum Cmd {
         /// Report what would be rebuilt without writing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Recompute statistical rarity scores and 1..N ranks (ALG-627).
+    ///
+    /// The formula lives in `migrations/20260906000800_rarity.sql` and is
+    /// implemented once, in `data-model::rarity`. A pass is idempotent: the
+    /// writer's `IS DISTINCT FROM` guard means re-running an unchanged
+    /// collection writes no row, which is what `--expect-unchanged` proves.
+    Rarity {
+        /// Only this collection (default: every enabled one).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Only collections a writer flagged — what the ingester's drain does.
+        #[arg(long)]
+        dirty_only: bool,
+        /// Recompute and report without writing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Fail when anything would change — the "re-running changes nothing" proof.
+        #[arg(long)]
+        expect_unchanged: bool,
+        /// Recompute a second way, in exact integer arithmetic, and compare
+        /// with what is stored. This is the acceptance criterion, runnable
+        /// against production.
+        #[arg(long)]
+        verify: bool,
+        /// Print one asset's score term by term instead of recomputing.
+        #[arg(long)]
+        explain: Option<String>,
     },
     /// Synthetic data + facet timings — the ALG-619 "< 100 ms" acceptance evidence.
     Bench {
@@ -330,6 +360,134 @@ async fn main() -> anyhow::Result<()> {
                 .map(|c| c.slug.clone())
             {
                 bail!("activity backfill failed for {failed} (see backfill_state.last_error)");
+            }
+        }
+        Cmd::Rarity {
+            slug,
+            dirty_only,
+            dry_run,
+            expect_unchanged,
+            verify,
+            explain,
+        } => {
+            if let Some(address) = &explain {
+                let terms = rarity::explain(&pool, address).await?;
+                if terms.is_empty() {
+                    bail!("no ranked asset with address {address}");
+                }
+                println!(
+                    "{:<16} {:<22} {:>9} {:>14}",
+                    "trait", "value", "carriers", "term"
+                );
+                for term in &terms {
+                    println!(
+                        "{:<16} {:<22} {:>9} {:>14.6}",
+                        term.trait_type,
+                        term.value.as_deref().unwrap_or("(absent)"),
+                        term.carriers,
+                        term.term
+                    );
+                }
+                println!(
+                    "{:<16} {:<22} {:>9} {:>14.6}",
+                    "",
+                    "SCORE",
+                    "",
+                    terms.iter().map(|t| t.term).sum::<f64>()
+                );
+                return Ok(());
+            }
+
+            let targets = rarity_targets(&pool, slug.as_deref(), dirty_only).await?;
+            if targets.is_empty() {
+                println!("no collection to rank");
+            }
+            let mut changed_slugs: Vec<String> = Vec::new();
+            let mut clean = true;
+            for (id, slug) in &targets {
+                if !rarity::is_rankable(&pool, *id).await? {
+                    // Two different situations, and only one is worth a warning.
+                    // A collection with no assets is simply not backfilled yet.
+                    // A collection with assets but no facetable trait type is
+                    // Pig Mud: its metadata host is gone, so the only trait it
+                    // carries is a per-asset-unique `Name` the registry excludes
+                    // from facets. Null is the honest answer there — ranking it
+                    // would mean one N-way tie — but an operator should know.
+                    let members = data_model_assets::member_count(&pool, *id).await?;
+                    if members > 0 {
+                        log::warn!(
+                            "{slug}: {members} asset(s) but no facetable trait type — rarity \
+                             stays null; add a metadata_uri_template in \
+                             config/collections.toml once the metadata is re-hosted"
+                        );
+                    } else {
+                        println!("{slug:<18} not backfilled yet, nothing to rank");
+                    }
+                    // The pass looked and there is nothing to do. Clearing the
+                    // flag matters for `--dirty-only`, which the ingester's
+                    // drain mirrors: left set, it would re-examine the same
+                    // collection every tick forever.
+                    if !dry_run {
+                        rarity::clear_dirty(&pool, *id).await?;
+                    }
+                    continue;
+                }
+                let outcome = if dry_run {
+                    rarity::preview(&pool, *id).await?
+                } else {
+                    rarity::recompute(&pool, *id).await?
+                };
+                println!(
+                    "{:<18} ranked={:<6} changed={:<6} version={:<4}{}",
+                    slug,
+                    outcome.ranked,
+                    outcome.changed,
+                    outcome.version,
+                    if outcome.skipped {
+                        " (skipped: another pass holds the lock)"
+                    } else {
+                        ""
+                    }
+                );
+                if outcome.changed > 0 {
+                    changed_slugs.push(slug.clone());
+                }
+                if verify {
+                    let check = rarity::verify(&pool, *id).await?;
+                    println!(
+                        "{:<18} verify: {} member(s), {} ranked, {} score / {} rank mismatch(es){}",
+                        slug,
+                        check.members,
+                        check.ranked,
+                        check.score_mismatches,
+                        check.rank_mismatches,
+                        check
+                            .first
+                            .as_deref()
+                            .map(|f| format!(" — {f}"))
+                            .unwrap_or_default()
+                    );
+                    clean &= check.is_clean();
+                }
+            }
+            if dry_run {
+                println!("\n(dry run, rolled back)");
+            }
+            if expect_unchanged && !changed_slugs.is_empty() {
+                bail!(
+                    "rarity changed {} collection(s): {}",
+                    changed_slugs.len(),
+                    changed_slugs.join(", ")
+                );
+            }
+            if expect_unchanged {
+                println!("\nrarity is a no-op, as expected");
+            }
+            if verify && !clean {
+                bail!("the stored ranks disagree with an independent recomputation");
+            }
+            if verify {
+                println!("\nranks match an independent recomputation");
             }
         }
         Cmd::RebuildOwnership {
@@ -581,6 +739,9 @@ struct Scenario {
     name: String,
     filters: BTreeMap<String, Vec<String>>,
     q: Option<&'static str>,
+    /// How the page is ordered. Every sort is a scan of its own index, so the
+    /// rarity index gets measured like the rest rather than assumed cheap.
+    sort: browse::Sort,
 }
 
 /// Scenarios derived from the collection's own facet distribution, so the
@@ -613,6 +774,13 @@ async fn derive_scenarios(pool: &PgPool, collection_id: i32) -> anyhow::Result<V
             name: "no filters".into(),
             filters: BTreeMap::new(),
             q: None,
+            sort: browse::Sort::Number,
+        },
+        Scenario {
+            name: "sort=rarity, no filters".into(),
+            filters: BTreeMap::new(),
+            q: None,
+            sort: browse::Sort::Rarity,
         },
         Scenario {
             name: format!("{a} in {{2 most common}} AND {b} = p30 value"),
@@ -621,6 +789,7 @@ async fn derive_scenarios(pool: &PgPool, collection_id: i32) -> anyhow::Result<V
                 (b.clone(), vec![at(bv, 30)]),
             ]),
             q: None,
+            sort: browse::Sort::Number,
         },
         Scenario {
             name: format!("{a} = p30, {b} = p30, {c} = rarest"),
@@ -630,13 +799,40 @@ async fn derive_scenarios(pool: &PgPool, collection_id: i32) -> anyhow::Result<V
                 (c.clone(), vec![cv[cv.len() - 1].clone()]),
             ]),
             q: None,
+            sort: browse::Sort::Number,
         },
         Scenario {
             name: "text search q=#12".into(),
             filters: BTreeMap::new(),
             q: Some("#12"),
+            sort: browse::Sort::Number,
         },
     ])
+}
+
+/// The collections a `rarity` run covers: one slug, the flagged ones, or every
+/// enabled collection in registry order.
+async fn rarity_targets(
+    pool: &PgPool,
+    slug: Option<&str>,
+    dirty_only: bool,
+) -> anyhow::Result<Vec<(i32, String)>> {
+    if let Some(slug) = slug {
+        let row = registry::by_slug(pool, slug)
+            .await?
+            .with_context(|| format!("no collection with slug {slug}"))?;
+        return Ok(vec![(row.id, row.slug)]);
+    }
+    let enabled = registry::list_enabled(pool).await?;
+    if !dirty_only {
+        return Ok(enabled.into_iter().map(|c| (c.id, c.slug)).collect());
+    }
+    let dirty = rarity::dirty_collections(pool).await?;
+    Ok(enabled
+        .into_iter()
+        .filter(|c| dirty.contains(&c.id))
+        .map(|c| (c.id, c.slug))
+        .collect())
 }
 
 async fn seed_bench_collections(pool: &PgPool, assets: i64) -> anyhow::Result<()> {
@@ -646,6 +842,7 @@ async fn seed_bench_collections(pool: &PgPool, assets: i64) -> anyhow::Result<()
             name: "Bench PSG-like".into(),
             assets,
             unique_trait: false,
+            coverage: 1.0,
             seed: 0.42,
         },
         SyntheticSpec {
@@ -653,6 +850,7 @@ async fn seed_bench_collections(pool: &PgPool, assets: i64) -> anyhow::Result<()
             name: "Bench PGG-like".into(),
             assets: assets / 2,
             unique_trait: true,
+            coverage: 1.0,
             seed: 0.43,
         },
         SyntheticSpec {
@@ -660,6 +858,10 @@ async fn seed_bench_collections(pool: &PgPool, assets: i64) -> anyhow::Result<()
             name: "Bench Core-like".into(),
             assets,
             unique_trait: false,
+            // Sparse, like the dynamic Core collection it stands in for: the
+            // browse benchmark's rarity scenario is only representative if
+            // some assets are missing some traits.
+            coverage: 0.35,
             seed: 0.44,
         },
     ];
@@ -737,7 +939,7 @@ async fn bench(pool: &PgPool, options: BenchOptions) -> anyhow::Result<()> {
                 collection_id: collection.id,
                 selections: selections.clone(),
                 q: scenario.q.map(str::to_owned),
-                sort: browse::Sort::Number,
+                sort: scenario.sort,
                 after: None,
                 limit: 25,
             };

@@ -24,6 +24,12 @@ pub struct Integrity {
     pub symbol_mismatch: i64,
     /// Assets an out-of-order event flagged for the ownership rebuild.
     pub ownership_dirty: i64,
+    /// Enabled collections whose ranks are not a clean `1..N` over their
+    /// faceted population — unranked members, duplicate ranks or a gap.
+    /// Non-zero means a rarity pass is owed or one wrote a broken result;
+    /// stale ranks are otherwise invisible, because a wrong rank still
+    /// serializes and still sorts.
+    pub rarity_broken: i64,
 }
 
 impl Integrity {
@@ -35,18 +41,21 @@ impl Integrity {
 
 /// Counts every integrity view in one round trip.
 pub async fn snapshot<'e>(exec: impl PgExecutor<'e>) -> sqlx::Result<Integrity> {
-    let (owner_mismatch, allowlist_violation, symbol_mismatch, ownership_dirty) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM integrity_owner_mismatch)::bigint, \
+    let (owner_mismatch, allowlist_violation, symbol_mismatch, ownership_dirty, rarity_broken) =
+        sqlx::query_as(
+            "SELECT (SELECT count(*) FROM integrity_owner_mismatch)::bigint, \
                     (SELECT count(*) FROM integrity_allowlist_violation)::bigint, \
                     (SELECT count(*) FROM integrity_symbol_mismatch)::bigint, \
-                    (SELECT count(*) FROM assets WHERE ownership_dirty)::bigint",
-    )
-    .fetch_one(exec)
-    .await?;
+                    (SELECT count(*) FROM assets WHERE ownership_dirty)::bigint, \
+                    (SELECT count(*) FROM integrity_rarity_broken)::bigint",
+        )
+        .fetch_one(exec)
+        .await?;
     Ok(Integrity {
         owner_mismatch,
         allowlist_violation,
         symbol_mismatch,
         ownership_dirty,
+        rarity_broken,
     })
 }

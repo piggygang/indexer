@@ -45,7 +45,9 @@ pub struct ActivityEvent {
 /// Flat rather than two nested structs because both halves carry an `id` and
 /// sqlx's `flatten` has no column prefix; [`CollectionEvent::card`] puts the
 /// NFT half back into the shape the summary DTO already consumes.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+///
+/// No `Eq`: the NFT half carries an `Option<f64>` rarity score.
+#[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct CollectionEvent {
     pub id: i64,
     pub kind: String,
@@ -66,6 +68,8 @@ pub struct CollectionEvent {
     pub nft_burned: bool,
     pub nft_owner: Option<String>,
     pub nft_last_activity_at: Option<DateTime<Utc>>,
+    pub nft_rarity_score: Option<f64>,
+    pub nft_rarity_rank: Option<i32>,
 }
 
 impl CollectionEvent {
@@ -97,6 +101,8 @@ impl CollectionEvent {
             burned: self.nft_burned,
             owner: self.nft_owner.clone(),
             last_activity_at: self.nft_last_activity_at,
+            rarity_score: self.nft_rarity_score,
+            rarity_rank: self.nft_rarity_rank,
             sort_number: 0,
             sort_text: String::new(),
         }
@@ -171,7 +177,8 @@ pub async fn collection_activity(
                 a.id AS nft_id, a.address AS nft_address, a.name AS nft_name, \
                 a.number AS nft_number, a.image_uri AS nft_image_uri, \
                 a.image_status AS nft_image_status, a.burned AS nft_burned, \
-                a.owner AS nft_owner, a.last_activity_at AS nft_last_activity_at \
+                a.owner AS nft_owner, a.last_activity_at AS nft_last_activity_at, \
+                a.rarity_score AS nft_rarity_score, a.rarity_rank AS nft_rarity_rank \
            FROM activity e JOIN assets a ON a.id = e.asset_id \
           WHERE e.collection_id = $1 AND e.kind = ANY($2::text[]){keyset} \
           ORDER BY e.slot DESC, e.id DESC LIMIT {limit_param}"

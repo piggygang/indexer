@@ -126,27 +126,15 @@ fn scalar(query: &str, name: &str) -> Option<String> {
 
 /// `sort`, defaulting to `number`.
 ///
-/// `rarity`/`-rarity` are reserved by the contract so the client's union stays
-/// stable when ALG-627 ships; until then they are `422 unsupported_sort` with
-/// the supported list in `details`, exactly as the contract's example shows.
+/// Every member of the contract's enum is now served: ALG-627 shipped rarity,
+/// so the reserved branch that answered `422 unsupported_sort` is gone.
+/// `Code::UnsupportedSort` stays — it is a member of the contract's closed
+/// error enum, and nothing else may be invented in its place.
 pub fn sort(query: &str) -> Result<Sort, ApiError> {
     let Some(raw) = scalar(query, "sort") else {
         return Ok(Sort::Number);
     };
-    if let Some(sort) = Sort::parse(&raw) {
-        return Ok(sort);
-    }
-    if raw == "rarity" || raw == "-rarity" {
-        return Err(ApiError::new(
-            Code::UnsupportedSort,
-            format!("sort={raw} is not available until rarity scoring ships"),
-            json!({
-                "parameter": "sort",
-                "supported": ["number", "-number", "name", "-name", "activity", "-activity"],
-            }),
-        ));
-    }
-    Err(ApiError::invalid("sort", format!("unknown sort `{raw}`")))
+    Sort::parse(&raw).ok_or_else(|| ApiError::invalid("sort", format!("unknown sort `{raw}`")))
 }
 
 /// `limit`, defaulting to 24 with a maximum of 100 — the shared `Limit`
@@ -338,11 +326,21 @@ mod tests {
     }
 
     #[test]
-    fn rarity_is_reserved_not_unknown() {
-        let err = sort("sort=rarity").unwrap_err();
-        assert_eq!(err.code, Code::UnsupportedSort);
-        assert_eq!(err.details["parameter"], "sort");
-        assert_eq!(sort("sort=-activity").unwrap(), Sort::ActivityDesc);
+    fn every_member_of_the_contracts_sort_enum_parses() {
+        // The contract's enum, verbatim. A member that stops parsing is a
+        // client-visible regression, and rarity used to be exactly that.
+        for (raw, expected) in [
+            ("number", Sort::Number),
+            ("-number", Sort::NumberDesc),
+            ("name", Sort::Name),
+            ("-name", Sort::NameDesc),
+            ("activity", Sort::Activity),
+            ("-activity", Sort::ActivityDesc),
+            ("rarity", Sort::Rarity),
+            ("-rarity", Sort::RarityDesc),
+        ] {
+            assert_eq!(sort(&format!("sort={raw}")).unwrap(), expected, "{raw}");
+        }
         assert_eq!(sort("").unwrap(), Sort::Number);
         assert_eq!(sort("sort=nope").unwrap_err().code, Code::InvalidParameter);
     }

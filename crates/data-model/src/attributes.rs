@@ -41,6 +41,11 @@ pub async fn ensure_trait_value<'e>(
 
 /// Re-applies `collections.facet_exclude` to the existing trait types of one
 /// collection. Returns the number of rows that changed.
+///
+/// Flags the collection's ranks stale when it changed anything: rarity is
+/// scored over `is_facet` trait types only, so excluding a trait re-ranks the
+/// whole collection — and this is the one staleness source that writes no
+/// asset row, leaves no counter and would otherwise be invisible.
 pub async fn sync_trait_facets<'e>(
     exec: impl PgExecutor<'e>,
     collection_id: i32,
@@ -56,6 +61,20 @@ pub async fn sync_trait_facets<'e>(
     .execute(exec)
     .await?;
     Ok(result.rows_affected())
+}
+
+/// [`sync_trait_facets`] plus the rarity flag, for callers holding a
+/// transaction (the seeder). Split so the read-only executor form stays
+/// usable.
+pub async fn sync_trait_facets_and_flag(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    collection_id: i32,
+) -> sqlx::Result<u64> {
+    let changed = sync_trait_facets(&mut **tx, collection_id).await?;
+    if changed > 0 {
+        crate::rarity::mark_dirty(&mut **tx, collection_id).await?;
+    }
+    Ok(changed)
 }
 
 /// One trait type's spread over a collection, for the backfill's

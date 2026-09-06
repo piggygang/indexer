@@ -35,8 +35,30 @@ pub struct SyntheticSpec {
     pub name: String,
     pub assets: i64,
     pub unique_trait: bool,
+    /// Fraction of assets that carry each facet trait type, in `(0, 1]`.
+    ///
+    /// `1.0` gives every asset every trait, which is what the real Token
+    /// Metadata collections look like. Below 1.0, the later trait types thin
+    /// out — the shape of the dynamic Core collection, where an `Earring` is
+    /// worn by 258 of 747. Rarity scores absence as a value, so a fixture with
+    /// full coverage never exercises that bucket at all.
+    pub coverage: f64,
     /// `setseed` argument in `[-1, 1]`.
     pub seed: f64,
+}
+
+impl SyntheticSpec {
+    /// How likely trait type `position` is to be present. The first types stay
+    /// universal and the tail thins, so one knob produces a realistic mix
+    /// rather than uniform holes.
+    fn coverage_at(&self, position: usize) -> f64 {
+        if self.coverage >= 1.0 {
+            return 1.0;
+        }
+        let steps = FACET_TRAITS.len().saturating_sub(1).max(1) as f64;
+        let t = position as f64 / steps;
+        (1.0 - t * (1.0 - self.coverage)).clamp(0.05, 1.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +157,8 @@ pub async fn seed_synthetic(
             "WITH vals AS (SELECT id, trait_type_id, row_number() OVER (ORDER BY id) - 1 AS ord \
                              FROM trait_values WHERE trait_type_id = $2), \
                   pick AS (SELECT a.id AS asset_id, floor(power(random(), $4::float8) * $3::int)::int AS ord \
-                             FROM assets a WHERE a.collection_id = $1) \
+                             FROM assets a WHERE a.collection_id = $1 \
+                              AND ($6::float8 >= 1.0 OR random() < $6::float8)) \
              INSERT INTO asset_attributes (asset_id, collection_id, trait_type_id, trait_value_id, position) \
              SELECT p.asset_id, $1, v.trait_type_id, v.id, $5::smallint \
                FROM pick p JOIN vals v ON v.ord = p.ord",
@@ -145,6 +168,7 @@ pub async fn seed_synthetic(
         .bind(cardinality)
         .bind(SKEW)
         .bind(position as i16)
+        .bind(spec.coverage_at(position))
         .execute(&mut *tx)
         .await
         .with_context(|| format!("generating {name} attributes"))?;

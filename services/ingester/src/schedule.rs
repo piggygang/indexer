@@ -26,10 +26,10 @@
 
 use std::time::Duration;
 
-use indexer_config::ReconcileConfig;
+use indexer_config::{RarityConfig, ReconcileConfig};
 use indexer_das::backfill::{self, BackfillOptions};
 use indexer_das::DasClient;
-use indexer_data_model::{ingest_state, PgPool};
+use indexer_data_model::{ingest_state, rarity, registry, PgPool};
 use serde_json::json;
 use tokio::sync::watch;
 
@@ -49,12 +49,23 @@ pub async fn run(
     pool: PgPool,
     das: DasClient,
     config: ReconcileConfig,
+    rarity_config: RarityConfig,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Two independent schedules share one task. The early return is per
+    // schedule, not for the whole loop: RECONCILE_INTERVAL_SECS=0 must not
+    // silently freeze ranks, which is a different subsystem with a different
+    // knob.
     if !config.enabled() {
         log::info!("periodic reconciliation disabled (RECONCILE_INTERVAL_SECS=0)");
+    }
+    if !rarity_config.enabled() {
+        log::info!("periodic rarity drain disabled (RARITY_INTERVAL_SECS=0)");
+    }
+    if !config.enabled() && !rarity_config.enabled() {
         return;
     }
+    let rarity_every = Duration::from_secs(rarity_config.interval_secs);
     let sweep_every = Duration::from_secs(config.interval_secs);
     let deep_every = Duration::from_secs(config.deep_interval_secs);
     log::info!(
@@ -83,12 +94,26 @@ pub async fn run(
             }
 
             _ = tick.tick() => {
-                if due(&pool, reconcile::KIND, sweep_every).await
+                // The rarity drain first, and every tick: the flag is the
+                // trigger, so a collection a writer touched is re-ranked on the
+                // next minute rather than at the interval. The interval is only
+                // the backstop for a flag that was somehow missed. It is also
+                // the cheapest job (~110 ms for everything) and needs no DAS,
+                // so it runs even when Helius is down.
+                if rarity_config.enabled()
+                    && !run_job("rarity drain", drain_rarity(&pool, rarity_every), &mut shutdown)
+                        .await
+                {
+                    return;
+                }
+                if config.enabled()
+                    && due(&pool, reconcile::KIND, sweep_every).await
                     && !run_job("scheduled reconcile", sweep(&pool, &das), &mut shutdown).await
                 {
                     return;
                 }
-                if due(&pool, reconcile::DEEP_KIND, deep_every).await
+                if config.enabled()
+                    && due(&pool, reconcile::DEEP_KIND, deep_every).await
                     && !run_job("deep reconcile", deep(&pool, &das), &mut shutdown).await
                 {
                     return;
@@ -247,4 +272,75 @@ async fn collection_id(pool: &PgPool, slug: &str) -> Option<i32> {
         .ok()
         .flatten()
         .map(|c| c.id)
+}
+
+/// `backfill_state.kind` for the rarity pass.
+///
+/// Its own kind, not the reconcile one: a *failing* backfill still stamps
+/// `finished_at`, so sharing a kind would make a collection whose ranks were
+/// never computed look freshly ranked.
+pub const RARITY_KIND: &str = "rarity";
+
+/// Recomputes every collection a writer flagged, plus every collection whose
+/// last pass is older than the backstop interval.
+///
+/// The flag is the real trigger — `assets::upsert_batch`,
+/// `assets::set_membership_and_flag` and `attributes::sync_trait_facets_and_flag`
+/// set it transactionally with the write that invalidated the ranks — so this
+/// is usually a single cheap query returning nothing.
+async fn drain_rarity(pool: &PgPool, backstop: Duration) -> anyhow::Result<()> {
+    let mut targets = rarity::dirty_collections(pool).await?;
+    if due(pool, RARITY_KIND, backstop).await {
+        for collection in registry::list_enabled(pool).await? {
+            if !targets.contains(&collection.id) {
+                targets.push(collection.id);
+            }
+        }
+        targets.sort_unstable();
+    }
+    for collection_id in targets {
+        let started_at = chrono::Utc::now();
+        if !rarity::is_rankable(pool, collection_id).await? {
+            // Nothing to rank, and nothing wrong: a collection whose metadata
+            // host is gone carries no facetable trait type. Clear the flag so
+            // the drain does not spin on it, and leave the ranks null.
+            rarity::clear_dirty(pool, collection_id).await?;
+            continue;
+        }
+        let outcome = rarity::recompute(pool, collection_id).await?;
+        if outcome.skipped {
+            // Another replica holds the lock during a rolling deploy. The flag
+            // still stands, so the winner's pass covers this one.
+            log::info!("rarity: collection {collection_id} is being ranked elsewhere");
+            continue;
+        }
+        if outcome.changed > 0 {
+            log::info!(
+                "rarity: collection {collection_id} re-ranked {} of {} asset(s), version {}",
+                outcome.changed,
+                outcome.ranked,
+                outcome.version
+            );
+        }
+        let state = ingest_state::BackfillState {
+            collection_id,
+            kind: RARITY_KIND.to_string(),
+            status: "done".to_string(),
+            cursor: json!({"mode": "rarity"}),
+            progress: json!({
+                "ranked": outcome.ranked,
+                // The same word every other periodic job uses for "rows this
+                // run had to fix", so one metric spans them all.
+                "corrections": outcome.changed,
+                "version": outcome.version,
+                "duration_ms": (chrono::Utc::now() - started_at).num_milliseconds(),
+            }),
+            last_error: None,
+            started_at: Some(started_at),
+            finished_at: Some(chrono::Utc::now()),
+            updated_at: chrono::Utc::now(),
+        };
+        ingest_state::put_backfill_state(pool, &state).await?;
+    }
+    Ok(())
 }

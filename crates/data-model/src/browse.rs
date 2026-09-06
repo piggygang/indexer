@@ -21,8 +21,12 @@ use sqlx::{FromRow, PgPool};
 
 use crate::facets::{self, TraitSelection};
 
-/// How the grid is ordered. `rarity` is reserved by the contract and rejected
-/// at the HTTP layer with `422`, so it has no variant here.
+/// How the grid is ordered.
+///
+/// `rarity` ascends the *rank*, so it lists the rarest first — the same
+/// direction every other sort takes (all of them ascend their key), and the
+/// reading the frozen sentinel prose assumes. `-rarity` is the same index
+/// scanned backwards: most common first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
     Number,
@@ -31,6 +35,8 @@ pub enum Sort {
     NameDesc,
     Activity,
     ActivityDesc,
+    Rarity,
+    RarityDesc,
 }
 
 impl Sort {
@@ -44,6 +50,8 @@ impl Sort {
             Self::NameDesc => "-name",
             Self::Activity => "activity",
             Self::ActivityDesc => "-activity",
+            Self::Rarity => "rarity",
+            Self::RarityDesc => "-rarity",
         }
     }
 
@@ -55,12 +63,17 @@ impl Sort {
             "-name" => Self::NameDesc,
             "activity" => Self::Activity,
             "-activity" => Self::ActivityDesc,
+            "rarity" => Self::Rarity,
+            "-rarity" => Self::RarityDesc,
             _ => return None,
         })
     }
 
     const fn descending(self) -> bool {
-        matches!(self, Self::NumberDesc | Self::NameDesc | Self::ActivityDesc)
+        matches!(
+            self,
+            Self::NumberDesc | Self::NameDesc | Self::ActivityDesc | Self::RarityDesc
+        )
     }
 
     /// The sort key as SQL, with the NULL sentinel the matching index stores.
@@ -69,6 +82,11 @@ impl Sort {
             Self::Number | Self::NumberDesc => "coalesce(a.number, 2147483647)",
             Self::Name | Self::NameDesc => "a.name",
             Self::Activity | Self::ActivityDesc => "coalesce(a.last_activity_slot, -1)",
+            // The RANK, never the score: `CursorKey.number` is an `i64` and the
+            // outer projection casts the key to `bigint`, so a float score
+            // would be truncated into the cursor and the keyset would skip
+            // rows. The rank orders identically by construction.
+            Self::Rarity | Self::RarityDesc => "coalesce(a.rarity_rank, 2147483647)",
         }
     }
 
@@ -76,6 +94,16 @@ impl Sort {
     /// cursor codec has to encode the same distinction.
     pub const fn key_is_text(self) -> bool {
         matches!(self, Self::Name | Self::NameDesc)
+    }
+
+    /// Does this ordering depend on the collection's rarity pass?
+    ///
+    /// A re-rank moves most of the collection at once — one Core mint moved 506
+    /// of 746 ranks — so a rarity cursor has to be fenced on
+    /// `collections.rarity_version`. Every other sort is unaffected, which is
+    /// why the fence is asked for per sort rather than added to every cursor.
+    pub const fn is_rarity(self) -> bool {
+        matches!(self, Self::Rarity | Self::RarityDesc)
     }
 }
 
@@ -103,7 +131,10 @@ pub struct BrowseQuery {
 }
 
 /// One grid card — the `NftSummary` row shape.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+///
+/// No `Eq`: `rarity_score` is an `Option<f64>`, and a score is a measurement,
+/// not a key.
+#[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct AssetCard {
     pub id: i64,
     pub address: String,
@@ -114,6 +145,10 @@ pub struct AssetCard {
     pub burned: bool,
     pub owner: Option<String>,
     pub last_activity_at: Option<DateTime<Utc>>,
+    /// Null for a collection with no facetable trait types, and until the
+    /// first rarity pass has run.
+    pub rarity_score: Option<f64>,
+    pub rarity_rank: Option<i32>,
     /// The keyset position of this row, so the caller can mint a cursor
     /// without re-deriving which column the sort used.
     pub sort_number: i64,
@@ -128,7 +163,8 @@ pub struct AssetCard {
 /// three predicates the facet query applies, in the same order.
 const FILTERED_BASE: &str = "\
     SELECT a.id, a.address, a.name, a.number, a.image_uri, a.image_status, a.burned, \
-           a.owner, a.last_activity_at, a.last_activity_slot \
+           a.owner, a.last_activity_at, a.last_activity_slot, \
+           a.rarity_score, a.rarity_rank \
       FROM assets a \
      WHERE a.collection_id = $1 AND a.membership_status = 'member' \
        AND ($6::text IS NULL \
@@ -168,7 +204,7 @@ pub async fn browse(pool: &PgPool, query: &BrowseQuery) -> sqlx::Result<Vec<Asse
     let sql = format!(
         "WITH base AS ({FILTERED_BASE}{keyset}) \
          SELECT id, address, name, number, image_uri, image_status, burned, owner, \
-                last_activity_at, \
+                last_activity_at, rarity_score, rarity_rank, \
                 {number_key}::bigint AS sort_number, {text_key}::text AS sort_text \
            FROM base a \
           ORDER BY {key} {dir}, a.id {dir} \

@@ -12,6 +12,7 @@ use indexer_das::backfill::merge;
 use indexer_das::DasClient;
 use indexer_data_model::activity::{self, AssetRef, LiveEvent};
 use indexer_data_model::assets;
+use indexer_data_model::rarity;
 use indexer_data_model::types::EventKind;
 use indexer_data_model::PgPool;
 use indexer_ingest::decode::{self, CoreTouch, DecodeContext, DecodedKind};
@@ -399,9 +400,42 @@ impl Pipeline {
     ) -> anyhow::Result<()> {
         let input = merge(asset, None);
         let mut tx = self.pool.begin().await?;
-        assets::upsert_batch(&mut tx, collection_id, slot, std::slice::from_ref(&input)).await?;
+        let counts =
+            assets::upsert_batch(&mut tx, collection_id, slot, std::slice::from_ref(&input))
+                .await?;
         tx.commit().await?;
+        self.rerank_after(collection_id, &counts).await;
         Ok(())
+    }
+
+    /// Re-ranks the collection when the write that just committed invalidated
+    /// its ranks — a new Core mint, or a metadata update that moved attributes.
+    ///
+    /// `upsert_batch` already set `collections.rarity_dirty` transactionally,
+    /// so the scheduled drain would pick this up within a minute regardless.
+    /// Doing it here as well turns "a new Core mint triggers re-rank" from
+    /// eventually into immediately, at ~110 ms on a path that already spends
+    /// seconds in `hydrate` waiting for DAS to index the mint's metadata.
+    ///
+    /// **After the commit, never inside it**: the pass touches every asset row
+    /// of the collection, and holding those locks inside the live writer's
+    /// transaction would stall ingestion behind a bookkeeping job. A failure is
+    /// logged and dropped — the flag stands, and the drain is the backstop.
+    async fn rerank_after(&self, collection_id: i32, counts: &assets::BatchCounts) {
+        if counts.inserted == 0 && counts.attributes_written == 0 && counts.attributes_removed == 0
+        {
+            return;
+        }
+        match rarity::recompute(&self.pool, collection_id).await {
+            Ok(outcome) if outcome.changed > 0 => log::info!(
+                "rarity: collection {collection_id} re-ranked {} of {} asset(s), version {}",
+                outcome.changed,
+                outcome.ranked,
+                outcome.version
+            ),
+            Ok(_) => {}
+            Err(error) => log::warn!("rarity: collection {collection_id} not re-ranked: {error}"),
+        }
     }
 
     /// The registered collection with this address. Matching on the address

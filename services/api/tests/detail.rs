@@ -618,6 +618,8 @@ async fn a_collection_feed_carries_its_cards_newest_first(pool: PgPool) {
     assert!(rows
         .iter()
         .all(|r| r["nft"]["collection"]["slug"] == "syn-feed"));
+    // The feed's embedded card carries rarity like every other `NftSummary`;
+    // this fixture has no facetable traits, so it is null here.
     assert!(rows
         .iter()
         .all(|r| r["nft"]["address"].is_string() && r["nft"]["rarityRank"].is_null()));
@@ -706,6 +708,7 @@ async fn a_disabled_collection_is_invisible_to_every_detail_endpoint(pool: PgPoo
             name: "Bench".into(),
             assets: 40,
             unique_trait: false,
+            coverage: 1.0,
             seed: 0.21,
         },
     )
@@ -792,5 +795,94 @@ async fn every_detail_endpoint_validates_with_an_etag(pool: PgPool) {
         assert!(second.headers().contains_key(header::CACHE_CONTROL));
         assert!(second.headers().contains_key(header::VARY));
         assert!(test::read_body(second).await.is_empty());
+    }
+}
+
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn rarity_reaches_every_endpoint_that_carries_a_card(pool: PgPool) {
+    // `NftSummary` is an `allOf` base, so one constructor feeds the grid, the
+    // detail page, the collection feed, the portfolio and search. This asserts
+    // all five, because a null slipping through on one of them is exactly the
+    // kind of drift a schema check cannot see — `null` is valid everywhere.
+    let cid = collection(&pool, "syn-rarity", 1).await;
+    let owner = pk(120);
+    let traits = [(10u8, "#1", "Crown"), (11, "#2", "Cap"), (12, "#3", "Cap")];
+    for (seed, name, head) in traits {
+        let (id, _) = asset(&pool, cid, seed, name).await;
+        sqlx::query("UPDATE assets SET owner = $2, owner_slot = 1 WHERE id = $1")
+            .bind(id)
+            .bind(&owner)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        indexer_data_model::assets::upsert_batch(
+            &mut tx,
+            cid,
+            1,
+            &[indexer_data_model::assets::AssetInput {
+                address: pk(seed),
+                name: name.to_string(),
+                symbol: None,
+                metadata_uri: None,
+                metadata_source_uri: None,
+                image_uri: None,
+                burned: false,
+                owner: Some(owner.clone()),
+                attributes: Some(vec![indexer_data_model::assets::TraitInput {
+                    trait_type: "Head".into(),
+                    value: head.into(),
+                    position: 0,
+                }]),
+                document: None,
+            }],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    // Head: Crown 1/3, Cap 2/3 — so #1 scores 3.0 and ranks 1, the other two
+    // score 1.5 and rank 2 and 3 by id.
+    let outcome = indexer_data_model::rarity::recompute(&pool, cid)
+        .await
+        .unwrap();
+    assert_eq!(outcome.ranked, 3);
+    let app = app!(pool);
+
+    let (_, detail) = get!(app, &format!("/v1/nfts/{}", pk(10)));
+    assert_eq!(detail["rarityRank"], 1);
+    assert_eq!(detail["rarityScore"], 3.0);
+    // `rarityPct` stays null: the issue names score and rank, and a value's
+    // own frequency is a separate follow-up.
+    assert!(detail["attributes"][0]["rarityPct"].is_null());
+
+    let (_, grid) = get!(app, "/v1/collections/syn-rarity/nfts?sort=rarity");
+    let cards = grid["data"].as_array().unwrap();
+    assert_eq!(cards[0]["rarityRank"], 1);
+    assert_eq!(cards[0]["address"], pk(10));
+    assert_eq!(cards[1]["rarityScore"], 1.5);
+
+    let (_, portfolio) = get!(app, &format!("/v1/wallets/{owner}/nfts"));
+    assert!(portfolio["nfts"]["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|c| c["rarityRank"].is_i64()));
+
+    let (_, search) = get!(app, "/v1/search?q=%231");
+    assert_eq!(search["groups"][0]["nfts"][0]["rarityRank"], 1);
+
+    let first: i64 = sqlx::query_scalar("SELECT id FROM assets WHERE address = $1")
+        .bind(pk(10))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    timeline(&pool, first, cid, 1).await;
+    let app = app!(pool);
+    let (_, feed) = get!(app, "/v1/collections/syn-rarity/activity");
+    assert!(!feed["data"].as_array().unwrap().is_empty());
+    for event in feed["data"].as_array().unwrap() {
+        assert!(event["nft"]["rarityRank"].is_i64(), "{event}");
     }
 }

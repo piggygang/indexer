@@ -50,6 +50,7 @@ async fn collection(pool: &PgPool, slug: &str, assets: i64) -> i32 {
             name: "Bench".into(),
             assets,
             unique_trait: true,
+            coverage: 1.0,
             seed: 0.21,
         },
     )
@@ -275,12 +276,11 @@ async fn validators_and_the_error_shape(pool: PgPool) {
     assert_eq!(resp.headers().get(header::ETAG).unwrap(), etag.as_str());
     assert!(resp.headers().contains_key(header::CACHE_CONTROL));
 
-    // Reserved sorts are 422 with the supported list — not 400, and never a
-    // silent fallback to the default.
-    let (status, body) = get!(app, "/v1/collections/bench-api-errors/nfts?sort=rarity");
-    assert_eq!(status, 422);
-    assert_eq!(body["error"], "unsupported_sort");
-    assert!(body["details"]["supported"].is_array());
+    // `sort=rarity` used to be the 422 here. ALG-627 shipped it, so it is a
+    // 200 now — the over-large limit below is what keeps the contract's only
+    // declared 422 reachable.
+    let (status, _) = get!(app, "/v1/collections/bench-api-errors/nfts?sort=rarity");
+    assert_eq!(status, 200);
 
     // An over-large limit is refused, never clamped.
     let (status, body) = get!(app, "/v1/collections/bench-api-errors/nfts?limit=101");
@@ -313,6 +313,7 @@ async fn a_disabled_collection_is_not_served(pool: PgPool) {
             name: "Hidden".into(),
             assets: 50,
             unique_trait: false,
+            coverage: 1.0,
             seed: 0.3,
         },
     )
@@ -367,4 +368,94 @@ async fn facets_are_ordered_and_exclude_what_the_registry_excludes(pool: PgPool)
             "zero-count values are omitted"
         );
     }
+}
+
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn the_rarity_sort_orders_by_rank_and_its_cursor_is_fenced(pool: PgPool) {
+    let id = collection(&pool, "bench-api-rarity", 300).await;
+    indexer_data_model::rarity::recompute(&pool, id)
+        .await
+        .unwrap();
+    let app = app!(pool);
+    let base = "/v1/collections/bench-api-rarity/nfts";
+
+    // `rarity` is rarest first — rank ascending, like every other sort ascends
+    // its key. `-rarity` is the same index scanned backwards.
+    let (status, page) = get!(app, &format!("{base}?sort=rarity&limit=5"));
+    assert_eq!(status, 200);
+    let ranks: Vec<i64> = page["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["rarityRank"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ranks, vec![1, 2, 3, 4, 5]);
+    assert!(page["data"][0]["rarityScore"].as_f64().unwrap() > 0.0);
+
+    let (_, last) = get!(app, &format!("{base}?sort=-rarity&limit=1"));
+    assert_eq!(last["data"][0]["rarityRank"], 300);
+
+    // Paged to exhaustion, the sort is a strict 1..N with no gap and no repeat.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            Some(c) => format!("{base}?sort=rarity&limit=24&cursor={c}"),
+            None => format!("{base}?sort=rarity&limit=24"),
+        };
+        let (status, page) = get!(app, &uri);
+        assert_eq!(status, 200, "{uri}");
+        seen.extend(
+            page["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n["rarityRank"].as_i64().unwrap()),
+        );
+        match page["nextCursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(seen, (1..=300).collect::<Vec<i64>>());
+
+    // A rarity cursor is fenced on the collection's rarity version: a re-rank
+    // that changes rows invalidates it, because one pass can move most of the
+    // collection and a stale cursor would silently skip and repeat rows.
+    let (_, page) = get!(app, &format!("{base}?sort=rarity&limit=5"));
+    let rarity_cursor = page["nextCursor"].as_str().unwrap().to_string();
+    let (_, page) = get!(app, &format!("{base}?sort=number&limit=5"));
+    let number_cursor = page["nextCursor"].as_str().unwrap().to_string();
+
+    // Change the population, then re-rank.
+    sqlx::query(
+        "INSERT INTO assets (address, collection_id, name) \
+         SELECT 'SYN' || translate(md5('fence:' || g::text), '0', 'Z'), $1, '#90' || g \
+           FROM generate_series(1, 4) g",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let outcome = indexer_data_model::rarity::recompute(&pool, id)
+        .await
+        .unwrap();
+    assert!(outcome.changed > 0);
+
+    let app = app!(pool);
+    let (status, body) = get!(
+        app,
+        &format!("{base}?sort=rarity&limit=5&cursor={rarity_cursor}")
+    );
+    assert_eq!(status, 400, "a re-rank must invalidate a rarity cursor");
+    assert_eq!(body["error"], "invalid_cursor");
+
+    // …and only a rarity cursor. A re-rank must not break an in-flight scroll
+    // of a sort it cannot affect.
+    let (status, _) = get!(
+        app,
+        &format!("{base}?sort=number&limit=5&cursor={number_cursor}")
+    );
+    assert_eq!(status, 200, "a re-rank must not invalidate a number cursor");
 }

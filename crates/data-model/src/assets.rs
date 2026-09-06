@@ -203,6 +203,17 @@ pub async fn upsert_batch(
     counts.attributes_removed = removed;
     counts.attributes_written = written;
 
+    // Rarity is a function of the population size and of every asset's
+    // attributes, so an insert or an attribute change invalidates the whole
+    // collection's ranks. Flagging here rather than in each pipeline makes it
+    // transactional with the write and covers the live pipeline, the reconcile
+    // sweep, the DAS backfill and the synthetic generator in one place — no
+    // future caller can forget it. An `updated` that only moved an owner also
+    // flags; a pass over an unchanged collection costs one no-op UPDATE.
+    if counts.inserted > 0 || counts.attributes_written > 0 || counts.attributes_removed > 0 {
+        crate::rarity::mark_dirty(&mut **tx, collection_id).await?;
+    }
+
     Ok(counts)
 }
 
@@ -560,6 +571,25 @@ pub async fn set_membership<'e>(
     .execute(exec)
     .await?;
     Ok(done.rows_affected())
+}
+
+/// Flips membership and flags the collection's ranks stale in one call.
+///
+/// A Core asset leaving or rejoining changes the population every frequency is
+/// measured against, so it re-ranks the collection — and unlike an attribute
+/// change it leaves no other trace: `reconcile` discards this function's
+/// return value, so nothing downstream would notice.
+pub async fn set_membership_and_flag(
+    tx: &mut Transaction<'_, Postgres>,
+    collection_id: i32,
+    addresses: &[String],
+    removed: bool,
+) -> sqlx::Result<u64> {
+    let moved = set_membership(&mut **tx, collection_id, addresses, removed).await?;
+    if moved > 0 {
+        crate::rarity::mark_dirty(&mut **tx, collection_id).await?;
+    }
+    Ok(moved)
 }
 
 /// Documents already stored for a batch of addresses, as

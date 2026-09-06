@@ -25,7 +25,10 @@ pub async fn get_nft(
     id: web::Path<String>,
 ) -> Result<HttpResponse> {
     let row = asset(&pool, &id).await?;
-    respond(&req, &cache, &format!("nft:{}", row.id), || async {
+    // The rarity fence is part of the key, so a re-rank shows up on the next
+    // request instead of waiting out the cache TTL.
+    let key = format!("nft:{}:{}", row.id, row.rarity_version);
+    respond(&req, &cache, &key, || async {
         let attributes = nft::attributes(pool.get_ref(), row.id).await?;
         let open = nft::open_interval(pool.get_ref(), row.id).await?;
         let mint = nft::mint_info(pool.get_ref(), row.id).await?;
@@ -51,8 +54,8 @@ pub async fn get_nft(
                 burned: row.burned,
                 owner: row.owner.clone(),
                 last_activity_at: row.last_activity_at,
-                rarity_rank: None,
-                rarity_score: None,
+                rarity_rank: row.rarity_rank,
+                rarity_score: row.rarity_score,
                 collection: dto::CollectionRef {
                     slug: row.collection_slug.clone(),
                     name: row.collection_name.clone(),

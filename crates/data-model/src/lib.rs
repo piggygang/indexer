@@ -23,6 +23,7 @@ pub mod facets;
 pub mod ingest_state;
 pub mod integrity;
 pub mod nft;
+pub mod rarity;
 pub mod registry;
 pub mod search;
 pub mod seed;

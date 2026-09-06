@@ -169,6 +169,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). `0` disables the schedule, leaving the on-`Connected` reconcile |
 | `RECONCILE_DEEP_INTERVAL_SECS` | no | `604800` | ingester only: the weekly deep pass — supply, burned assets, attribute changes |
 | `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling for the sweep, which shares the Helius budget with live ingestion |
+| `RARITY_INTERVAL_SECS` | no | `86400` | ingester only: backstop for the rarity drain (ALG-627). The dirty flag is the real trigger, so this only bounds how long a missed flag can sit; `0` disables the drain |
 
 ## Endpoints
 
@@ -1290,6 +1291,153 @@ read-layer invariants: a keyset page is exactly a slice of the ordered scan at
 every page size, the detail page shows traits `/facets` excludes, and a search
 for `100%` is a literal.
 
+## Rarity (ALG-627)
+
+Statistical rarity per collection: a score, a `1..N` rank, `sort=rarity` on the grid,
+and `rarityRank`/`rarityScore` on every response that carries an NFT card. The formula
+lives in one migration and is implemented in one statement
+(`crates/data-model/src/rarity.rs`).
+
+```sh
+indexer-admin rarity                      # recompute every enabled collection
+indexer-admin rarity --expect-unchanged   # re-running writes nothing
+indexer-admin rarity --verify             # ranks match an independent recomputation
+indexer-admin rarity --explain <address>  # one asset's score, term by term
+curl -s 'localhost:8080/v1/collections/piggy-gang/nfts?sort=rarity&limit=1' | jq '.data[0]'
+```
+
+### The formula
+
+Population `P` is the browse population **verbatim** — `collection_id AND
+membership_status = 'member'`, burned assets **in**, removed assets **out** — with
+`N = |P|`. The trait set `T` is the collection's trait types with `is_facet`. For each
+`t ∈ T` an asset has one value `v`, or the sentinel `⊥` when it carries none, and
+`c(t, v)` counts the members of `P` with that cell.
+
+> **score = Σ over t ∈ T of N / c(t, vₐ(t))**, summed in `numeric`, rounded to 6 dp
+> **rank = row_number() OVER (ORDER BY score DESC, id)** — exactly `1..N`
+
+Three choices, each forced by a measurement rather than a preference:
+
+**Absence is a value, not a skipped term.** Every asset's score is then a sum over the
+same `|T|` terms, so scores are comparable. Skipping would reward an asset merely for
+having a slot filled. On Piggy Gang an `Earring` is worn by 258 of 747, so *wearing one
+at all* is the rarity signal, and the 489 assets sharing `⊥` rightly contribute almost
+nothing. The two treatments disagree on **723 of 747** ranks, by up to **280 places** —
+this is not a cosmetic choice. `rarity --explain` shows it directly:
+
+```
+trait            value                   carriers           term
+Body             Solana                         8      93.375000
+Mouth            Golden Teeth                  12      62.250000
+Head             Propeller Hat                 14      53.357143
+Clothes          Solana Tee                    15      49.800000
+Earring          Pink Diamond                  37      20.189189
+Eyes             Focused                       56      13.339286
+Background       Orange                       122       6.122951
+Special          (absent)                     399       1.872180
+                 SCORE                                300.305749
+```
+
+**Facetable trait types only.** `is_facet` is exactly the set `/facets` counts, so the
+sidebar and the score can never disagree about which traits are real, and a
+per-asset-unique `Name` stays out of the arithmetic. The cost is stated rather than
+hidden: **Pig Mud has no facetable trait type at all** — its metadata host answers HTTP
+530, so the only trait DAS ever cached is that unique `Name` — and all 2,073 of its
+assets carry `rarityRank: null`. That is the honest answer; ranking them would mean one
+2,073-way tie. `rarity` WARNs about it and points at the `metadata_uri_template` in
+`config/collections.toml` that fixes it with no code change.
+
+**Summed in `numeric`, stored as `double precision`.** `float8` addition is not
+associative, and the same query returned three different digests under three planner
+settings (parallel aggregate on and off, `hashagg` off). That would make
+`--expect-unchanged` a coin flip and rewrite every row on every pass. `numeric` is exact
+and order-independent by construction, at about 10% more time.
+
+Ties are real but rare — 1 pair in 10,000 on Piggy SOL Gang — and broken by `id`, so the
+rank is a deterministic `1..N` rather than a `RANK()` with gaps. (`/holders` does use
+`RANK()`; that contract asks for shared ranks, this one asks for `1..N`.)
+
+### Recompute
+
+Every writer that can stale a rank flags its collection, **in the SQL layer** rather than
+in each pipeline, so the flag is transactional with the write and no future caller can
+forget it. `assets::upsert_batch` covers the live pipeline, the reconcile sweep and the
+DAS backfill at once; `set_membership_and_flag` covers a Core asset leaving or rejoining;
+`sync_trait_facets_and_flag` covers a `facet_exclude` edit — the one staleness source
+that writes no asset row and would otherwise be invisible.
+
+A **new Core mint does not arrive through the live pipeline**: `activity.asset_id` is a
+foreign key and the decoder only resolves assets already tracked, so a brand-new Core
+asset is discovered by the reconciliation sweep's `upsert_batch`. That is the same writer
+that sets the flag, which is what makes the acceptance criterion structural rather than a
+special case. The mint path also re-ranks inline, right after its transaction commits —
+never inside it, which would hold every asset row of the collection inside the live
+writer's transaction. A failure there is logged and dropped; the flag stands and the
+drain is the backstop.
+
+The drain is a third job in the ingester's existing scheduler. It runs every tick, needs
+no Helius (so a Helius outage cannot freeze ranks), takes
+`pg_try_advisory_xact_lock(627, collection_id)` and **skips rather than blocks** when a
+second replica holds it during a rolling deploy. `RARITY_INTERVAL_SECS` (default 86400)
+is only a backstop for a flag that was somehow missed — the flag is the trigger. Counters
+go to `backfill_state` under `kind = 'rarity'`, with `progress.corrections` meaning the
+same thing it does for reconciliation.
+
+Measured on the real data: a full pass over all four collections is ~260 ms, and one Core
+mint moves **577 of 747** ranks and all 747 scores.
+
+### The browse sort, and why rarity cursors are fenced
+
+`sort=rarity` is **rarest first** — it ascends the rank, which is the direction every
+other sort takes — and `-rarity` is the same index scanned backwards. The keyset sorts on
+the **rank, never the score**: `CursorKey.number` is an `i64` and the projection casts to
+`bigint`, so a float score would be truncated into the cursor and the page would skip
+rows. Unranked assets sort last through the same NULL-sentinel-inside-the-index trick
+`number` uses (`coalesce(rarity_rank, 2147483647)`).
+
+Because one pass moves most of a collection at once, a rarity cursor carries
+`collections.rarity_version`, bumped only by a pass that actually changed rows. A re-rank
+mid-scroll is then `400 invalid_cursor` — which the contract already calls a normal
+recoverable condition — instead of silently skipping and repeating rows. The fence
+applies to **rarity sorts only**, so a re-rank cannot invalidate a `number`, `name` or
+`activity` cursor, and the three static collections never invalidate one at all. The same
+version is part of the browse and detail cache keys, so a re-rank is visible on the next
+request rather than after the 15 s TTL.
+
+### Proof
+
+Four layers, because "the ranks are right" is the whole issue:
+
+1. a **hand-computed fixture** in `crates/data-model/tests/rarity.rs` whose scores are
+   literals with the arithmetic written out — the only test that catches someone changing
+   the formula and updating the oracle to match;
+2. `rarity::verify`, an **independent recomputation** from different queries in exact
+   `i128` fixed point, so agreement is evidence and not two copies of one rounding bug
+   agreeing. Shipped as `rarity --verify`, so it runs against production and not only
+   against fixtures;
+3. **structural invariants** — `1..N` with no gap or duplicate, no pair out of order —
+   plus `integrity.rarity_broken`, which every reconcile run snapshots, because a stale
+   rank still serializes and still sorts;
+4. the **triggers**: a mint, a membership move in both directions and a `facet_exclude`
+   edit each flag the collection, and two concurrent passes do not collide.
+
+On the real dataset all three implementations agree exactly: `rarity --verify` reports
+0 score and 0 rank mismatches across 15,747 ranked assets, and a third deliberately naive
+SQL recomputation agrees on Piggy Gang's 747. CI runs `rarity`, `rarity
+--expect-unchanged` and `rarity --verify` on a three-asset fixture whose scores
+(6.0 / 4.5 / 4.5) are hand-checkable, and the Prism proxy greps for a digit rather than
+just a 200 — `null` is schema-valid for every rarity field, so `curl -sf` alone would
+pass on an unimplemented feature.
+
+**The frozen contract is untouched.** Both enum members and all three fields were
+reserved in ALG-620, and `null` was always a valid value for them. Three prose strings
+are now stale (the two `Reserved — always null…` descriptions, the `Sort` note about
+`422`, and the `rarityNotReady` example); they are descriptions rather than schema —
+nothing machine-checked reads them — so they belong in a doc-only follow-up under `/v1`'s
+freeze rules. `Attribute.rarityPct` also stays `null`: the issue names score and rank,
+and a value's own frequency is a separate change.
+
 ## Roadmap
 
 - ALG-619 — data model & collections registry (migrations, `ingest_state`) — done
@@ -1300,4 +1448,5 @@ for `100%` is a literal.
 - ALG-624 — reconciliation: periodic DAS diff + self-heal — done
 - ALG-625 — public REST API: browse, facets, search — done
 - ALG-626 — public REST API: detail, activity, portfolio — done (`/v1` complete)
-- ALG-627 — rarity scoring · ALG-628 — prod monitoring/alerting · ALG-629 — external collections
+- ALG-627 — rarity scoring & ranks — done
+- ALG-628 — prod monitoring/alerting · ALG-629 — external collections
