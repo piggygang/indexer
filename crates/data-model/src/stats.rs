@@ -117,3 +117,69 @@ pub async fn holder_buckets<'e>(
         })
         .collect())
 }
+
+/// One holder of one collection — the contract's `Holder`, and the counting
+/// half of `WalletCollectionHolding`.
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub struct Holder {
+    pub collection_id: i32,
+    pub address: String,
+    pub count: i64,
+    pub rank: i64,
+}
+
+/// Holders ranked by holdings descending, over the same population as
+/// `holders` and `holder_buckets` — members with an owner, so burned assets
+/// drop out and the counts sum to `supply`, exactly as the contract states.
+///
+/// `RANK()`, not `DENSE_RANK()`: the contract says *"ties share the lower rank
+/// and skip the next values"*. The window has to be computed in a subquery,
+/// because a `WHERE` on the outer query is applied *before* window functions
+/// and would rank only the surviving rows.
+const RANKED: &str = "\
+    WITH per_owner AS ( \
+        SELECT a.collection_id, a.owner, count(*)::bigint AS held \
+          FROM assets a JOIN collections c ON c.id = a.collection_id \
+         WHERE a.collection_id = ANY($1::int[]) AND a.membership_status = 'member' \
+           AND a.owner IS NOT NULL AND c.enabled \
+         GROUP BY a.collection_id, a.owner), \
+    ranked AS ( \
+        SELECT collection_id, owner, held, \
+               rank() OVER (PARTITION BY collection_id ORDER BY held DESC)::bigint AS rank \
+          FROM per_owner)";
+
+/// The top holders of one collection, ranked.
+pub async fn top_holders<'e>(
+    exec: impl PgExecutor<'e>,
+    collection_id: i32,
+    limit: i64,
+) -> sqlx::Result<Vec<Holder>> {
+    sqlx::query_as::<_, Holder>(&format!(
+        "{RANKED} SELECT collection_id, owner AS address, held AS count, rank FROM ranked \
+          ORDER BY rank, address LIMIT $2"
+    ))
+    .bind(vec![collection_id])
+    .bind(limit)
+    .fetch_all(exec)
+    .await
+}
+
+/// One wallet's rank in each of the collections it holds.
+///
+/// Shares [`RANKED`] with [`top_holders`], so a portfolio's `holderRank` and
+/// the same collection's `/holders` listing can never disagree about a wallet's
+/// position.
+pub async fn holder_ranks<'e>(
+    exec: impl PgExecutor<'e>,
+    owner: &str,
+    collections: &[i32],
+) -> sqlx::Result<Vec<Holder>> {
+    sqlx::query_as::<_, Holder>(&format!(
+        "{RANKED} SELECT collection_id, owner AS address, held AS count, rank FROM ranked \
+          WHERE owner = $2 ORDER BY held DESC, collection_id"
+    ))
+    .bind(collections)
+    .bind(owner)
+    .fetch_all(exec)
+    .await
+}

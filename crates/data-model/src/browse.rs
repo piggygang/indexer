@@ -72,8 +72,9 @@ impl Sort {
         }
     }
 
-    /// Is the key a number (`$k` binds as bigint) or text?
-    const fn key_is_text(self) -> bool {
+    /// Is the key a number (`$k` binds as bigint) or text? Public because the
+    /// cursor codec has to encode the same distinction.
+    pub const fn key_is_text(self) -> bool {
         matches!(self, Self::Name | Self::NameDesc)
     }
 }

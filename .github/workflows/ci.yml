@@ -75,6 +75,34 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: "24.19.0"
+      # A fixture, so the proxy validates the schemas a registry-only database
+      # leaves empty: NftDetail, ActivityEvent (both branches of its kind-
+      # dependent nullability) and the summary strip. Every key below is
+      # SYNTHETIC and copied from the contract's own examples — no on-chain
+      # address enters this repo outside config/ (CLAUDE.md).
+      - name: One synthetic asset, so the detail half is not an empty page
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          INSERT INTO assets (address, collection_id, name, owner, owner_slot)
+          SELECT 'SYNarqd6dg3ZygtDhD8CNLqE8wPNdAqWv7', id, '#1',
+                 'HLDAXhwhoQo8vntbEMc231443cEQijZ4B', 318442901
+            FROM collections WHERE slug = 'piggy-sol-gang';
+          INSERT INTO activity (asset_id, collection_id, signature, slot, block_time, kind,
+                                from_owner, to_owner, price_lamports, marketplace, source)
+          SELECT a.id, a.collection_id,
+                 'SgnS8C2hGJTEB8gKuwtW4rzQxwsYFg3JGZYS8C2hGJTEB8gKuwtW4rzQxwsYFg3JGZYS8C2hGJTEB8gKuwtW4rz',
+                 97441201, '2021-09-14T17:03:11Z', 'mint',
+                 NULL, 'HLDoLKj9p8xFdCKpffq7xNpPd3ACapACP', NULL, NULL, 'manual'
+            FROM assets a WHERE a.address = 'SYNarqd6dg3ZygtDhD8CNLqE8wPNdAqWv7';
+          INSERT INTO activity (asset_id, collection_id, signature, slot, block_time, kind,
+                                from_owner, to_owner, price_lamports, marketplace, source)
+          SELECT a.id, a.collection_id,
+                 'SgnCAZcw6LM5wbp1D8JdXCb6f4w3UFN3J96CAZcw6LM5wbp1D8JdXCb6f4w3UFN3J96CAZcw6LM5wbp1D8JdXCb',
+                 318442901, '2026-08-30T21:14:22Z', 'sale',
+                 'HLDoLKj9p8xFdCKpffq7xNpPd3ACapACP', 'HLDAXhwhoQo8vntbEMc231443cEQijZ4B',
+                 12500000000, 'Tensor', 'manual'
+            FROM assets a WHERE a.address = 'SYNarqd6dg3ZygtDhD8CNLqE8wPNdAqWv7';
+          SQL
       - name: The API conforms to the frozen contract
         run: |
           cargo run -p indexer-api &
@@ -88,12 +116,40 @@ jobs:
             curl -sf http://127.0.0.1:4011/v1/collections >/dev/null && break
             sleep 1
           done
-          # The same three shapes the mock is exercised with, so the contract is
-          # checked from both sides against one set of URLs.
-          curl -sf http://127.0.0.1:4011/v1/collections | grep -q piggy-sol-gang
-          curl -sf http://127.0.0.1:4011/v1/collections/piggy-sol-gang >/dev/null
-          curl -sf http://127.0.0.1:4011/v1/collections/piggy-sol-gang/facets >/dev/null
-          curl -sf 'http://127.0.0.1:4011/v1/collections/piggy-sol-gang/nfts?trait%5BHead%5D=Crown&sort=-activity' >/dev/null
+          # The same shapes the mock is exercised with, so the contract is
+          # checked from both sides against one set of URLs. Every path in the
+          # document appears here: a response Prism cannot validate is a
+          # response nothing checks.
+          P=http://127.0.0.1:4011/v1
+          A=SYNarqd6dg3ZygtDhD8CNLqE8wPNdAqWv7
+          W=HLDAXhwhoQo8vntbEMc231443cEQijZ4B
+          curl -sf $P/collections | grep -q piggy-sol-gang
+          curl -sf $P/collections/piggy-sol-gang >/dev/null
+          curl -sf $P/collections/piggy-sol-gang/facets >/dev/null
+          curl -sf "$P/collections/piggy-sol-gang/nfts?trait%5BHead%5D=Crown&sort=-activity" >/dev/null
+          curl -sf "$P/collections/piggy-sol-gang/activity?kind=sale&kind=mint" >/dev/null
+          curl -sf $P/collections/piggy-sol-gang/holders >/dev/null
+          curl -sf $P/nfts/$A | grep -q activitySummary
+          curl -sf "$P/nfts/$A/activity?limit=1" >/dev/null
+          curl -sf $P/nfts/$A/owners >/dev/null
+          curl -sf "$P/wallets/$W/nfts?collection=piggy-sol-gang" >/dev/null
+          curl -sf "$P/search?q=%231" >/dev/null
+          curl -sf "$P/search?q=$A" | grep -q '"kind":"nft"'
+          # Error bodies are part of the contract too. A well-formed request
+          # that finds nothing reaches the API, so the proxy validates the 404
+          # body against the `Error` schema; `-f` would swallow it, hence the
+          # status assertion.
+          test "$(curl -s -o /dev/null -w '%{http_code}' $P/nfts/HLDz7xArdTQeiCeKHg3VqhhNXzZGH5qBS)" = 404
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$P/collections/piggy-sol-gang/nfts?sort=rarity")" = 422
+          # A MALFORMED request never reaches the API: Prism validates the
+          # request first and answers 422 itself. So the parameter rules are
+          # asserted against the API directly — the proxy structurally cannot
+          # see them.
+          D=http://127.0.0.1:8080/v1
+          test "$(curl -s -o /dev/null -w '%{http_code}' $D/nfts/not-base58)" = 400
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$D/nfts/$A/activity?limit=101")" = 400
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$D/nfts/$A/activity?kind=listing")" = 400
+          test "$(curl -s -o /dev/null -w '%{http_code}' $D/search)" = 400
 
   # The frozen v1 API contract (ALG-620). A separate job with no `needs:`, so it
   # runs in parallel with `check` and adds no wall-clock time — `check` compiles
