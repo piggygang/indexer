@@ -117,6 +117,7 @@ async fn disjunctive_counts_match_brute_force(pool: PgPool) {
         name: "Test PGG-like".into(),
         assets: 1_500,
         unique_trait: true,
+        coverage: 1.0,
         seed: 0.17,
     };
     let report = synth::seed_synthetic(&pool, &spec).await.unwrap();
@@ -233,6 +234,7 @@ async fn synth_is_deterministic_and_cleanable(pool: PgPool) {
         name: "Test PSG-like".into(),
         assets: 300,
         unique_trait: false,
+        coverage: 1.0,
         seed: 0.5,
     };
     let first = synth::seed_synthetic(&pool, &spec).await.unwrap();

@@ -16,6 +16,26 @@ pub struct Config {
     pub helius: HeliusConfig,
     pub database: DatabaseConfig,
     pub reconcile: ReconcileConfig,
+    pub rarity: RarityConfig,
+}
+
+/// Cadence of the rarity drain (ALG-627).
+///
+/// A backstop, not the trigger: every writer that can stale a rank flags its
+/// collection, and the drain runs whatever is flagged on the next tick. The
+/// interval only bounds how long a flag can sit unnoticed if a flagging write
+/// happened while no drain was running.
+#[derive(Debug, Clone)]
+pub struct RarityConfig {
+    /// `RARITY_INTERVAL_SECS`, default 86400 (a day). Zero disables the drain,
+    /// leaving `indexer-admin rarity` as the only way to recompute.
+    pub interval_secs: u64,
+}
+
+impl RarityConfig {
+    pub fn enabled(&self) -> bool {
+        self.interval_secs > 0
+    }
 }
 
 /// Cadence of the ingester's periodic reconciliation (ALG-624).
@@ -123,6 +143,9 @@ impl Config {
                 deep_interval_secs: parsed_or("RECONCILE_DEEP_INTERVAL_SECS", 604_800)?,
                 rps: parsed_or("RECONCILE_RPS", 10)?,
             },
+            rarity: RarityConfig {
+                interval_secs: parsed_or("RARITY_INTERVAL_SECS", 86_400)?,
+            },
         })
     }
 }
@@ -152,7 +175,7 @@ where
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 9] = [
+    const KEYS: [&str; 10] = [
         "HOST",
         "PORT",
         "HELIUS_API_KEY",
@@ -162,6 +185,7 @@ mod tests {
         "RECONCILE_INTERVAL_SECS",
         "RECONCILE_DEEP_INTERVAL_SECS",
         "RECONCILE_RPS",
+        "RARITY_INTERVAL_SECS",
     ];
 
     fn clear() {
@@ -182,6 +206,8 @@ mod tests {
         assert_eq!(config.database.url, None);
         assert_eq!(config.database.max_connections, 5);
         assert_eq!(config.database.connect_timeout_secs, 5);
+        assert_eq!(config.rarity.interval_secs, 86_400);
+        assert!(config.rarity.enabled());
         assert!(config
             .database
             .required_url()
@@ -201,6 +227,17 @@ mod tests {
             "postgres://localhost/x"
         );
         assert_eq!(config.database.max_connections, 12);
+
+        // Missing var -> default, present-but-unparseable -> hard error.
+        env::set_var("RARITY_INTERVAL_SECS", "0");
+        assert!(!Config::try_from_env().unwrap().rarity.enabled());
+        env::set_var("RARITY_INTERVAL_SECS", "soon");
+        let err = Config::try_from_env().unwrap_err();
+        assert!(
+            err.to_string().contains("RARITY_INTERVAL_SECS"),
+            "unexpected error: {err:#}"
+        );
+        env::remove_var("RARITY_INTERVAL_SECS");
 
         env::set_var("PORT", "80800");
         let err = Config::try_from_env().unwrap_err();

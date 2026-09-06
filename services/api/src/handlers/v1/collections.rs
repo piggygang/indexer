@@ -79,11 +79,24 @@ pub async fn browse_collection_nfts(
     let limit = query::limit(raw, StatusCode::UNPROCESSABLE_ENTITY)?;
 
     let canonical = filters.canonical();
+    // The rarity fence, and only for a rarity sort. One Core mint re-ranks most
+    // of a collection at once — 506 of 746, measured — so a rarity cursor
+    // issued before a pass would silently skip and repeat rows. `400
+    // invalid_cursor` is what the contract calls a normal recoverable
+    // condition, and it is the honest answer. Scoping the fence to rarity means
+    // a re-rank cannot invalidate a number, name or activity cursor, and the
+    // three static collections never invalidate one at all.
+    let fence = if sort.is_rarity() {
+        row.rarity_version.to_string()
+    } else {
+        String::new()
+    };
     let fingerprint = cursor::fingerprint(&[
         &row.id.to_string(),
         sort.as_str(),
         &canonical,
         filters.q.as_deref().unwrap_or_default(),
+        &fence,
     ]);
     let after = match query::cursor(raw) {
         Some(raw) => Some(cursor::decode(&raw, sort.as_str(), &fingerprint)?),
@@ -101,6 +114,7 @@ pub async fn browse_collection_nfts(
             &after.as_ref().map_or(String::new(), |k| {
                 format!("{}|{}|{}", k.number, k.text, k.id)
             }),
+            &fence,
         ],
     );
     respond(&req, &cache, &key, || async {

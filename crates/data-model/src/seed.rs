@@ -12,7 +12,7 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 use sqlx::{PgPool, Postgres, Transaction};
 
-use crate::attributes::sync_trait_facets;
+use crate::attributes::sync_trait_facets_and_flag;
 use crate::types::Standard;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -361,7 +361,7 @@ pub async fn apply(
                 list.len()
             ));
         }
-        let facets_synced = sync_trait_facets(&mut *tx, id).await?;
+        let facets_synced = sync_trait_facets_and_flag(&mut tx, id).await?;
         report.collections.push(CollectionOutcome {
             slug: c.slug.clone(),
             id,

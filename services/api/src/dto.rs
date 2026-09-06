@@ -69,9 +69,9 @@ pub struct NftSummary {
     pub burned: bool,
     pub owner: Option<String>,
     pub last_activity_at: Option<DateTime<Utc>>,
-    /// Reserved by the contract — always null until ALG-627 ships rarity.
+    /// Rank 1 is the rarest. Null for a collection with no facetable trait
+    /// types, and until the first rarity pass has run.
     pub rarity_rank: Option<i32>,
-    /// Reserved by the contract — always null until ALG-627 ships rarity.
     pub rarity_score: Option<f64>,
     pub collection: CollectionRef,
 }
@@ -190,8 +190,8 @@ impl NftSummary {
             burned: card.burned,
             owner: card.owner.clone(),
             last_activity_at: card.last_activity_at,
-            rarity_rank: None,
-            rarity_score: None,
+            rarity_rank: card.rarity_rank,
+            rarity_score: card.rarity_score,
             collection,
         }
     }

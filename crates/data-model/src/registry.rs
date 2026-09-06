@@ -23,11 +23,14 @@ pub struct CollectionRow {
     pub enabled: bool,
     /// `Some` for every enabled row (DB CHECK `collections_enabled_resolvable`).
     pub membership_rule: Option<MembershipRule>,
+    /// Bumped by a rarity pass that changed rows. Fences rarity cursors and
+    /// the rarity-sorted cache entries; every other sort ignores it.
+    pub rarity_version: i32,
 }
 
 const COLLECTION_COLUMNS: &str = "id, slug, name, standard, address, verified_creator, \
      update_authority, symbol, image_url, metadata_uri_template, facet_exclude, enabled, \
-     membership_rule";
+     membership_rule, rarity_version";
 
 impl CollectionRow {
     /// The URI the backfill should fetch for an asset: the template with

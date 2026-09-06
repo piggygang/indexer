@@ -80,13 +80,46 @@ jobs:
       # dependent nullability) and the summary strip. Every key below is
       # SYNTHETIC and copied from the contract's own examples — no on-chain
       # address enters this repo outside config/ (CLAUDE.md).
-      - name: One synthetic asset, so the detail half is not an empty page
+      - name: Three synthetic assets, so the detail half is not an empty page
         run: |
           psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
           INSERT INTO assets (address, collection_id, name, owner, owner_slot)
           SELECT 'SYNarqd6dg3ZygtDhD8CNLqE8wPNdAqWv7', id, '#1',
                  'HLDAXhwhoQo8vntbEMc231443cEQijZ4B', 318442901
             FROM collections WHERE slug = 'piggy-sol-gang';
+          INSERT INTO assets (address, collection_id, name)
+          SELECT a.addr, c.id, a.name FROM collections c,
+                 (VALUES ('SYNt8rKspZCUyzpJC4sx9FEqrK8SzAH6QZ', '#2'),
+                         ('SYNu6skvdET1pB8qq9EAwQ3Lj7G98W8ZQC', '#3')) AS a(addr, name)
+           WHERE c.slug = 'piggy-sol-gang';
+          -- Attributes with hand-checkable arithmetic, so `rarity --verify` in
+          -- CI is proving a number a human can reproduce. Three shared trait
+          -- types contribute 3/3 = 1 each; Head splits 1/3 and 2/3:
+          --   #1 = 1 + 1 + 1 + 3/1 = 6.0   -> rank 1
+          --   #2 = #3 = 1 + 1 + 1 + 3/2 = 4.5  -> ranks 2 and 3, tie broken by id
+          INSERT INTO trait_types (collection_id, name)
+          SELECT id, t FROM collections,
+                 unnest(ARRAY['Background', 'Body', 'Mouth', 'Head']) AS t
+           WHERE slug = 'piggy-sol-gang' ON CONFLICT DO NOTHING;
+          INSERT INTO trait_values (trait_type_id, value)
+          SELECT tt.id, v.value FROM trait_types tt
+            JOIN collections c ON c.id = tt.collection_id AND c.slug = 'piggy-sol-gang'
+            JOIN (VALUES ('Background', 'Pink'), ('Body', 'Classic'), ('Mouth', 'Cigar'),
+                         ('Head', 'Crown'), ('Head', 'Beanie')) AS v(name, value)
+              ON v.name = tt.name
+          ON CONFLICT DO NOTHING;
+          INSERT INTO asset_attributes (asset_id, collection_id, trait_type_id, trait_value_id, position)
+          SELECT a.id, a.collection_id, tt.id, tv.id, 0
+            FROM assets a
+            JOIN trait_types tt ON tt.collection_id = a.collection_id
+            JOIN trait_values tv ON tv.trait_type_id = tt.id
+           WHERE a.address IN ('SYNarqd6dg3ZygtDhD8CNLqE8wPNdAqWv7',
+                               'SYNt8rKspZCUyzpJC4sx9FEqrK8SzAH6QZ',
+                               'SYNu6skvdET1pB8qq9EAwQ3Lj7G98W8ZQC')
+             AND ((tt.name <> 'Head' AND tv.value IN ('Pink', 'Classic', 'Cigar'))
+               OR (tt.name = 'Head' AND tv.value =
+                   CASE WHEN a.name = '#1' THEN 'Crown' ELSE 'Beanie' END))
+          ON CONFLICT DO NOTHING;
           INSERT INTO activity (asset_id, collection_id, signature, slot, block_time, kind,
                                 from_owner, to_owner, price_lamports, marketplace, source)
           SELECT a.id, a.collection_id,
@@ -103,6 +136,15 @@ jobs:
                  12500000000, 'Tensor', 'manual'
             FROM assets a WHERE a.address = 'SYNarqd6dg3ZygtDhD8CNLqE8wPNdAqWv7';
           SQL
+      # Three lines, three claims: the pass runs, re-running writes nothing, and
+      # the stored ranks match a recomputation done a different way (different
+      # queries, exact integer arithmetic). That is ALG-627's acceptance
+      # criterion enforced by CI rather than asserted in a PR description.
+      - name: Rarity is computed, idempotent and independently verifiable
+        run: |
+          cargo run -p indexer-admin -- rarity
+          cargo run -p indexer-admin -- rarity --expect-unchanged
+          cargo run -p indexer-admin -- rarity --verify
       - name: The API conforms to the frozen contract
         run: |
           cargo run -p indexer-api &
@@ -127,9 +169,15 @@ jobs:
           curl -sf $P/collections/piggy-sol-gang >/dev/null
           curl -sf $P/collections/piggy-sol-gang/facets >/dev/null
           curl -sf "$P/collections/piggy-sol-gang/nfts?trait%5BHead%5D=Crown&sort=-activity" >/dev/null
+          # `sort=rarity` was a 422 until ALG-627. `curl -sf` alone would pass
+          # on a null rank — null is schema-valid for every rarity field — so
+          # the grep is what proves rarity actually shipped.
+          curl -sf "$P/collections/piggy-sol-gang/nfts?sort=rarity" | grep -q '"rarityRank":[0-9]'
+          curl -sf "$P/collections/piggy-sol-gang/nfts?sort=-rarity" >/dev/null
           curl -sf "$P/collections/piggy-sol-gang/activity?kind=sale&kind=mint" >/dev/null
           curl -sf $P/collections/piggy-sol-gang/holders >/dev/null
           curl -sf $P/nfts/$A | grep -q activitySummary
+          curl -sf $P/nfts/$A | grep -q '"rarityRank":[0-9]'
           curl -sf "$P/nfts/$A/activity?limit=1" >/dev/null
           curl -sf $P/nfts/$A/owners >/dev/null
           curl -sf "$P/wallets/$W/nfts?collection=piggy-sol-gang" >/dev/null
@@ -140,7 +188,6 @@ jobs:
           # body against the `Error` schema; `-f` would swallow it, hence the
           # status assertion.
           test "$(curl -s -o /dev/null -w '%{http_code}' $P/nfts/HLDz7xArdTQeiCeKHg3VqhhNXzZGH5qBS)" = 404
-          test "$(curl -s -o /dev/null -w '%{http_code}' "$P/collections/piggy-sol-gang/nfts?sort=rarity")" = 422
           # A MALFORMED request never reaches the API: Prism validates the
           # request first and answers 422 itself. So the parameter rules are
           # asserted against the API directly — the proxy structurally cannot
@@ -150,6 +197,11 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' "$D/nfts/$A/activity?limit=101")" = 400
           test "$(curl -s -o /dev/null -w '%{http_code}' "$D/nfts/$A/activity?kind=listing")" = 400
           test "$(curl -s -o /dev/null -w '%{http_code}' $D/search)" = 400
+          # Browse is the only path declaring 422, and since ALG-627 unreserved
+          # `sort=rarity` an over-large limit is the only thing that still emits
+          # it. Asserted here, not through the proxy, because Prism's own
+          # request validation would answer first.
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$D/collections/piggy-sol-gang/nfts?limit=101")" = 422
 
   # The frozen v1 API contract (ALG-620). A separate job with no `needs:`, so it
   # runs in parallel with `check` and adds no wall-clock time — `check` compiles

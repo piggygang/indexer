@@ -28,7 +28,9 @@ pub enum Match {
 
 /// One matching card, tagged with its collection and that collection's exact
 /// match count.
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+///
+/// No `Eq`: the embedded card carries an `Option<f64>` rarity score.
+#[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct SearchHit {
     pub collection_id: i32,
     /// Exact number of matches in this collection — every match, not just the
@@ -58,6 +60,7 @@ pub async fn grouped(
         "WITH matched AS ( \
              SELECT a.collection_id, a.id, a.address, a.name, a.number, a.image_uri, \
                     a.image_status, a.burned, a.owner, a.last_activity_at, \
+                    a.rarity_score, a.rarity_rank, \
                     count(*) OVER (PARTITION BY a.collection_id)::bigint AS total, \
                     row_number() OVER (PARTITION BY a.collection_id \
                                        ORDER BY coalesce(a.number, 2147483647), a.id) AS rn \
@@ -66,7 +69,7 @@ pub async fn grouped(
                 AND {predicate} \
                 AND ($2::int IS NULL OR a.collection_id = $2)) \
          SELECT collection_id, total, id, address, name, number, image_uri, image_status, \
-                burned, owner, last_activity_at, \
+                burned, owner, last_activity_at, rarity_score, rarity_rank, \
                 0::bigint AS sort_number, ''::text AS sort_text \
            FROM matched WHERE rn <= $3 ORDER BY collection_id, rn"
     );

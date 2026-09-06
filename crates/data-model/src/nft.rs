@@ -20,7 +20,9 @@ use crate::types::{EventKind, Standard};
 /// The asset row plus the collection identity `NftDetail` needs. The standard
 /// is the collection's — the assets migration says so: *"a collection cannot
 /// mix standards; NftDetail.standard comes from the join."*
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+///
+/// No `Eq`: `rarity_score` is an `Option<f64>`.
+#[derive(Debug, Clone, PartialEq, FromRow)]
 pub struct NftRow {
     pub id: i64,
     pub address: String,
@@ -39,11 +41,16 @@ pub struct NftRow {
     pub membership_status: String,
     pub removed_at: Option<DateTime<Utc>>,
     pub last_activity_at: Option<DateTime<Utc>>,
+    pub rarity_score: Option<f64>,
+    pub rarity_rank: Option<i32>,
     pub updated_at: DateTime<Utc>,
     pub collection_slug: String,
     pub collection_name: String,
     pub collection_image_url: Option<String>,
     pub standard: Option<Standard>,
+    /// The collection's rarity fence, so a re-rank invalidates this page's
+    /// cache entry instead of waiting out the TTL.
+    pub rarity_version: i32,
 }
 
 /// One attribute of one asset, in display order.
@@ -91,8 +98,8 @@ pub struct ActivitySummary {
 const NFT_COLUMNS: &str = "a.id, a.address, a.collection_id, a.name, a.number, a.symbol, \
      a.metadata_uri, a.metadata_source_uri, a.image_uri, a.image_status, a.image_checked_at, \
      a.burned, a.owner, a.owner_slot, a.membership_status, a.removed_at, a.last_activity_at, \
-     a.updated_at, c.slug AS collection_slug, c.name AS collection_name, \
-     c.image_url AS collection_image_url, c.standard";
+     a.rarity_score, a.rarity_rank, a.updated_at, c.slug AS collection_slug, c.name AS collection_name, \
+     c.image_url AS collection_image_url, c.standard, c.rarity_version";
 
 /// One asset by its public address — the mint for Token Metadata, the asset id
 /// for Core. Assets of disabled collections are invisible, exactly as a

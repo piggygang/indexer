@@ -283,12 +283,18 @@ pub async fn run(
                     gone.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
                 );
             }
+            // Membership moves the population every trait frequency is
+            // measured against, so both directions re-rank the collection —
+            // and this is the one such write with no other trace, since the
+            // "came back" call's return value is deliberately discarded.
+            let mut tx = pool.begin().await?;
             counts.membership_removed =
-                assets::set_membership(pool, collection.id, &gone, true).await?;
+                assets::set_membership_and_flag(&mut tx, collection.id, &gone, true).await?;
             // An asset that came back is a member again. The writer's guard
             // makes the common case (nothing changed) a true no-op.
             let back: Vec<String> = found.iter().map(|a| a.id.clone()).collect();
-            assets::set_membership(pool, collection.id, &back, false).await?;
+            assets::set_membership_and_flag(&mut tx, collection.id, &back, false).await?;
+            tx.commit().await?;
         }
 
         // Read back the documents we are not re-fetching. Without this the

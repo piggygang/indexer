@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         consumer.pool.clone(),
         consumer.das.clone(),
         config.reconcile.clone(),
+        config.rarity.clone(),
         shutdown.clone(),
     ));
 
