@@ -229,10 +229,16 @@ impl Report {
 
 /// Runs both tiers and records what it corrected.
 ///
-/// `from` is the durable cursor; `None` means we have never checkpointed and
-/// the sweep alone is the baseline. Every collection's outcome is persisted to
-/// `backfill_state` under [`KIND`], so a run is readable after the fact
-/// without scrollback — the same discipline both backfills follow.
+/// `from` is the durable cursor, recorded in `backfill_state.cursor.from_slot`
+/// so a run says what it resumed from. It is **not** the recovery floor —
+/// tier 2 walks each candidate back to that asset's own `last_activity_slot`.
+/// Those two were the same value once, and it made the scheduled sweep a
+/// no-op: the cursor is always ahead of anything the stream missed. Do not
+/// re-couple them.
+///
+/// Every collection's outcome is persisted to `backfill_state` under [`KIND`],
+/// so a run is readable after the fact without scrollback — the same
+/// discipline both backfills follow.
 pub async fn run(
     pool: &PgPool,
     das: &DasClient,
@@ -363,6 +369,20 @@ pub async fn run(
         }
     }
 
+    // …and so are assets whose ownership is right but whose timeline is not.
+    //
+    // The state diff above cannot find these: it compares `assets.owner` with
+    // DAS, and a previous sweep already patched the owner to match. The
+    // transfer that moved it stayed missing, so the asset agrees with DAS,
+    // disagrees with its own history, and would never be looked at again.
+    // `drifted_assets` is the standing backlog of exactly that, and folding it
+    // in here is what makes the sweep converge instead of plateauing.
+    for drifted in activity::drifted_assets(pool, MAX_CANDIDATES as i64).await? {
+        if !candidates.iter().any(|c| c.id == drifted.id) {
+            candidates.push(drifted);
+        }
+    }
+
     if candidates.len() > MAX_CANDIDATES {
         report.overflowed = true;
         log::error!(
@@ -380,8 +400,24 @@ pub async fn run(
         candidates.truncate(MAX_CANDIDATES);
     }
 
-    let floor = from.unwrap_or(0) as i64;
     for candidate in &candidates {
+        // The floor is per asset: the newest slot we already have an event
+        // for. This is the bug this module shipped with — `from` is the live
+        // cursor, which on a healthy ingester is *now*, so a transfer the
+        // WebSocket dropped was by definition below it. `recover_asset`
+        // returned on its first comparison and every scheduled sweep reported
+        // `signatures=0 recorded=0` while tier 1 quietly patched the owner
+        // column. The gap between the two is the whole failure.
+        //
+        // An asset we have never recorded anything for falls back to the
+        // cursor rather than to 0. That is not timidity: 35% of tracked assets
+        // are in that state because the archival backfill has never covered
+        // the whole catalogue, and walking each one's full history inline would
+        // turn an hourly sweep into an archival crawl. `backfill-activity` owns
+        // that; this owns the gap between what we recorded and what moved.
+        let floor = candidate
+            .last_activity_slot
+            .unwrap_or(from.unwrap_or(0) as i64);
         let (signatures, outcome) = recover_asset(pool, das, pipeline, candidate, floor)
             .await
             .unwrap_or_else(|error| {

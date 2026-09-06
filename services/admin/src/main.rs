@@ -126,6 +126,12 @@ enum Cmd {
         /// venue registry. No network at all — use it after adding a venue.
         #[arg(long)]
         reprice_only: bool,
+        /// Repair exactly the assets whose ownership is right but whose
+        /// timeline is not — the transfers the live stream dropped. Targeted
+        /// at the disagreement rather than at a whole collection; pair it with
+        /// `--limit` to bound one run.
+        #[arg(long)]
+        drifted: bool,
         /// Fail when anything would change — the "re-running changes nothing" proof.
         #[arg(long)]
         expect_unchanged: bool,
@@ -317,6 +323,7 @@ async fn main() -> anyhow::Result<()> {
             reclassify,
             reprice_only,
             expect_unchanged,
+            drifted,
         } => {
             let venues = Venues::load(&marketplaces)?;
             println!(
@@ -341,6 +348,7 @@ async fn main() -> anyhow::Result<()> {
                 concurrency,
                 reclassify,
                 reprice_only,
+                drifted,
             };
             let report =
                 activity_backfill::run(&pool, &das, &venues, &options, print_activity_progress)

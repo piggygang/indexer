@@ -1208,3 +1208,117 @@ async fn membership_flips_without_losing_the_asset(pool: PgPool) {
             .unwrap();
     assert!(removed_at.is_none(), "assets_removed_pair demands the pair");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn drift_is_a_contradicted_timeline_not_an_uncrawled_one(pool: PgPool) {
+    // The predicate the reconciliation sweep and `backfill-activity --drifted`
+    // share, and the line it has to draw.
+    let collection_id = collection(&pool).await;
+    let agreeing = asset(&pool, collection_id, 1).await;
+    let mismatched = asset(&pool, collection_id, 2).await;
+    let never_crawled = asset(&pool, collection_id, 3).await;
+
+    // History exists and agrees — not drift.
+    write(
+        &pool,
+        agreeing,
+        collection_id,
+        &sig(1),
+        100,
+        EventKind::Mint,
+        None,
+        Some(&pk(10)),
+    )
+    .await;
+
+    // History exists but the owner column moved past it: what a DAS state
+    // sweep leaves behind when the transfer that moved it was never recorded.
+    write(
+        &pool,
+        mismatched,
+        collection_id,
+        &sig(2),
+        100,
+        EventKind::Mint,
+        None,
+        Some(&pk(11)),
+    )
+    .await;
+    sqlx::query("UPDATE assets SET owner = $2, owner_slot = 999 WHERE id = $1")
+        .bind(mismatched)
+        .bind(pk(12))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // An owner and no activity at all. This is NOT drift, and that assertion
+    // is the load-bearing one here: 35% of production's tracked assets are in
+    // this state because the archival backfill has never covered the whole
+    // catalogue. Counting it would put thousands of un-crawled assets into
+    // every hourly sweep, against a 10 rps budget.
+    sqlx::query("UPDATE assets SET owner = $2, owner_slot = 999 WHERE id = $1")
+        .bind(never_crawled)
+        .bind(pk(13))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let drifted = activity::drifted_assets(&pool, 100).await.unwrap();
+    let ids: Vec<i64> = drifted.iter().map(|a| a.id).collect();
+    assert!(ids.contains(&mismatched), "owner past its history: {ids:?}");
+    assert!(
+        !ids.contains(&never_crawled),
+        "never crawled is not drift — that is `backfill-activity`'s job: {ids:?}"
+    );
+    assert!(!ids.contains(&agreeing), "an agreeing asset is not drift");
+    assert_eq!(activity::drifted_count(&pool).await.unwrap(), 1);
+
+    // The floor the sweep would walk this one back to.
+    assert_eq!(drifted[0].last_activity_slot, Some(100));
+
+    // Repairing it empties the backlog, which is what makes the sweep converge
+    // instead of plateauing the way production did.
+    write(
+        &pool,
+        mismatched,
+        collection_id,
+        &sig(3),
+        200,
+        EventKind::Transfer,
+        Some(&pk(11)),
+        Some(&pk(12)),
+    )
+    .await;
+    assert_eq!(activity::drifted_count(&pool).await.unwrap(), 0);
+    assert!(activity::drifted_assets(&pool, 100)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // A burned asset has no owner, so it can never be in the population.
+    let burned = asset(&pool, collection_id, 4).await;
+    write(
+        &pool,
+        burned,
+        collection_id,
+        &sig(5),
+        100,
+        EventKind::Mint,
+        None,
+        Some(&pk(14)),
+    )
+    .await;
+    write(
+        &pool,
+        burned,
+        collection_id,
+        &sig(6),
+        101,
+        EventKind::Burn,
+        Some(&pk(14)),
+        None,
+    )
+    .await;
+    assert_eq!(activity::drifted_count(&pool).await.unwrap(), 0);
+}

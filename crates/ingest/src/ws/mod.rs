@@ -262,6 +262,12 @@ async fn session(
                                 // no live filters would silently deliver
                                 // nothing.
                                 if !connected && pending.is_empty() {
+                                    if let Some(reason) = wire::partially_subscribed(
+                                        by_filter.len(),
+                                        current.transactions.len(),
+                                    ) {
+                                        return Err(reason);
+                                    }
                                     connected = true;
                                     log::info!(
                                         "helius-ws subscribed: {} filter(s)",

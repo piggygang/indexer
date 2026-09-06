@@ -170,6 +170,9 @@ mod tests {
             owner: owner.map(str::to_string),
             owner_slot: owner.map(|_| 100),
             burned,
+            // The chain checker reasons about the derived timeline, not about
+            // where a recovery walk would stop.
+            last_activity_slot: None,
         }
     }
 

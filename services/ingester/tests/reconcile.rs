@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use chrono::TimeZone;
 use indexer_das::DasClient;
+use indexer_data_model::activity;
 use indexer_data_model::PgPool;
 use indexer_ingest::decode::DecodeContext;
 use indexer_ingester::pipeline::Pipeline;
@@ -540,4 +542,173 @@ async fn an_asset_flagged_out_of_order_is_rebuilt_by_the_sweep(pool: PgPool) {
     );
     assert!(report.corrections() > 0, "a rebuild is a correction");
     assert!(report.integrity.is_healthy(), "{:?}", report.integrity);
+}
+
+/// Seeds one already-recorded event through the real writer, so the asset gets
+/// both a `last_activity_slot` (the recovery floor) and an open ownership
+/// interval (what `integrity_owner_mismatch` compares against).
+async fn record_prior_event(pool: &PgPool, collection_id: i32, address: &str, slot: i64) {
+    let (asset_id, owner): (i64, Option<String>) =
+        sqlx::query_as("SELECT id, owner FROM assets WHERE address = $1")
+            .bind(address)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let owner = owner.expect("the fixture asset has an owner");
+    let mut tx = pool.begin().await.unwrap();
+    activity::record(
+        &mut tx,
+        &activity::LiveEvent {
+            asset_id,
+            collection_id,
+            signature: &sig(99),
+            seq: 0,
+            slot,
+            block_time: chrono::Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+            kind: indexer_data_model::types::EventKind::Mint,
+            from_owner: None,
+            to_owner: Some(&owner),
+            price_lamports: None,
+            marketplace: None,
+            details: None,
+            source: "backfill",
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_scheduled_sweep_recovers_a_transfer_older_than_the_live_cursor(pool: PgPool) {
+    // The shape production was actually in. The hourly sweep passes the *live*
+    // cursor, which on a healthy ingester is `now` — far ahead of the transfer
+    // the WebSocket dropped. When the recovery floor was that cursor, the walk
+    // returned on its first comparison and every scheduled sweep reported
+    // `signatures=0 recorded=0` while tier 1 quietly patched the owner column.
+    let (mint, stale, current) = (pk(1), pk(10), pk(11));
+    let collection_id = allowlist_collection(&pool, std::slice::from_ref(&mint)).await;
+    insert_asset(&pool, collection_id, &mint, &stale, 100).await;
+    record_prior_event(&pool, collection_id, &mint, 400).await;
+
+    let mut fake = FakeHelius::bind().await;
+    fake.serve(Script {
+        slot: 1_000,
+        assets: BTreeMap::from([(mint.clone(), das_asset(&mint, &current, false))]),
+        signatures: BTreeMap::from([(
+            mint.clone(),
+            vec![
+                json!({"signature": sig(1), "slot": 500, "blockTime": 1_700_000_000, "err": null}),
+            ],
+        )]),
+        transactions: BTreeMap::from([(sig(1), transfer_tx(&mint, &stale, &current, 500))]),
+    });
+    let das = fake.client();
+    let pipeline = pipeline(&pool, &das);
+
+    // The cursor is 500 slots PAST the transfer, exactly as a live stream that
+    // kept checkpointing through the gap would leave it.
+    let report = reconcile::run(&pool, &das, &pipeline, Some(1_000))
+        .await
+        .unwrap();
+    report.log("test");
+
+    assert_eq!(report.candidates(), 1, "the stale owner must be noticed");
+    assert!(
+        report.signatures() > 0,
+        "the walk must look below the live cursor: {:?}",
+        report.collections
+    );
+    assert_eq!(
+        report.recorded(),
+        1,
+        "the dropped transfer must be recovered even though it predates the cursor"
+    );
+
+    let (source, slot): (String, i64) =
+        sqlx::query_as("SELECT source, slot FROM activity WHERE signature = $1")
+            .bind(sig(1))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((source.as_str(), slot), ("reconcile", 500));
+    assert!(report.integrity.is_healthy(), "{:?}", report.integrity);
+
+    // The prior event is the floor, so a second sweep walks nothing new.
+    let again = reconcile::run(&pool, &das, &pipeline, Some(1_000))
+        .await
+        .unwrap();
+    assert_eq!(again.candidates(), 0);
+    assert!(again.is_noop());
+}
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_timeline_that_contradicts_the_owner_is_swept_back_in(pool: PgPool) {
+    // The other half of the drift, and the one the DAS diff cannot see: an
+    // earlier sweep already patched `assets.owner` to match DAS, so the asset
+    // now agrees with DAS, disagrees with its own history, and would never be
+    // a candidate again. `drifted_assets` is what puts it back in the sweep.
+    let (mint, stale, current) = (pk(1), pk(10), pk(11));
+    let collection_id = allowlist_collection(&pool, std::slice::from_ref(&mint)).await;
+    insert_asset(&pool, collection_id, &mint, &stale, 100).await;
+    record_prior_event(&pool, collection_id, &mint, 400).await;
+    // The owner column moves past the history, exactly as tier 1 leaves it.
+    sqlx::query("UPDATE assets SET owner = $2, owner_slot = 999 WHERE address = $1")
+        .bind(&mint)
+        .bind(&current)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mismatched: i64 = sqlx::query_scalar("SELECT count(*) FROM integrity_owner_mismatch")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(mismatched, 1, "the fixture must actually disagree");
+
+    let mut fake = FakeHelius::bind().await;
+    fake.serve(Script {
+        slot: 1_000,
+        // DAS agrees with the database now, so tier 1 finds nothing.
+        assets: BTreeMap::from([(mint.clone(), das_asset(&mint, &current, false))]),
+        signatures: BTreeMap::from([(
+            mint.clone(),
+            vec![
+                json!({"signature": sig(1), "slot": 500, "blockTime": 1_700_000_000, "err": null}),
+            ],
+        )]),
+        transactions: BTreeMap::from([(sig(1), transfer_tx(&mint, &stale, &current, 500))]),
+    });
+    let das = fake.client();
+    let pipeline = pipeline(&pool, &das);
+
+    let report = reconcile::run(&pool, &das, &pipeline, Some(1_000))
+        .await
+        .unwrap();
+    report.log("test");
+
+    assert_eq!(
+        report.candidates(),
+        0,
+        "the DAS state diff must find nothing — that is the whole point"
+    );
+    assert_eq!(
+        report.recorded(),
+        1,
+        "the drift backlog must still put it in the sweep: {:?}",
+        report.collections
+    );
+
+    // Repaired, so it leaves the backlog and the next sweep is a no-op.
+    assert_eq!(
+        indexer_data_model::activity::drifted_count(&pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(report.integrity.is_healthy(), "{:?}", report.integrity);
+    let again = reconcile::run(&pool, &das, &pipeline, Some(1_000))
+        .await
+        .unwrap();
+    assert!(again.is_noop());
 }

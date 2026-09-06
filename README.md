@@ -923,10 +923,11 @@ candidate count fell from 65 to 1 — the 1 being a genuine ownership change.
 
 ### Deploying it
 
-The `ingester` block is in `.railway/railway.ts` — **it has not been applied**.
-Nothing applies it on merge: Railway's GitHub integration deploys images and
-never reads `.railway/`, so merging lands the code with no service to run it.
-Merging *does* rebuild `api` and `admin`, whose watch patterns match `crates/**`.
+The `ingester` block is in `.railway/railway.ts` and **has been applied** — the
+service has been live since 2026-09-05. Nothing applies that file on merge:
+Railway's GitHub integration deploys images and never reads `.railway/`, so a
+merge lands the code and leaves project config alone. Merging *does* rebuild
+`api` and `admin`, whose watch patterns match `crates/**`.
 
 Merge first, apply second. Merge-first leaves git ahead of Railway, so `plan`
 reads `1 to add, 0 to change, 0 to destroy` throughout the window — additive,
@@ -1051,6 +1052,84 @@ ever-growing span of history without ever catching up.
 What it still cannot recover is unchanged from ALG-623: an ownership round-trip
 inside one gap (the state diff sees no change), and a transaction that never
 names the asset. Neither invents an activity row.
+
+### The recovery floor is per asset — and once was not
+
+Tier 2 walks a candidate's signatures newest first and stops at
+`slot <= floor`. That floor is **the asset's own `last_activity_slot`**: "walk
+back to the last event we already recorded for it".
+
+It used to be the *stream cursor*, and that made the whole tier a no-op. The
+on-connect sweep passes the pre-restart cursor, which is correct — but the
+scheduled sweep passes the live one, which on a healthy ingester is *now*. A
+transfer the WebSocket dropped is by definition older than now, so the walk
+returned on its first comparison. Tier 1 kept patching `assets.owner` from DAS
+while tier 2 recorded nothing, so the owner column was right, the timeline was
+empty, and `integrity_owner_mismatch` climbed monotonically. In production it
+went `0 → 288 → 554 → 884 → 1050` over four hours with every sweep logging
+`signatures=0 recorded=0`, and it was found only because someone moved a pig and
+noticed the transfer never showed up.
+
+Two consequences worth keeping:
+
+- **`from` is not a floor.** It is recorded in `backfill_state.cursor.from_slot`
+  so a run says what it resumed from, and that is all. `reconcile::run` says so
+  in its doc comment; do not re-couple them.
+- **An asset with no recorded activity falls back to the cursor**, not to 0.
+  35% of tracked assets are in that state because the archival backfill has
+  never covered the whole catalogue, so walking each one's full history inline
+  would turn an hourly sweep into an archival crawl. That is
+  `backfill-activity`'s job, not the sweep's.
+
+### The drift backlog
+
+Once tier 1 patches an owner, the asset stops disagreeing with DAS — so it is
+never a candidate again, even though its timeline still contradicts its owner.
+The sweep therefore also folds in `activity::drifted_assets`: exactly
+`integrity_owner_mismatch`, assets whose open ownership interval names someone
+other than `assets.owner`. That is what makes the metric converge rather than
+plateau, and `indexer-admin backfill-activity --drifted` drains the same set on
+demand:
+
+```sh
+indexer-admin backfill-activity --drifted --limit 500
+```
+
+The predicate is defined once, in `data-model::activity::drifted_assets`, and
+read by both — the discipline `owner_agrees` already states: the metric and the
+repair must not be able to drift apart. It deliberately excludes "has an owner
+and no history at all", which means *not crawled yet*, not *drift*.
+
+### Is the ingester alive? — the runbook
+
+It binds no port, so it has no healthcheck, no domain and no `/metrics`; a
+Railway deploy goes Active the moment the container starts, whether or not the
+pipeline is ingesting anything. Silence in the logs is normal — a healthy
+ingester prints nothing between subscribing and the next hourly sweep. So
+"alive" is a question you answer from the database, not from the process:
+
+```sh
+railway status                                   # → "- ingester: ● Online"
+railway logs --service ingester -d -n 200        # -d = this deployment, -n = no streaming
+```
+```sql
+-- Alive and receiving roots? `updated_at` moves on every checkpoint even when
+-- the slot does not, so this is a heartbeat. Over ~2 min means wedged.
+SELECT stream, last_processed_slot, now() - updated_at AS age FROM ingest_state;
+
+-- Disagreeing with itself? All zeroes is healthy.
+SELECT (SELECT count(*) FROM integrity_owner_mismatch)     AS owner_mismatch,
+       (SELECT count(*) FROM assets WHERE ownership_dirty) AS dirty,
+       (SELECT count(*) FROM integrity_rarity_broken)      AS rarity_broken;
+
+-- What the last sweep actually did. `signatures = 0` with `candidates > 0` is
+-- the shape of a recovery that is not recovering.
+SELECT collection_id, progress, finished_at
+  FROM backfill_state WHERE kind = 'reconcile' ORDER BY finished_at DESC;
+```
+
+Nothing alerts on any of this yet — ALG-628 owns that, and the predicates above
+are the ones it should use.
 
 ### Verified end to end (2026-09-05, mainnet)
 

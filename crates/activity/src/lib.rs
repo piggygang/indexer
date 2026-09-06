@@ -74,6 +74,11 @@ pub struct Options {
     /// Database-only pass: promote already-stored transfers to sales using the
     /// current venue registry, with no network at all.
     pub reprice_only: bool,
+    /// Crawl exactly the assets whose ownership is right but whose timeline is
+    /// not — [`activity::drifted_assets`]. The repair path for transfers the
+    /// live stream dropped: targeted at the disagreement itself rather than at
+    /// a whole collection.
+    pub drifted: bool,
 }
 
 impl Default for Options {
@@ -87,6 +92,7 @@ impl Default for Options {
             concurrency: 4,
             reclassify: false,
             reprice_only: false,
+            drifted: false,
         }
     }
 }
@@ -223,6 +229,10 @@ where
             }],
             warnings: Vec::new(),
         });
+    }
+
+    if options.drifted {
+        return crawl_drifted(pool, das, venues, options).await;
     }
 
     let mut report = Report::default();
@@ -613,4 +623,65 @@ async fn mark_failed(pool: &PgPool, collection_id: i32, error: &str) {
     if let Err(error) = ingest_state::put_backfill_state(pool, &state).await {
         log::error!("could not record the failure for collection {collection_id}: {error}");
     }
+}
+
+/// Crawls the standing drift backlog: assets that have an owner but whose
+/// timeline does not account for it.
+///
+/// Like the single-asset path this writes no cursor — a repair is not progress
+/// through a collection, and claiming otherwise would let a later `--resume`
+/// skip assets it never crawled. Crawls run concurrently and writes do not,
+/// for the same reason the collection loop gives: every write is its own
+/// per-asset transaction.
+async fn crawl_drifted(
+    pool: &PgPool,
+    das: &DasClient,
+    venues: &Venues,
+    options: &Options,
+) -> anyhow::Result<Report> {
+    let limit = options.limit.unwrap_or(usize::MAX).min(i64::MAX as usize) as i64;
+    let assets = activity::drifted_assets(pool, limit).await?;
+    let backlog = activity::drifted_count(pool).await?;
+    log::info!(
+        "{} drifted asset(s) to repair ({backlog} in the backlog), {} venue(s)",
+        assets.len(),
+        venues.len()
+    );
+    if assets.is_empty() {
+        return Ok(Report::default());
+    }
+
+    let core = core_collections(pool).await?;
+    let mut counts = Counts::default();
+    let started = Instant::now();
+    for chunk in assets.chunks(options.batch.max(1)) {
+        let crawled = futures_util::future::join_all(chunk.iter().map(|asset| {
+            let core = &core;
+            async move { (asset, crawl::crawl_asset(das, venues, core, asset).await) }
+        }))
+        .await;
+        for (asset, result) in crawled {
+            let outcome = result.with_context(|| format!("crawling {}", asset.address))?;
+            counts.add(write_asset(pool, asset, &outcome, options).await?);
+        }
+    }
+
+    let remaining = activity::drifted_count(pool).await?;
+    let mut warnings = Vec::new();
+    if remaining > 0 {
+        warnings.push(format!(
+            "{remaining} asset(s) still drifted — re-run, or raise --limit"
+        ));
+    }
+    Ok(Report {
+        collections: vec![CollectionReport {
+            slug: "drifted".into(),
+            rule: MembershipRule::TmAllowlist,
+            counts,
+            status: "done".into(),
+            elapsed: started.elapsed(),
+            warnings: Vec::new(),
+        }],
+        warnings,
+    })
 }

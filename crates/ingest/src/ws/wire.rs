@@ -23,6 +23,25 @@ const fn commitment_str(commitment: Commitment) -> &'static str {
     }
 }
 
+/// Why a connection that has finished acknowledging is still not usable.
+///
+/// The adapter registers a filter only when its ack carries a numeric
+/// subscription id, but treats an empty pending map as "connected". An ack
+/// shaped any other way therefore yields a socket that looks perfectly
+/// healthy — root notifications flow, checkpoints advance, the log says
+/// `subscribed` — and delivers no transactions at all. Comparing the two
+/// counts is what turns that into a loud reconnect instead of silent
+/// starvation, which is the same failure class as a recovery walk that never
+/// looks back.
+pub fn partially_subscribed(acked: usize, requested: usize) -> Option<String> {
+    (acked != requested).then(|| {
+        format!(
+            "only {acked} of {requested} transaction filter(s) were acknowledged; the \
+             socket would deliver nothing for the rest"
+        )
+    })
+}
+
 /// One `transactionSubscribe` call.
 ///
 /// `vote: false` is hard-coded because [`SubscriptionSpec`] states it as an
@@ -469,5 +488,24 @@ mod tests {
         s.accounts
             .insert("accts".into(), crate::spec::AccountFilter::default());
         assert!(unsupported(&s).unwrap().contains("account filters"));
+    }
+}
+
+#[cfg(test)]
+mod subscription_health {
+    use super::*;
+
+    #[test]
+    fn a_partially_acknowledged_socket_is_refused() {
+        // The healthy case says nothing.
+        assert_eq!(partially_subscribed(1, 1), None);
+        assert_eq!(partially_subscribed(0, 0), None);
+
+        // An ack that did not register its filter must not pass as connected:
+        // the socket would deliver roots forever and transactions never.
+        let reason = partially_subscribed(0, 1).expect("must be refused");
+        assert!(reason.contains("0 of 1"), "{reason}");
+        assert!(reason.contains("deliver nothing"), "{reason}");
+        assert!(partially_subscribed(2, 3).is_some());
     }
 }
