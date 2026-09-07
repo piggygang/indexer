@@ -37,7 +37,37 @@ const WATCHDOG: Duration = Duration::from_secs(300);
 pub struct Consumer {
     pub pool: PgPool,
     pub das: DasClient,
+    /// The client the spawned reconcile uses — rate-limited, and the **same
+    /// instance** `schedule::run` holds so the two share one budget rather than
+    /// two. The live `das` above stays unthrottled: it is the half that cannot
+    /// wait.
+    pub reconcile_das: DasClient,
     pub source: Arc<dyn IngestSource>,
+}
+
+/// The on-`Connected` reconcile, owned by the consumer's run so it cannot
+/// outlive it.
+///
+/// Abandoning a sweep in flight is safe for the same reason `schedule::run_job`
+/// abandons one: every step commits its own transaction, and `finished_at` is
+/// written only on completion, so the next run picks up from the same state.
+/// What is *not* safe is leaving one running while the supervisor starts a
+/// fresh consumer — hence the `Drop`.
+#[derive(Default)]
+struct Reconciling(Option<tokio::task::JoinHandle<()>>);
+
+impl Reconciling {
+    fn in_flight(&self) -> bool {
+        self.0.as_ref().is_some_and(|handle| !handle.is_finished())
+    }
+}
+
+impl Drop for Reconciling {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -75,6 +105,7 @@ impl Consumer {
         );
 
         let mut stats = Stats::default();
+        let mut reconciling = Reconciling::default();
         let mut pending_checkpoint: Option<u64> = None;
         let mut last_checkpoint_write = Instant::now();
         let mut last_progress = Instant::now();
@@ -83,94 +114,107 @@ impl Consumer {
 
         loop {
             tokio::select! {
-                            biased;
+                biased;
 
-                            _ = shutdown.changed() => {
-                                if *shutdown.borrow() {
-                                    log::info!("shutdown requested; flushing");
-                                    break;
-                                }
-                            }
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        log::info!("shutdown requested; flushing");
+                        break;
+                    }
+                }
 
-                            _ = poll.tick() => {
-                                // A registry change (a new collection, or Core assets the
-                                // backfill added) reaches the socket without a restart.
-                                match spec::build(&self.pool).await {
-                                    Ok(next) => {
-                                        spec_tx.send_if_modified(|current| {
-                                            let changed = *current != next;
-                                            if changed {
-                                                *current = next;
-                                            }
-                                            changed
-                                        });
-                                    }
-                                    Err(error) => log::warn!("rebuilding the subscription spec: {error:#}"),
+                _ = poll.tick() => {
+                    // A registry change (a new collection, or Core assets the
+                    // backfill added) reaches the socket without a restart.
+                    match spec::build(&self.pool).await {
+                        Ok(next) => {
+                            spec_tx.send_if_modified(|current| {
+                                let changed = *current != next;
+                                if changed {
+                                    *current = next;
                                 }
-                                if let Ok(context) = reconcile::context(&self.pool).await {
-                                    *pipeline.context_mut() = context;
-                                }
-                                if last_progress.elapsed() > WATCHDOG {
-                                    anyhow::bail!(
-                                        "no checkpoint in {}s — exiting so the restart policy reconnects \
-                                         and reconciles",
-                                        last_progress.elapsed().as_secs()
-                                    );
-                                }
-                            }
+                                changed
+                            });
+                        }
+                        Err(error) => log::warn!("rebuilding the subscription spec: {error:#}"),
+                    }
+                    if let Ok(context) = reconcile::context(&self.pool).await {
+                        *pipeline.context_mut() = context;
+                    }
+                    if last_progress.elapsed() > WATCHDOG {
+                        anyhow::bail!(
+                            "no checkpoint in {}s — exiting so the restart policy reconnects \
+                             and reconciles",
+                            last_progress.elapsed().as_secs()
+                        );
+                    }
+                }
 
-                            item = stream.next() => {
-                                let Some(item) = item else {
-                                    log::warn!("stream ended");
-                                    break;
-                                };
-                                // A terminal error is the adapter giving up; the service
-                                // decides the restart policy, not the adapter.
-                                let event = item?;
+                item = stream.next() => {
+                    let Some(item) = item else {
+                        log::warn!("stream ended");
+                        break;
+                    };
+                    // A terminal error is the adapter giving up; the service
+                    // decides the restart policy, not the adapter.
+                    let event = item?;
 
-                                match event {
-                                    IngestEvent::Transaction(update) => {
-                                        stats.events += 1;
-                                        match pipeline.handle(&update).await {
-                                            Ok(outcome) => stats.outcome.add(outcome),
-                                            Err(error) => {
-                                                log::error!("{}: {error:#}", update.signature);
-                                                return Err(error);
-                                            }
-                                        }
-                                    }
-                                    IngestEvent::SlotCheckpoint(checkpoint) => {
-                                        last_progress = Instant::now();
-                                        pending_checkpoint = Some(checkpoint.slot);
-                                        if last_checkpoint_write.elapsed() >= CHECKPOINT_EVERY {
-                                            self.checkpoint(&mut pending_checkpoint).await?;
-                                            last_checkpoint_write = Instant::now();
-                                        }
-                                    }
-                                    IngestEvent::Status(StreamStatus::Connected) => {
-                                        // Reconcile on EVERY connect, so cold start, crash
-                                        // restart and mid-run reconnect are one path.
-                                        stats.reconciles += 1;
-                                        let from = ingest_state::last_processed_slot(&self.pool, STREAM).await?;
-                                        let report = reconcile::run(&self.pool, &self.das, &pipeline, from)
-                                            .await?;
-            report.log("reconcile");
-                                        last_progress = Instant::now();
-                                    }
-                                    IngestEvent::Status(StreamStatus::Reconnecting { attempt }) => {
-                                        stats.reconnects += 1;
-                                        log::warn!("transport reconnecting (attempt {attempt})");
-                                    }
-                                    IngestEvent::Status(StreamStatus::Lagged { dropped }) => {
-                                        log::warn!("dropped {dropped} event(s); the reconnect will reconcile");
-                                    }
-                                    IngestEvent::Status(StreamStatus::Resubscribed) => {
-                                        log::info!("subscriptions updated without a reconnect");
-                                    }
-                                    IngestEvent::Account(_) => {}
+                    match event {
+                        IngestEvent::Transaction(update) => {
+                            stats.events += 1;
+                            match pipeline.handle(&update).await {
+                                Ok(outcome) => stats.outcome.add(outcome),
+                                Err(error) => {
+                                    log::error!("{}: {error:#}", update.signature);
+                                    return Err(error);
                                 }
                             }
                         }
+                        IngestEvent::SlotCheckpoint(checkpoint) => {
+                            last_progress = Instant::now();
+                            pending_checkpoint = Some(checkpoint.slot);
+                            if last_checkpoint_write.elapsed() >= CHECKPOINT_EVERY {
+                                self.checkpoint(&mut pending_checkpoint).await?;
+                                last_checkpoint_write = Instant::now();
+                            }
+                        }
+                        IngestEvent::Status(StreamStatus::Connected) => {
+                            // Reconcile on EVERY connect, so cold start, crash
+                            // restart and mid-run reconnect are one path.
+                            //
+                            // Spawned, not awaited. A sweep takes tens of
+                            // seconds, and awaiting it here meant the consumer
+                            // stopped reading the socket for exactly as long —
+                            // on a transport with no replay, every event that
+                            // arrived in that window was lost, which is the
+                            // failure this reconcile exists to repair. A
+                            // reconnect storm is the worst case and the one
+                            // that made it self-defeating.
+                            last_progress = Instant::now();
+                            if reconciling.in_flight() {
+                                log::info!("reconcile already in flight; this connect rides it");
+                            } else {
+                                stats.reconciles += 1;
+                                reconciling.0 = Some(tokio::spawn(reconcile_once(
+                                    self.pool.clone(),
+                                    self.reconcile_das.clone(),
+                                )));
+                            }
+                        }
+                        IngestEvent::Status(StreamStatus::Reconnecting { attempt }) => {
+                            stats.reconnects += 1;
+                            log::warn!("transport reconnecting (attempt {attempt})");
+                        }
+                        IngestEvent::Status(StreamStatus::Lagged { dropped }) => {
+                            log::warn!("dropped {dropped} event(s); the reconnect will reconcile");
+                        }
+                        IngestEvent::Status(StreamStatus::Resubscribed) => {
+                            log::info!("subscriptions updated without a reconnect");
+                        }
+                        IngestEvent::Account(_) => {}
+                    }
+                }
+            }
         }
 
         self.checkpoint(&mut pending_checkpoint).await?;
@@ -182,6 +226,29 @@ impl Consumer {
             ingest_state::checkpoint(&self.pool, STREAM, slot).await?;
         }
         Ok(())
+    }
+}
+
+/// One reconcile, with its own pipeline and its own error handling.
+///
+/// A failure is logged rather than returned: this no longer runs on the
+/// consumer's path, so it has no consumer to take down, and every connect and
+/// every scheduled tick is another attempt. It builds a fresh `DecodeContext`
+/// for the same reason `schedule::sweep` does — the consumer owns its own
+/// mutably, and a fresh one picks up registry changes without a restart.
+async fn reconcile_once(pool: PgPool, das: DasClient) {
+    let context = match reconcile::context(&pool).await {
+        Ok(context) => context,
+        Err(error) => return log::error!("reconcile could not read the venue registry: {error:#}"),
+    };
+    let pipeline = Pipeline::new(pool.clone(), das.clone(), context, "reconcile");
+    let from = match ingest_state::last_processed_slot(&pool, STREAM).await {
+        Ok(from) => from,
+        Err(error) => return log::error!("reconcile could not read the cursor: {error:#}"),
+    };
+    match reconcile::run(&pool, &das, &pipeline, from).await {
+        Ok(report) => report.log("reconcile"),
+        Err(error) => log::error!("reconcile failed: {error:#}"),
     }
 }
 

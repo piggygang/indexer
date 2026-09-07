@@ -138,6 +138,38 @@ pub struct SearchPage {
     pub grand_total: Option<u64>,
 }
 
+/// How a `searchAssets` call selects its population.
+///
+/// One variant per membership rule the registry can express, so the caller
+/// never has to know which JSON field a collection's identity lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchFilter {
+    /// Metaplex Core, and Token Metadata with a certified collection.
+    Collection(String),
+    /// Token Metadata without one: the verified creator is the only
+    /// collection-wide handle that exists.
+    Creator(String),
+}
+
+/// How a `searchAssets` page is ordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchOrder {
+    /// Stable and total — the only safe order to paginate an enumeration with.
+    IdAsc,
+    /// Newest on-chain action first. Not stable under concurrent activity, so
+    /// it is only ever read as a single page, never paged through.
+    RecentActionDesc,
+}
+
+impl SearchOrder {
+    fn as_json(self) -> Value {
+        match self {
+            Self::IdAsc => json!({"sortBy": "id", "sortDirection": "asc"}),
+            Self::RecentActionDesc => json!({"sortBy": "recent_action", "sortDirection": "desc"}),
+        }
+    }
+}
+
 /// Outcome of an image probe. `Undetermined` deliberately has no database
 /// representation — the columns are left untouched so the next pass retries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -387,9 +419,9 @@ impl DasClient {
         })
     }
 
-    /// One page of a collection's assets. Used for both `core_collection` and
-    /// `tm_collection` — the only difference between them is which address
-    /// the registry supplies.
+    /// One page of a collection's assets, oldest id first. Used for both
+    /// `core_collection` and `tm_collection` — the only difference between
+    /// them is which address the registry supplies.
     pub async fn search_assets(
         &self,
         collection: &str,
@@ -397,13 +429,58 @@ impl DasClient {
         limit: u32,
         grand_total: bool,
     ) -> Result<SearchPage, DasError> {
-        let params = json!({
-            "grouping": ["collection", collection],
+        self.search(
+            &SearchFilter::Collection(collection.to_string()),
+            SearchOrder::IdAsc,
+            page,
+            limit,
+            grand_total,
+        )
+        .await
+    }
+
+    /// The newest-acted-on assets a filter matches, most recent first.
+    ///
+    /// This is the reconciliation tip probe: instead of re-reading every
+    /// tracked asset to find the handful that moved, ask DAS which ones acted
+    /// most recently and read down until the answers stop being news. One call
+    /// per filter, against 18 `getAssetBatch` calls for a full sweep.
+    pub async fn search_recent(
+        &self,
+        filter: &SearchFilter,
+        limit: u32,
+    ) -> Result<SearchPage, DasError> {
+        self.search(filter, SearchOrder::RecentActionDesc, 1, limit, false)
+            .await
+    }
+
+    async fn search(
+        &self,
+        filter: &SearchFilter,
+        order: SearchOrder,
+        page: u32,
+        limit: u32,
+        grand_total: bool,
+    ) -> Result<SearchPage, DasError> {
+        let mut params = json!({
             "page": page,
             "limit": limit,
-            "sortBy": {"sortBy": "id", "sortDirection": "asc"},
+            "sortBy": order.as_json(),
             "options": {"showUnverifiedCollections": true, "showGrandTotal": grand_total},
         });
+        match filter {
+            SearchFilter::Collection(address) => {
+                params["grouping"] = json!(["collection", address]);
+            }
+            SearchFilter::Creator(address) => {
+                // The verified creator is what identifies a Token Metadata
+                // collection that has no certified collection — the same
+                // signal `collections.verified_creator` holds and the
+                // allowlist rule validates against.
+                params["creatorAddress"] = json!(address);
+                params["creatorVerified"] = json!(true);
+            }
+        }
         let value = self.rpc("searchAssets", params).await?;
 
         #[derive(Deserialize)]

@@ -25,9 +25,10 @@
 //! transaction that never names the asset. Neither invents an activity row.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use futures_util::StreamExt;
 use indexer_das::backfill::merge;
 use indexer_das::DasClient;
 use indexer_data_model::activity::{self, AssetRef};
@@ -42,6 +43,13 @@ use crate::pipeline::{Outcome, Pipeline};
 
 /// Signatures fetched per asset per page.
 const SIGNATURE_PAGE: u32 = 1_000;
+
+/// Concurrent `getAssetBatch` calls during enumeration.
+///
+/// The Developer plan allows 10 DAS requests/second — a separate bucket from
+/// RPC's 50/s — and `RECONCILE_RPS` already caps the client. Six in flight
+/// turns ~30 s of serial round trips into ~5 s without approaching the limit.
+const FETCH_CONCURRENCY: usize = 6;
 
 /// Beyond this many disagreeing assets a targeted recovery stops being
 /// meaningful. The sweep is still written and the overflow is flagged
@@ -101,7 +109,13 @@ impl CollectionReport {
             + self.rebuilt
     }
 
-    fn progress(&self, elapsed_ms: u128, overflowed: bool, integrity: &Integrity) -> Value {
+    fn progress(
+        &self,
+        elapsed_ms: u128,
+        phases: &Phases,
+        overflowed: bool,
+        integrity: &Integrity,
+    ) -> Value {
         json!({
             "swept": self.swept,
             "candidates": self.candidates,
@@ -126,8 +140,27 @@ impl CollectionReport {
             "symbol_mismatch": integrity.symbol_mismatch,
             "ownership_dirty": integrity.ownership_dirty,
             "duration_ms": elapsed_ms,
+            // Where the run's wall clock went. Run-level, not per collection,
+            // and recorded because "the sweep is slow" is otherwise
+            // unanswerable after the fact: the state pass and the recovery walk
+            // have completely different cost drivers, and only one of them is
+            // fixed by reading fewer assets.
+            "enumerate_ms": phases.enumerate.as_millis(),
+            "write_ms": phases.write.as_millis(),
+            "recover_ms": phases.recover.as_millis(),
         })
     }
+}
+
+/// Wall clock per phase of one run.
+#[derive(Debug, Default, Clone, Copy)]
+struct Phases {
+    /// Asking DAS what exists and what it owns.
+    enumerate: Duration,
+    /// Writing the state back.
+    write: Duration,
+    /// Walking each candidate's signatures and replaying what is missing.
+    recover: Duration,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -249,6 +282,14 @@ pub async fn run(
     let started_at = chrono::Utc::now();
     let mut report = Report::default();
     let mut candidates: Vec<AssetRef> = Vec::new();
+    let mut phases = Phases::default();
+
+    // One slot for the whole sweep, read BEFORE any data call so it stays a
+    // conservative lower bound on every observation it stamps — exactly as
+    // `assets.owner_slot` documents. Per-collection reads bought nothing: a
+    // later collection got a *higher* floor for data of the same age, which is
+    // the direction that loses a write, and each one was a round trip.
+    let slot = das.get_slot().await.context("getSlot")?;
 
     for collection in registry::list_enabled(pool).await? {
         let Some(rule) = collection.membership_rule else {
@@ -265,10 +306,9 @@ pub async fn run(
             .map(|r| (r.address.clone(), r))
             .collect();
 
-        // The slot is read BEFORE the data call so it is a conservative lower
-        // bound on the observation, exactly as `assets.owner_slot` documents.
-        let slot = das.get_slot().await.context("getSlot")?;
+        let enumerating = Instant::now();
         let found = enumerate(pool, das, &collection, rule, &stored).await?;
+        phases.enumerate += enumerating.elapsed();
 
         // Core assets can leave a collection when the update authority moves
         // them. Enumeration is authoritative for that rule and only that rule:
@@ -303,62 +343,93 @@ pub async fn run(
             tx.commit().await?;
         }
 
-        // Read back the documents we are not re-fetching. Without this the
-        // sweep hands `merge` a `None` document and reverts name, image and
-        // attributes to whatever DAS has cached — which would both corrupt the
-        // operator's re-hosted metadata and keep the corrections metric
-        // permanently above zero. `backfill.rs` does exactly this for the same
-        // reason.
-        let addresses: Vec<String> = found.iter().map(|a| a.id.clone()).collect();
+        // Assets we already have take the state-only path; only the ones this
+        // sweep is *discovering* need a full row.
+        //
+        // That split is what removed the sweep's largest read. It used to load
+        // every stored document — 17 820 JSONB blobs a pass — purely so
+        // `merge` would not hand `upsert_batch` a `None` document and blank the
+        // operator's re-hosted metadata. `apply_state` cannot touch those
+        // columns at all, so for an asset we already know the question does not
+        // arise; and a genuinely new asset (a Core mint) is rare enough that
+        // reading documents for just those few costs nothing.
+        let fresh: Vec<&indexer_das::Asset> = found
+            .iter()
+            .filter(|asset| !stored.contains_key(&asset.id))
+            .collect();
         let mut documents: BTreeMap<String, (String, Value)> = BTreeMap::new();
-        for (address, uri, json) in
-            assets::stored_documents(pool, collection.id, &addresses).await?
-        {
-            documents.insert(address, (uri, json));
+        if !fresh.is_empty() {
+            let addresses: Vec<String> = fresh.iter().map(|a| a.id.clone()).collect();
+            for (address, uri, json) in
+                assets::stored_documents(pool, collection.id, &addresses).await?
+            {
+                documents.insert(address, (uri, json));
+            }
         }
 
-        let mut inputs: Vec<AssetInput> = Vec::new();
+        let mut inserts: Vec<AssetInput> = Vec::new();
+        let mut updates: Vec<assets::StateInput> = Vec::new();
         for asset in &found {
             counts.swept += 1;
-            let document = documents
-                .get(&asset.id)
-                .map(|(uri, json)| (uri.as_str(), json));
-            let input = merge(asset, document);
+            let owner = (!asset.burnt)
+                .then(|| asset.owner().map(str::to_string))
+                .flatten();
+
             // The diff must mirror the writer's own policy, or an asset it
             // refuses to change becomes a permanent candidate and burns a
             // `getSignaturesForAddress` call on every reconnect forever.
             // Two asymmetries matter:
-            //   * `input.owner == None` means DAS does not know, not that
-            //     the asset has no owner — and `upsert_batch` will not
-            //     clobber a known owner with unknown.
+            //   * `owner == None` means DAS does not know, not that the asset
+            //     has no owner — and neither writer will clobber a known owner
+            //     with unknown.
             //   * burning is monotone, so only DAS asserting a burn we
             //     have not recorded is news.
-            if let Some(known) = stored.get(&asset.id) {
-                let owner_moved = input.owner.is_some() && known.owner != input.owner;
-                let newly_burned = input.burned && !known.burned;
-                if owner_moved || newly_burned {
-                    log::debug!(
-                        "candidate {}: db(owner={:?} burned={}) das(owner={:?} burned={})",
-                        known.address,
-                        known.owner.as_deref(),
-                        known.burned,
-                        input.owner.as_deref(),
-                        input.burned
-                    );
-                    counts.candidates += 1;
-                    candidates.push(known.clone());
+            match stored.get(&asset.id) {
+                Some(known) => {
+                    let owner_moved = owner.is_some() && known.owner != owner;
+                    let newly_burned = asset.burnt && !known.burned;
+                    if owner_moved || newly_burned {
+                        log::debug!(
+                            "candidate {}: db(owner={:?} burned={}) das(owner={:?} burned={})",
+                            known.address,
+                            known.owner.as_deref(),
+                            known.burned,
+                            owner.as_deref(),
+                            asset.burnt
+                        );
+                        counts.candidates += 1;
+                        candidates.push(known.clone());
+                    }
+                    updates.push(assets::StateInput {
+                        address: asset.id.clone(),
+                        owner,
+                        burned: asset.burnt,
+                    });
+                }
+                None => {
+                    let document = documents
+                        .get(&asset.id)
+                        .map(|(uri, json)| (uri.as_str(), json));
+                    inserts.push(merge(asset, document));
                 }
             }
-            inputs.push(input);
         }
 
-        for chunk in inputs.chunks(500) {
+        let writing = Instant::now();
+        for chunk in inserts.chunks(500) {
             let mut tx = pool.begin().await?;
             counts
                 .state
                 .add(assets::upsert_batch(&mut tx, collection.id, slot, chunk).await?);
             tx.commit().await?;
         }
+        for chunk in updates.chunks(2_000) {
+            let mut tx = pool.begin().await?;
+            counts.state.updated +=
+                assets::apply_state(&mut tx, collection.id, slot, chunk).await?;
+            tx.commit().await?;
+        }
+        phases.write += writing.elapsed();
         report.collections.push(counts);
     }
 
@@ -400,6 +471,7 @@ pub async fn run(
         candidates.truncate(MAX_CANDIDATES);
     }
 
+    let recovering = Instant::now();
     for candidate in &candidates {
         // The floor is per asset: the newest slot we already have an event
         // for. This is the bug this module shipped with — `from` is the live
@@ -433,6 +505,7 @@ pub async fn run(
             counts.activity.add(outcome);
         }
     }
+    phases.recover = recovering.elapsed();
 
     // Self-heal, after the recovery has had its chance to supply the missing
     // events: re-derive intervals for every asset an out-of-order write
@@ -467,7 +540,12 @@ pub async fn run(
             kind: KIND.to_string(),
             status: "done".into(),
             cursor: json!({"mode": "reconcile", "from_slot": from}),
-            progress: counts.progress(elapsed.as_millis(), report.overflowed, &report.integrity),
+            progress: counts.progress(
+                elapsed.as_millis(),
+                &phases,
+                report.overflowed,
+                &report.integrity,
+            ),
             last_error: None,
             started_at: Some(started_at),
             finished_at: Some(chrono::Utc::now()),
@@ -497,14 +575,23 @@ async fn enumerate(
                 MembershipRule::TmAllowlist => registry::allowlist(pool, collection.id).await?,
                 _ => stored.keys().cloned().collect(),
             };
+            // Concurrent, because the sweep's wall clock was almost entirely
+            // serial round trips: 18 sequential `getAssetBatch` calls, each
+            // returning a 1 000-asset payload, is ~30 s of mostly waiting.
+            // `FETCH_CONCURRENCY` is well inside the Developer plan's 10 DAS
+            // requests/second, and the client's own rate limiter enforces the
+            // ceiling regardless.
+            let batches: Vec<Vec<String>> =
+                addresses.chunks(1_000).map(<[String]>::to_vec).collect();
+            let results: Vec<_> = futures_util::stream::iter(batches)
+                .map(|chunk| async move { das.get_asset_batch(&chunk).await })
+                .buffer_unordered(FETCH_CONCURRENCY)
+                .collect()
+                .await;
+
             let mut found = Vec::new();
-            for chunk in addresses.chunks(1_000) {
-                found.extend(
-                    das.get_asset_batch(chunk)
-                        .await
-                        .context("getAssetBatch")?
-                        .found,
-                );
+            for result in results {
+                found.extend(result.context("getAssetBatch")?.found);
             }
             Ok(found)
         }
@@ -533,7 +620,11 @@ async fn enumerate(
 
 /// Walks one asset's signatures back to the cursor and replays them through
 /// the live decoder.
-async fn recover_asset(
+///
+/// Shared by all three callers that ever need to rebuild a timeline: the
+/// on-connect sweep, the scheduled sweep, and the tip probe. There is exactly
+/// one implementation on purpose — a second would drift.
+pub(crate) async fn recover_asset(
     pool: &PgPool,
     das: &DasClient,
     pipeline: &Pipeline,

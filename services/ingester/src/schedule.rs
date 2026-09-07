@@ -34,11 +34,16 @@ use serde_json::json;
 use tokio::sync::watch;
 
 use crate::pipeline::Pipeline;
-use crate::reconcile;
+use crate::{probe, reconcile};
 
 /// How often due-ness is checked. Well under the shortest useful interval, so
 /// a job starts close to when it falls due without polling the database hard.
-const TICK: Duration = Duration::from_secs(60);
+///
+/// 10 s rather than 60: the tip probe's default interval is 30 s, and a 60 s
+/// tick would swallow it whole — the configured interval has to be the thing
+/// that governs, not the tick. Each tick is one indexed `min(finished_at)`
+/// query per job.
+const TICK: Duration = Duration::from_secs(10);
 
 /// Runs the schedule until the shutdown signal fires.
 ///
@@ -62,21 +67,29 @@ pub async fn run(
     if !rarity_config.enabled() {
         log::info!("periodic rarity drain disabled (RARITY_INTERVAL_SECS=0)");
     }
-    if !config.enabled() && !rarity_config.enabled() {
+    if !config.tip_enabled() {
+        log::info!("reconciliation tip probe disabled (RECONCILE_TIP_INTERVAL_SECS=0)");
+    }
+    if !config.enabled() && !rarity_config.enabled() && !config.tip_enabled() {
         return;
     }
+    let tip_every = Duration::from_secs(config.tip_interval_secs);
     let rarity_every = Duration::from_secs(rarity_config.interval_secs);
     let sweep_every = Duration::from_secs(config.interval_secs);
     let deep_every = Duration::from_secs(config.deep_interval_secs);
     log::info!(
-        "reconciling every {}s, deep pass every {}s, at {} rpc/s",
+        "tip probe every {}s, reconciling every {}s, deep pass every {}s, at {} rpc/s",
+        tip_every.as_secs(),
         sweep_every.as_secs(),
         deep_every.as_secs(),
         config.rps
     );
 
-    // Throttled: the live writer is not, and this is the half that can wait.
-    let das = das.with_rate_limit(config.rps);
+    // `das` arrives already rate-limited, and deliberately as the same
+    // instance the consumer's spawned reconcile holds: `with_rate_limit` here
+    // would install a *second* limiter and the two halves would together ask
+    // for twice `config.rps`. Throttled at all because the live writer is not,
+    // and this is the half that can wait.
     let mut tick = tokio::time::interval(TICK);
     // `interval` fires immediately; the boot-time reconcile is the consumer's
     // job on `Connected`, so the first scheduled run is one interval away.
@@ -103,6 +116,17 @@ pub async fn run(
                 if rarity_config.enabled()
                     && !run_job("rarity drain", drain_rarity(&pool, rarity_every), &mut shutdown)
                         .await
+                {
+                    return;
+                }
+                // The tip probe before the full sweep: it is 3 calls against
+                // 23 and answers the same question sooner. They share the DAS
+                // rate budget, and `run_job` runs one job at a time, so a
+                // sweep in progress simply delays the next probe by its own
+                // duration rather than competing with it.
+                if config.tip_enabled()
+                    && due(&pool, probe::KIND, tip_every).await
+                    && !run_job("tip probe", tip(&pool, &das), &mut shutdown).await
                 {
                     return;
                 }
@@ -186,6 +210,26 @@ async fn due(pool: &PgPool, kind: &str, interval: Duration) -> bool {
             false
         }
     }
+}
+
+/// The tip probe: what moved since we last looked, without re-reading
+/// everything to find out.
+async fn tip(pool: &PgPool, das: &DasClient) -> anyhow::Result<()> {
+    let started_at = chrono::Utc::now();
+    // Its own pipeline, for the same reason the sweep builds one: a fresh
+    // `DecodeContext` picks up registry changes without waiting for a restart.
+    let pipeline = Pipeline::new(
+        pool.clone(),
+        das.clone(),
+        reconcile::context(pool).await?,
+        "reconcile",
+    );
+    let report = probe::run(pool, das, &pipeline).await?;
+    if !report.is_noop() {
+        report.log("tip probe");
+    }
+    probe::write_state(pool, &report, started_at).await?;
+    Ok(())
 }
 
 /// The hourly state sweep plus targeted activity recovery.

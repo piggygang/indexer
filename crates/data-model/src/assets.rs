@@ -424,6 +424,77 @@ WITH input AS (
 SELECT (SELECT count(*) FROM removed)::bigint,
        (SELECT count(*) FROM written)::bigint";
 
+/// The on-chain state of one asset, with no metadata attached.
+///
+/// [`AssetInput`] carries the whole row, which is right for a backfill and
+/// wrong for a state sweep: `upsert_batch` writes `name`, `symbol` and
+/// `metadata_uri` **unconditionally** (only `image_uri` and
+/// `metadata_source_uri` are coalesced), so handing it a merge built without a
+/// document would blank the operator's re-hosted metadata. That is why the
+/// sweep has always had to read back 17 820 stored documents just to correct
+/// an owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateInput {
+    pub address: String,
+    /// `None` = DAS does not know, which is not the same as "no owner" and
+    /// never clears a stored one.
+    pub owner: Option<String>,
+    pub burned: bool,
+}
+
+/// Applies owner and burned status to assets that already exist, touching no
+/// other column.
+///
+/// The same guards `upsert_batch` applies, and only those: `owner`/`owner_slot`
+/// move together and only under `EXCLUDED.owner_slot > assets.owner_slot`,
+/// burning is monotone, and an unchanged row is a true no-op so "re-running
+/// changes nothing" stays checkable. Deliberately an `UPDATE`, not an upsert —
+/// discovering a new asset is enumeration's job and needs the full input.
+pub async fn apply_state(
+    tx: &mut Transaction<'_, Postgres>,
+    collection_id: i32,
+    owner_slot: i64,
+    assets: &[StateInput],
+) -> sqlx::Result<u64> {
+    if assets.is_empty() {
+        return Ok(0);
+    }
+    let rows: Vec<Value> = assets
+        .iter()
+        .filter(|a| is_pubkey(&a.address))
+        .map(|a| json!({"address": a.address, "owner": a.owner, "burned": a.burned}))
+        .collect();
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let done = sqlx::query(
+        "UPDATE assets a SET \
+             burned = a.burned OR x.burned, \
+             owner = CASE WHEN a.burned OR x.burned THEN NULL \
+                          WHEN a.owner_slot IS NULL OR $3::bigint > a.owner_slot THEN x.owner \
+                          ELSE a.owner END, \
+             owner_slot = CASE WHEN a.burned OR x.burned THEN NULL \
+                               WHEN a.owner_slot IS NULL OR $3::bigint > a.owner_slot \
+                                    THEN CASE WHEN x.owner IS NULL THEN a.owner_slot \
+                                              ELSE $3::bigint END \
+                               ELSE a.owner_slot END \
+           FROM jsonb_to_recordset($2::jsonb) \
+                AS x(address text, owner text, burned boolean) \
+          WHERE a.address = x.address AND a.collection_id = $1 \
+            AND ((x.burned AND NOT a.burned) \
+                 OR (NOT (a.burned OR x.burned) \
+                     AND x.owner IS NOT NULL \
+                     AND (a.owner_slot IS NULL OR $3::bigint > a.owner_slot) \
+                     AND a.owner IS DISTINCT FROM x.owner))",
+    )
+    .bind(collection_id)
+    .bind(Value::Array(rows))
+    .bind(owner_slot)
+    .execute(&mut **tx)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// Records image reachability for the opt-in `--check-images` pass. Only
 /// determined outcomes are passed in: a timeout leaves both columns untouched
 /// so the next pass retries it.

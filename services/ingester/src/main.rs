@@ -40,9 +40,16 @@ async fn main() -> anyhow::Result<()> {
     log::info!("database migrated");
 
     let api_key = config.helius.required_api_key()?;
+    // One throttled client for everything that reconciles, built here and
+    // shared, so the scheduled sweep and the one the consumer spawns on
+    // `Connected` draw on a single rate budget instead of two. Helius meters
+    // DAS at 10 req/s on the Developer plan; two independent limiters set to
+    // that value would ask for 20.
+    let reconcile_das = DasClient::new(api_key)?.with_rate_limit(config.reconcile.rps);
     let consumer = Consumer {
         pool,
         das: DasClient::new(api_key)?,
+        reconcile_das: reconcile_das.clone(),
         source: Arc::new(HeliusWs::new(api_key)),
     };
 
@@ -54,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
     // Due-ness lives in `backfill_state`, so it survives the restarts anyway.
     let reconciler = tokio::spawn(schedule::run(
         consumer.pool.clone(),
-        consumer.das.clone(),
+        reconcile_das,
         config.reconcile.clone(),
         config.rarity.clone(),
         shutdown.clone(),
