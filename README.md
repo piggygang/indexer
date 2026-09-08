@@ -454,16 +454,44 @@ whole `deploy` block (restart policy, cron, `sleepApplication`, limit
 overrides), `networking`, and `github(..., { checkSuites })`. **The
 authoritative surface is the bundled type declarations in the `railway` npm
 package** (`IntentServiceConfig` in `node_modules/railway/dist/`). Read those,
-not the website, before concluding something must be set by hand — there are
-currently **no dashboard-only settings** for this project.
+not the website, before concluding something must be set by hand.
 
-Two more places the docs mislead:
+Three places the docs mislead:
+
+- **Custom domains cannot be registered from IaC** — the one genuinely
+  out-of-band step in this project. `domains: ["…"]` is *descriptive*: it names
+  a domain Railway already has, and `config plan` refuses outright to create
+  one (*"Custom-domain registration is not supported by Railway configuration"*).
+  `api`'s line works only because that domain predates the IaC file. Create the
+  domain first, then add the line:
+
+  ```sh
+  railway domain ingester.indexer.piggygang.net --port 8080 --service ingester
+  ```
+
+  **`--port 8080` is not optional.** The bare-string form compiles to
+  `{ port: 8080 }` in the SDK, so a domain created against another target port
+  leaves `plan` with a change it can never converge on; use the
+  `{ domain, port }` object form if you ever need a different one. Note this
+  restriction appears in neither the SDK types nor its README — both claim
+  domains are describable — so the CLI's error string is the only place it is
+  stated.
 
 - **Regions.** The IaC reference's example key is `europe-west4`, which is not a
   valid region id. `railway config pull` round-trips the short code — this
   project uses `ams`. The SDK does not validate region strings (`BucketRegion`
   is the only region union), so a wrong one type-checks and fails at apply.
 - **Wait for CI** is `source: github(repo, { checkSuites: true })`.
+
+And one SDK bug worth knowing before you reach for the escape hatch:
+`normalizeNetworking` writes `customDomains`/`tcpProxies` *after* spreading
+`networking`, so with the `domains`/`tcp` shorthand absent both keys become
+`undefined` and are pruned. A hand-authored
+`networking: { customDomains: { "x": null } }` is therefore **silently dropped**
+in `railway@3.11.0` — which also makes the CLI's own advice for removing a TCP
+proxy unexecutable. Deleting a domain means the dashboard or `railway domain`.
+Only `serviceDomains` and `privateNetworkEndpoint` survive that spread, which is
+why `api`'s `privateNetworkEndpoint` works.
 
 Watch patterns matter more than they look: without them **every push rebuilds
 every service**, including README-only commits, and an `admin` rebuild tears
@@ -1305,6 +1333,35 @@ future index-form decoder would read instead of re-fetching.
 - **Claiming is `FOR UPDATE SKIP LOCKED` + a lease + an attempt cap** — for the
   rolling-deploy overlap, for crash recovery, and for the poison row that would
   otherwise be re-claimed forever *and* pin the watermark.
+
+### Standing it up
+
+The order matters. One step costs 100 credits every time you redo it, and one
+ordering mistake takes the ingester down:
+
+1. **Set `HELIUS_WEBHOOK_SECRET` in the dashboard *before* the apply.** With
+   `webhook` in `INGEST_TRANSPORTS` and no secret, the ingester **fails to
+   boot** — `serve()` calls `required_webhook_secret()?` and a config error is
+   fatal by design. That used to be survivable; now that `/health` gates the
+   deploy, it fails the deploy instead. `preserve()` cannot help here: it
+   preserves nothing on a variable the service does not have yet, which is
+   exactly the state a first apply is in.
+2. **Create the domain — IaC cannot.**
+   `railway domain ingester.indexer.piggygang.net --port 8080 --service ingester`,
+   then point DNS at it. See *The IaC option surface* above for why, and why the
+   port is fixed. Add `domains: ["ingester.indexer.piggygang.net"]` to
+   `railway.ts` afterwards; its absence is not a deletion, so there is no rush,
+   but `plan` will not read as clean until it is there.
+3. `railway config plan` → `apply` for the healthcheck, `INGEST_TRANSPORTS`
+   and the connection bump.
+4. Confirm the endpoint is actually reachable *before* spending credits:
+   ```sh
+   curl -s https://ingester.indexer.piggygang.net/health
+   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+     https://ingester.indexer.piggygang.net/webhooks/helius \
+     -H 'Authorization: Bearer wrong' -H 'Content-Type: application/json' -d '[]'   # 401
+   ```
+5. Only then register the webhook.
 
 ### Registering it
 

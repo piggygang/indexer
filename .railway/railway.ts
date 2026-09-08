@@ -126,7 +126,23 @@ export default defineRailway(() => {
     // half would survive it (the inbox claim is FOR UPDATE SKIP LOCKED), but
     // the socket half would not.
     replicas: { [REGION]: 1 },
-    domains: ["ingester.indexer.piggygang.net"],
+    // No `domains` entry, deliberately. IaC **cannot register a custom domain** —
+    // `config plan` refuses it outright ("Custom-domain registration is not
+    // supported by Railway configuration"). The field is descriptive: it can
+    // name a domain Railway already has, which is why `api`'s line works (it
+    // arrived via `config pull` of a project that already had it). Create this
+    // one out of band, then add the line:
+    //
+    //   railway domain ingester.indexer.piggygang.net --port 8080 --service ingester
+    //
+    // Port 8080 is not optional: the bare-string form of `domains` compiles to
+    // `{ port: 8080 }` in the SDK, so a domain created against any other target
+    // port leaves `config plan` with a change it can never converge on.
+    //
+    // Unlike a service or a variable, omitting this is NOT a deletion — the
+    // networking sub-maps merge rather than replace, and removing an existing
+    // domain needs an explicit `customDomains: { "…": null }`. So the line can
+    // be added whenever, and its absence costs nothing but drift-check noise.
     env: {
       BIN: "indexer-ingester", // reaches the build only because the Dockerfile declares ARG BIN
       DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
@@ -136,10 +152,14 @@ export default defineRailway(() => {
       // this one value becoming "webhook"; the on-Connected reconcile follows
       // it automatically.
       INGEST_TRANSPORTS: "ws,webhook",
-      // The whole Authorization header Helius echoes back. Set it the moment
-      // this apply returns — preserve() preserves nothing on a variable the
-      // service does not have yet — and keep it identical to what
-      // `indexer-admin webhook` registers, or every delivery is a 401.
+      // The whole Authorization header Helius echoes back, and it must be set
+      // in the dashboard **before** the apply that turns the webhook lane on,
+      // not after: `serve()` calls `required_webhook_secret()?`, so the
+      // ingester fails to boot without it — and now that /health gates the
+      // deploy, that fails the deploy rather than degrading. preserve() cannot
+      // cover the gap; it preserves nothing on a variable that does not exist
+      // yet. Keep it identical to what `indexer-admin webhook` registers, or
+      // every delivery is a 401.
       HELIUS_WEBHOOK_SECRET: preserve(),
       WEBHOOK_URL: "https://ingester.indexer.piggygang.net/webhooks/helius",
       // preserve() keeps the live secret without writing it to source — but it
