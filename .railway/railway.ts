@@ -96,9 +96,15 @@ export default defineRailway(() => {
     },
   });
 
-  // The live pipeline (ALG-623). It binds no port, so it gets no healthcheck
-  // and no domain — an unset healthcheck makes the deploy go Active as soon as
-  // the container starts, which is what a service that serves no traffic needs.
+  // The live pipeline (ALG-623) and, since the webhook transport, an HTTP
+  // endpoint: Helius posts deliveries to /webhooks/helius, which this service
+  // files into `webhook_inbox` and drains itself. It therefore now binds $PORT
+  // and takes a healthcheck and a domain.
+  //
+  // The healthcheck is a deliberate behaviour change: a broken ingester used to
+  // go Active the moment its container started, and now fails its deploy
+  // instead. `/health` is liveness-only (no DB ping) so a Postgres blip cannot
+  // block a cutover — the same rule `api` follows.
   //
   // Restart policy: the README used to promise ALWAYS here, but
   // `restartPolicyType` is one of the three fields `config apply` silently
@@ -114,10 +120,28 @@ export default defineRailway(() => {
       dockerfilePath: "Dockerfile",
       watchPatterns: ["services/ingester/**", ...COMMON],
     },
+    healthcheck: "/health",
+    healthcheckTimeout: 120,
+    // One replica, still: two would double-subscribe the WebSocket. The webhook
+    // half would survive it (the inbox claim is FOR UPDATE SKIP LOCKED), but
+    // the socket half would not.
     replicas: { [REGION]: 1 },
+    domains: ["ingester.indexer.piggygang.net"],
     env: {
       BIN: "indexer-ingester", // reaches the build only because the Dockerfile declares ARG BIN
       DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
+      // Both transports at once. They write through the same signature-keyed
+      // idempotent writer, so double delivery is a no-op — which is what makes
+      // the WebSocket's loss rate measurable instead of assumed. Retirement is
+      // this one value becoming "webhook"; the on-Connected reconcile follows
+      // it automatically.
+      INGEST_TRANSPORTS: "ws,webhook",
+      // The whole Authorization header Helius echoes back. Set it the moment
+      // this apply returns — preserve() preserves nothing on a variable the
+      // service does not have yet — and keep it identical to what
+      // `indexer-admin webhook` registers, or every delivery is a 401.
+      HELIUS_WEBHOOK_SECRET: preserve(),
+      WEBHOOK_URL: "https://ingester.indexer.piggygang.net/webhooks/helius",
       // preserve() keeps the live secret without writing it to source — but it
       // preserves nothing on a service that does not exist yet, and does NOT
       // copy a value between services. On the apply that first creates this
@@ -126,12 +150,17 @@ export default defineRailway(() => {
       // exists `config plan` keeps reporting a pending change.
       HELIUS_API_KEY: preserve(),
       RUST_LOG: "info",
-      // One for the live writer, one for the reconcile the consumer spawns on
+      // One for the live writer, one for the reconcile a consumer spawns on
       // `Connected`, one for the scheduler (tip probe or sweep — `run_job`
       // runs one at a time), one for a Core mint's background attribute
-      // hydration, one spare. It was 3 while the on-connect reconcile was
-      // awaited inline and could not overlap anything; it can now.
-      DATABASE_MAX_CONNECTIONS: "5",
+      // hydration, one for the webhook drain, one for the receiver's inbox
+      // writer task, one spare. It was 3 while the on-connect reconcile was
+      // awaited inline and could not overlap anything.
+      //
+      // The HTTP handler itself needs none: it hands its batch to the writer
+      // task on the main runtime rather than touching the pool from an actix
+      // worker, whose runtime can be dropped out from under a connection.
+      DATABASE_MAX_CONNECTIONS: "7",
     },
   });
 

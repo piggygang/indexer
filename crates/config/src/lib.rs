@@ -15,8 +15,85 @@ pub struct Config {
     pub server: ServerConfig,
     pub helius: HeliusConfig,
     pub database: DatabaseConfig,
+    pub ingest: IngestConfig,
     pub reconcile: ReconcileConfig,
     pub rarity: RarityConfig,
+}
+
+/// Which transports the ingester runs, and how the webhook drain paces itself.
+///
+/// The WebSocket and the Helius webhook are both `IngestSource`s and both
+/// write through the same signature-keyed idempotent writer, so running them
+/// together is safe and is how the WebSocket's loss rate becomes measurable
+/// instead of assumed. `INGEST_TRANSPORTS=webhook` alone is the retirement.
+#[derive(Debug, Clone)]
+pub struct IngestConfig {
+    /// `INGEST_TRANSPORTS`, default `ws`. Comma-separated; an unknown member
+    /// is a hard error rather than a silently ignored typo that would leave a
+    /// transport unrun.
+    pub transports: Vec<Transport>,
+    /// `WEBHOOK_POLL_MS`, default 1000. Skipped entirely after a full batch,
+    /// so a burst drains continuously and an idle inbox costs one indexed
+    /// query a second.
+    pub webhook_poll_ms: u64,
+    /// `WEBHOOK_BATCH`, default 50. Each row is one `getTransaction`, so a
+    /// batch is a few seconds of work; small batches bound both the crash
+    /// replay window and the gap between checkpoint opportunities.
+    pub webhook_batch: i64,
+    /// `WEBHOOK_LEASE_SECS`, default 60. How long a claimed row stays claimed
+    /// before another drain may take it — the crash-recovery window.
+    pub webhook_lease_secs: u64,
+    /// `WEBHOOK_MAX_ATTEMPTS`, default 5. A row `getTransaction` never returns
+    /// would otherwise be re-claimed forever *and* pin the watermark.
+    pub webhook_max_attempts: i16,
+    /// `WEBHOOK_GRACE_SECS`, default 120. How long a processed row must settle
+    /// before the watermark counts it — the margin against a delivery that has
+    /// not arrived at all yet, which is the case `min(pending)` cannot see.
+    pub webhook_grace_secs: u64,
+    /// `WEBHOOK_RETAIN_DAYS`, default 30. Must outlast the dual-run evaluation
+    /// window: `webhook_inbox::coverage` reads these rows, so pruning early
+    /// deletes the evidence the retirement decision rests on.
+    pub webhook_retain_days: u32,
+}
+
+/// One ingest transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Helius Enhanced WebSockets. No replay: `ResumeFrom::Slot` is a floor.
+    Ws,
+    /// Helius webhooks, received by this service and drained from
+    /// `webhook_inbox`.
+    Webhook,
+}
+
+impl FromStr for Transport {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.trim() {
+            "ws" => Ok(Self::Ws),
+            "webhook" => Ok(Self::Webhook),
+            other => anyhow::bail!("unknown transport '{other}' (ws | webhook)"),
+        }
+    }
+}
+
+impl IngestConfig {
+    pub fn runs(&self, transport: Transport) -> bool {
+        self.transports.contains(&transport)
+    }
+
+    /// The lane that owns the on-`Connected` DAS reconcile.
+    ///
+    /// The first enabled transport in a fixed precedence, never a second env
+    /// var: retiring the WebSocket then moves the reconcile to the webhook
+    /// lane on its own, with nothing left to forget. Two lanes reconciling
+    /// would ask Helius for twice the rate budget `RECONCILE_RPS` allows.
+    pub fn reconciler(&self) -> Option<Transport> {
+        [Transport::Ws, Transport::Webhook]
+            .into_iter()
+            .find(|t| self.runs(*t))
+    }
 }
 
 /// Cadence of the rarity drain (ALG-627).
@@ -97,6 +174,21 @@ pub struct HeliusConfig {
     /// subcommand that needs it, so a missing key never breaks `migrate` or
     /// `seed`.
     pub api_key: Option<String>,
+    /// `HELIUS_WEBHOOK_SECRET`. The **whole** `Authorization` header value
+    /// Helius echoes back on every delivery — it is set as the webhook's
+    /// `authHeader` and compared verbatim, so there is no `Bearer ` to parse.
+    /// Helius offers no HMAC or signature scheme; this is the entire
+    /// authenticity check, so it wants real entropy.
+    pub webhook_secret: Option<String>,
+    /// `WEBHOOK_URL` — the public HTTPS endpoint Helius posts to, registered
+    /// by `indexer-admin webhook`. Never read on the receiving path.
+    pub webhook_url: Option<String>,
+    /// `HELIUS_WEBHOOK_API`, default `https://api-mainnet.helius-rpc.com`.
+    /// Configurable because Helius's docs and their own SDK disagree on the
+    /// host: the docs say `mainnet.helius-rpc.com`, the SDK uses this one, and
+    /// a legacy `api.helius.xyz` is still in circulation. The subcommand's
+    /// first call is a free `GET`, so a wrong host fails cheaply and loudly.
+    pub webhook_api: String,
 }
 
 impl HeliusConfig {
@@ -106,6 +198,20 @@ impl HeliusConfig {
         self.api_key
             .as_deref()
             .context("HELIUS_API_KEY is required for this command (see .env.example)")
+    }
+
+    /// The shared secret, or a hard error naming the variable.
+    pub fn required_webhook_secret(&self) -> Result<&str> {
+        self.webhook_secret
+            .as_deref()
+            .context("HELIUS_WEBHOOK_SECRET is required for this command (see .env.example)")
+    }
+
+    /// The registered endpoint, or a hard error naming the variable.
+    pub fn required_webhook_url(&self) -> Result<&str> {
+        self.webhook_url
+            .as_deref()
+            .context("WEBHOOK_URL is required for this command (see .env.example)")
     }
 }
 
@@ -151,8 +257,22 @@ impl Config {
             },
             helius: HeliusConfig {
                 api_key: env::var("HELIUS_API_KEY").ok().filter(|v| !v.is_empty()),
+                webhook_secret: env::var("HELIUS_WEBHOOK_SECRET")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+                webhook_url: env::var("WEBHOOK_URL").ok().filter(|v| !v.is_empty()),
+                webhook_api: string_or("HELIUS_WEBHOOK_API", "https://api-mainnet.helius-rpc.com"),
             },
             database,
+            ingest: IngestConfig {
+                transports: transports("INGEST_TRANSPORTS", "ws")?,
+                webhook_poll_ms: parsed_or("WEBHOOK_POLL_MS", 1_000)?,
+                webhook_batch: parsed_or("WEBHOOK_BATCH", 50)?,
+                webhook_lease_secs: parsed_or("WEBHOOK_LEASE_SECS", 60)?,
+                webhook_max_attempts: parsed_or("WEBHOOK_MAX_ATTEMPTS", 5)?,
+                webhook_grace_secs: parsed_or("WEBHOOK_GRACE_SECS", 120)?,
+                webhook_retain_days: parsed_or("WEBHOOK_RETAIN_DAYS", 30)?,
+            },
             reconcile: ReconcileConfig {
                 interval_secs: parsed_or("RECONCILE_INTERVAL_SECS", 3_600)?,
                 deep_interval_secs: parsed_or("RECONCILE_DEEP_INTERVAL_SECS", 604_800)?,
@@ -187,14 +307,37 @@ where
     }
 }
 
+/// A comma-separated transport list. Empty is a hard error rather than a
+/// silently inert ingester — a service that ingests nothing must say so at
+/// boot, not look healthy while doing nothing.
+fn transports(key: &str, default: &str) -> Result<Vec<Transport>> {
+    let raw = string_or(key, default);
+    let mut out = Vec::new();
+    for member in raw.split(',').filter(|m| !m.trim().is_empty()) {
+        let transport: Transport = member
+            .parse()
+            .with_context(|| format!("invalid {key}={raw}"))?;
+        if !out.contains(&transport) {
+            out.push(transport);
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("invalid {key}={raw}: name at least one transport (ws | webhook)");
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 21] = [
         "HOST",
         "PORT",
         "HELIUS_API_KEY",
+        "HELIUS_WEBHOOK_SECRET",
+        "HELIUS_WEBHOOK_API",
+        "WEBHOOK_URL",
         "DATABASE_URL",
         "DATABASE_MAX_CONNECTIONS",
         "DATABASE_CONNECT_TIMEOUT_SECS",
@@ -203,6 +346,13 @@ mod tests {
         "RECONCILE_RPS",
         "RARITY_INTERVAL_SECS",
         "RECONCILE_TIP_INTERVAL_SECS",
+        "INGEST_TRANSPORTS",
+        "WEBHOOK_POLL_MS",
+        "WEBHOOK_BATCH",
+        "WEBHOOK_LEASE_SECS",
+        "WEBHOOK_MAX_ATTEMPTS",
+        "WEBHOOK_GRACE_SECS",
+        "WEBHOOK_RETAIN_DAYS",
     ];
 
     fn clear() {
@@ -227,6 +377,21 @@ mod tests {
         assert!(config.rarity.enabled());
         assert_eq!(config.reconcile.tip_interval_secs, 30);
         assert!(config.reconcile.tip_enabled());
+        assert_eq!(config.helius.webhook_secret, None);
+        assert_eq!(config.helius.webhook_url, None);
+        assert_eq!(
+            config.helius.webhook_api,
+            "https://api-mainnet.helius-rpc.com"
+        );
+        // The WebSocket alone by default: adding the webhook lane is a
+        // deliberate act, not something a deploy picks up on its own.
+        assert_eq!(config.ingest.transports, vec![Transport::Ws]);
+        assert!(config.ingest.runs(Transport::Ws));
+        assert!(!config.ingest.runs(Transport::Webhook));
+        assert_eq!(config.ingest.reconciler(), Some(Transport::Ws));
+        assert_eq!(config.ingest.webhook_batch, 50);
+        assert_eq!(config.ingest.webhook_max_attempts, 5);
+        assert_eq!(config.ingest.webhook_grace_secs, 120);
         assert!(config
             .database
             .required_url()
@@ -287,18 +452,89 @@ mod tests {
     /// above is deliberately sequential because env vars are process-global,
     /// and this needs no env at all.
     #[test]
-    fn required_api_key_names_the_variable() {
-        let err = HeliusConfig { api_key: None }
-            .required_api_key()
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("HELIUS_API_KEY"),
-            "unexpected error: {err:#}"
+    fn required_accessors_name_their_variable() {
+        fn helius() -> HeliusConfig {
+            HeliusConfig {
+                api_key: None,
+                webhook_secret: None,
+                webhook_url: None,
+                webhook_api: "https://example.invalid".into(),
+            }
+        }
+
+        // Each accessor must name the variable a user has to set — the whole
+        // point of deferring the check to the command that needs it.
+        for (name, err) in [
+            ("HELIUS_API_KEY", helius().required_api_key().unwrap_err()),
+            (
+                "HELIUS_WEBHOOK_SECRET",
+                helius().required_webhook_secret().unwrap_err(),
+            ),
+            ("WEBHOOK_URL", helius().required_webhook_url().unwrap_err()),
+        ] {
+            assert!(
+                err.to_string().contains(name),
+                "the error for {name} must name it: {err:#}"
+            );
+        }
+
+        let configured = HeliusConfig {
+            api_key: Some("k".into()),
+            webhook_secret: Some("s".into()),
+            webhook_url: Some("https://example.test/webhooks/helius".into()),
+            ..helius()
+        };
+        assert_eq!(configured.required_api_key().unwrap(), "k");
+        assert_eq!(configured.required_webhook_secret().unwrap(), "s");
+        assert_eq!(
+            configured.required_webhook_url().unwrap(),
+            "https://example.test/webhooks/helius"
+        );
+    }
+
+    /// The retirement path is a single variable, and the reconcile owner moves
+    /// with it — that is the whole reason `reconciler()` is derived rather than
+    /// configured.
+    #[test]
+    fn transports_parse_and_carry_the_reconcile_owner() {
+        assert_eq!(transports("X", "ws").unwrap(), vec![Transport::Ws]);
+
+        env::set_var("X", "ws,webhook");
+        let dual = IngestConfig {
+            transports: transports("X", "ws").unwrap(),
+            webhook_poll_ms: 1_000,
+            webhook_batch: 50,
+            webhook_lease_secs: 60,
+            webhook_max_attempts: 5,
+            webhook_grace_secs: 120,
+            webhook_retain_days: 30,
+        };
+        assert_eq!(dual.transports, vec![Transport::Ws, Transport::Webhook]);
+        assert_eq!(
+            dual.reconciler(),
+            Some(Transport::Ws),
+            "during a dual run the WebSocket keeps the reconcile"
         );
 
-        let helius = HeliusConfig {
-            api_key: Some("k".into()),
+        // Retirement: one variable, and the webhook lane inherits it.
+        env::set_var("X", "webhook");
+        let retired = IngestConfig {
+            transports: transports("X", "ws").unwrap(),
+            ..dual.clone()
         };
-        assert_eq!(helius.required_api_key().unwrap(), "k");
+        assert_eq!(retired.reconciler(), Some(Transport::Webhook));
+        assert!(!retired.runs(Transport::Ws));
+
+        // Whitespace and duplicates are tolerated; unknown members are not,
+        // because a typo would silently leave a transport unrun.
+        env::set_var("X", " webhook , webhook ");
+        assert_eq!(transports("X", "ws").unwrap(), vec![Transport::Webhook]);
+        env::set_var("X", "ws,laserstream");
+        let err = transports("X", "ws").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("laserstream"),
+            "the error must name the offending member: {err:#}"
+        );
+        env::remove_var("X");
     }
 }

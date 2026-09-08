@@ -8,8 +8,10 @@
 
 pub mod blocktime;
 pub mod consumer;
+pub mod inbox;
 pub mod pipeline;
 pub mod probe;
+pub mod receiver;
 pub mod reconcile;
 pub mod schedule;
 pub mod spec;

@@ -555,6 +555,26 @@ fn flatten_instructions<'a>(message: &'a Value, meta: &'a Value) -> Vec<&'a Valu
     flat
 }
 
+/// The transaction's own `blockTime`, in unix seconds, when the payload has one.
+///
+/// The WebSocket notification does not carry it — which is why the live path
+/// resolves slots with `getBlockTime` and parks a signature it cannot resolve.
+/// A `getTransaction` response *does*, and so does a Helius webhook delivery.
+/// Preferring it removes an RPC call per new slot and, more importantly, the
+/// failure that silently dropped a real transfer on 2026-09-07 when a
+/// `confirmed`-fresh slot answered "Block not available".
+///
+/// This is the **second** permitted match on [`RawPayload`], and it lives here
+/// for the same reason the first one does: pipeline code must not learn the
+/// transport's shape. Both nestings are accepted, exactly as [`decode_json`]
+/// accepts them.
+pub fn block_time(update: &TransactionUpdate) -> Option<i64> {
+    let RawPayload::Json(payload) = &update.raw else {
+        return None;
+    };
+    pick(payload, &["/blockTime", "/transaction/blockTime"]).and_then(Value::as_i64)
+}
+
 fn pick<'a>(value: &'a Value, paths: &[&str]) -> Option<&'a Value> {
     paths.iter().find_map(|path| value.pointer(path))
 }
@@ -1053,5 +1073,87 @@ mod tests {
         let out = decode(&p);
         assert_eq!(out.events.len(), 1);
         assert_eq!(out.events[0].to_owner.as_deref(), Some(pk(51).as_str()));
+    }
+
+    /// **The trap this pipeline is built around.**
+    ///
+    /// A Helius *raw webhook* delivers `encoding: "json"` instructions — an
+    /// index into `accountKeys` for the program, integer account indices, and
+    /// base58 `data`. This decoder needs `jsonParsed`: a string `programId`,
+    /// string `accounts`, and `parsed.{type,info}`. Fed the raw shape it
+    /// matches nothing and returns empty — **no error, no log, no panic**,
+    /// which is why the webhook drain re-fetches every transaction with
+    /// `getTransaction` instead of decoding the stored body.
+    ///
+    /// This test exists so that silence is a *stated, tested* property rather
+    /// than a discovery, and so the re-fetch can never be "optimised away" by
+    /// someone who assumes the delivered body is readable.
+    #[test]
+    fn a_raw_webhook_payload_decodes_to_nothing() {
+        let mint = pk(1);
+        let (from, to) = (pk(2), pk(3));
+        let (src, dst) = (pk(4), pk(5));
+        let balance = |index: u64, owner: &str| {
+            json!({
+                "accountIndex": index, "mint": mint, "owner": owner,
+                "uiTokenAmount": {"amount": "1", "decimals": 0},
+            })
+        };
+        // Helius's documented raw shape, to the letter.
+        let payload = json!({
+            "blockTime": 1_673_445_241i64,
+            "slot": 171_942_732i64,
+            "meta": {
+                "err": null,
+                "fee": 10_000,
+                "preTokenBalances": [balance(1, &from)],
+                "postTokenBalances": [balance(2, &to)],
+                "innerInstructions": [],
+            },
+            "transaction": {
+                "signatures": ["sig"],
+                "message": {
+                    "accountKeys": [from.clone(), src, dst],
+                    "instructions": [{
+                        "accounts": [0, 1, 2],
+                        "data": "3GyWrkssW12wSfxjTynBnbif",
+                        "programIdIndex": 2,
+                    }],
+                },
+            },
+        });
+
+        let decoded = decode_json(&payload, &DecodeContext::default());
+        assert!(
+            decoded.is_empty(),
+            "index-form instructions must decode to nothing: {decoded:?}"
+        );
+        assert!(decoded.events.is_empty());
+        assert!(
+            decoded.programs.is_empty(),
+            "programIdIndex is not a programId"
+        );
+        assert!(
+            decoded.core.is_empty(),
+            "integer accounts cannot name a collection"
+        );
+
+        // The same transaction in the shape `getTransaction` returns *does*
+        // decode — which is exactly what the drain re-fetches to obtain.
+        let mut parsed = payload.clone();
+        parsed["transaction"]["message"]["instructions"] = json!([{
+            "program": "spl-token",
+            "programId": pk(90),
+            "parsed": {
+                "type": "transferChecked",
+                "info": {"source": pk(4), "destination": pk(5), "mint": mint},
+            },
+        }]);
+        let decoded = decode_json(&parsed, &DecodeContext::default());
+        assert_eq!(
+            decoded.events.len(),
+            1,
+            "the jsonParsed shape is what the decoder is for"
+        );
     }
 }

@@ -1,5 +1,7 @@
 //! Typed access to the collections / tokens registry.
 
+use std::collections::BTreeSet;
+
 use sqlx::{FromRow, PgPool};
 
 use crate::types::{MembershipRule, Standard};
@@ -95,4 +97,46 @@ pub async fn list_tokens(pool: &PgPool, enabled_only: bool) -> sqlx::Result<Vec<
     .bind(enabled_only)
     .fetch_all(pool)
     .await
+}
+
+/// Every on-chain address the pipeline wants transactions for.
+///
+/// **One definition, three consumers**: the WebSocket's `SubscriptionSpec`, the
+/// Helius webhook's `accountAddresses`, and the assertion that compares them.
+/// A second copy is exactly how address-list drift becomes real — a registered
+/// webhook whose list has fallen behind looks perfectly healthy (200s, no
+/// errors, a quiet inbox) while delivering nothing for the assets it no longer
+/// covers.
+///
+/// Membership is decided by `match`ing on [`MembershipRule`], one arm per rule
+/// and never on a slug, so onboarding a collection stays a TOML change.
+pub async fn tracked_addresses(pool: &PgPool) -> sqlx::Result<Vec<String>> {
+    let mut addresses = BTreeSet::new();
+    for collection in list_enabled(pool).await? {
+        let Some(rule) = collection.membership_rule else {
+            continue;
+        };
+        match rule {
+            // The committed mint list, so the filter is correct even before the
+            // backfill has run.
+            MembershipRule::TmAllowlist => {
+                addresses.extend(allowlist(pool, collection.id).await?);
+            }
+            // A certified collection mint never appears in a member's transfer,
+            // so the members themselves are the filter. New members are picked
+            // up by the next poll after a backfill adds them.
+            MembershipRule::TmCollection => {
+                addresses.extend(crate::assets::member_addresses(pool, collection.id).await?);
+            }
+            // Metaplex Core passes the collection account on every member
+            // instruction, so this one address catches transfers *and mints of
+            // assets that do not exist yet* — which is why individual Core
+            // asset addresses never enter the list, and why it only changes
+            // when the registry does.
+            MembershipRule::CoreCollection => {
+                addresses.extend(collection.address.clone());
+            }
+        }
+    }
+    Ok(addresses.into_iter().collect())
 }

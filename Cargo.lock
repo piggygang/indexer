@@ -1542,7 +1542,9 @@ dependencies = [
 name = "indexer-ingester"
 version = "0.1.0"
 dependencies = [
+ "actix-web",
  "anyhow",
+ "async-stream",
  "bs58",
  "chrono",
  "dotenv",
@@ -1554,7 +1556,9 @@ dependencies = [
  "indexer-ingest",
  "log",
  "serde_json",
+ "sha2",
  "sqlx",
+ "subtle",
  "tokio",
  "tokio-tungstenite",
 ]

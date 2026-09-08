@@ -17,9 +17,33 @@ use tokio::sync::watch;
 use crate::pipeline::{Outcome, Pipeline};
 use crate::{reconcile, spec};
 
-/// `ingest_state.stream` — `'<IngestSource::name()>:<label>'`, per the
-/// migration.
-pub const STREAM: &str = "helius-ws:mainnet";
+/// The durable identity of one transport.
+///
+/// `stream` is the `ingest_state.stream` key the migration specifies
+/// (`'<IngestSource::name()>:<label>'`); `source` is the `activity.source` tag
+/// this lane's writes carry, so a dual run is measurable one row at a time
+/// rather than only in aggregate.
+///
+/// One `Copy` struct rather than two fields, because the two must never
+/// disagree: a consumer that checkpoints one lane and tags its rows with
+/// another is the bug this shape forecloses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lane {
+    pub stream: &'static str,
+    pub source: &'static str,
+}
+
+/// Helius Enhanced WebSockets. No replay — `ResumeFrom::Slot` is a floor.
+pub const WS: Lane = Lane {
+    stream: "helius-ws:mainnet",
+    source: "live",
+};
+
+/// Helius webhooks, received by this service and drained from `webhook_inbox`.
+pub const WEBHOOK: Lane = Lane {
+    stream: "helius-webhook:mainnet",
+    source: "webhook",
+};
 
 /// Checkpoints are coalesced: roots arrive ~2.5/s and each is an upsert.
 /// `GREATEST` makes throttling safe, and the contract only requires that a
@@ -41,8 +65,15 @@ pub struct Consumer {
     /// instance** `schedule::run` holds so the two share one budget rather than
     /// two. The live `das` above stays unthrottled: it is the half that cannot
     /// wait.
-    pub reconcile_das: DasClient,
+    ///
+    /// `None` on every lane but one. An `Option` rather than a flag because a
+    /// flag and a client can disagree and an absent client cannot — and which
+    /// lane holds it is *derived* (`IngestConfig::reconciler`), so retiring a
+    /// transport moves the reconcile with no second variable to forget. Two
+    /// lanes reconciling would ask Helius for twice `RECONCILE_RPS`.
+    pub reconcile_das: Option<DasClient>,
     pub source: Arc<dyn IngestSource>,
+    pub lane: Lane,
 }
 
 /// The on-`Connected` reconcile, owned by the consumer's run so it cannot
@@ -86,13 +117,14 @@ impl Consumer {
             self.pool.clone(),
             self.das.clone(),
             reconcile::context(&self.pool).await?,
-            "live",
+            self.lane.source,
         );
 
-        let resume = reconcile::seed_cursor(&self.pool, STREAM).await?;
+        let resume = reconcile::seed_cursor(&self.pool, self.lane.stream).await?;
         let (spec_tx, spec_rx) = watch::channel(spec::build(&self.pool).await?);
         log::info!(
-            "resuming {STREAM} from {} with {} filter(s)",
+            "resuming {} from {} with {} filter(s)",
+            self.lane.stream,
             resume
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "the live tip".into()),
@@ -191,14 +223,19 @@ impl Consumer {
                             // reconnect storm is the worst case and the one
                             // that made it self-defeating.
                             last_progress = Instant::now();
-                            if reconciling.in_flight() {
-                                log::info!("reconcile already in flight; this connect rides it");
-                            } else {
-                                stats.reconciles += 1;
-                                reconciling.0 = Some(tokio::spawn(reconcile_once(
-                                    self.pool.clone(),
-                                    self.reconcile_das.clone(),
-                                )));
+                            // Only the reconciling lane, so a dual run does not
+                            // double the DAS budget.
+                            if let Some(das) = &self.reconcile_das {
+                                if reconciling.in_flight() {
+                                    log::info!("reconcile already in flight; this connect rides it");
+                                } else {
+                                    stats.reconciles += 1;
+                                    reconciling.0 = Some(tokio::spawn(reconcile_once(
+                                        self.pool.clone(),
+                                        das.clone(),
+                                        self.lane.stream,
+                                    )));
+                                }
                             }
                         }
                         IngestEvent::Status(StreamStatus::Reconnecting { attempt }) => {
@@ -223,7 +260,7 @@ impl Consumer {
 
     async fn checkpoint(&self, pending: &mut Option<u64>) -> anyhow::Result<()> {
         if let Some(slot) = pending.take() {
-            ingest_state::checkpoint(&self.pool, STREAM, slot).await?;
+            ingest_state::checkpoint(&self.pool, self.lane.stream, slot).await?;
         }
         Ok(())
     }
@@ -236,19 +273,65 @@ impl Consumer {
 /// every scheduled tick is another attempt. It builds a fresh `DecodeContext`
 /// for the same reason `schedule::sweep` does — the consumer owns its own
 /// mutably, and a fresh one picks up registry changes without a restart.
-async fn reconcile_once(pool: PgPool, das: DasClient) {
+async fn reconcile_once(pool: PgPool, das: DasClient, stream: &'static str) {
     let context = match reconcile::context(&pool).await {
         Ok(context) => context,
         Err(error) => return log::error!("reconcile could not read the venue registry: {error:#}"),
     };
     let pipeline = Pipeline::new(pool.clone(), das.clone(), context, "reconcile");
-    let from = match ingest_state::last_processed_slot(&pool, STREAM).await {
+    let from = match ingest_state::last_processed_slot(&pool, stream).await {
         Ok(from) => from,
         Err(error) => return log::error!("reconcile could not read the cursor: {error:#}"),
     };
     match reconcile::run(&pool, &das, &pipeline, from).await {
         Ok(report) => report.log("reconcile"),
         Err(error) => log::error!("reconcile failed: {error:#}"),
+    }
+}
+
+/// Runs one consumer until shutdown, restarting it with a backoff.
+///
+/// Lifted out of `main` so two lanes can be supervised independently: a failure
+/// on one transport must not tear down the other, and `Consumer::run` returns
+/// `Err` on a pipeline error. Merged, an inbox hiccup would force a reconnect
+/// on the transport that has no replay — precisely the event that loses data.
+pub async fn supervise(consumer: Consumer, mut shutdown: watch::Receiver<bool>) {
+    /// Between restarts, so a persistent upstream outage is not a hot loop.
+    const BACKOFF: [u64; 5] = [1, 5, 15, 30, 60];
+    let lane = consumer.lane;
+    let mut restarts = 0usize;
+
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        match consumer.run(shutdown.clone()).await {
+            Ok(stats) => {
+                log::info!(
+                    "{} stopped: events={} recorded={} redelivered={} dirty={} \
+                     parked={} reconnects={} reconciles={}",
+                    lane.stream,
+                    stats.events,
+                    stats.outcome.recorded,
+                    stats.outcome.redelivered,
+                    stats.outcome.dirty,
+                    stats.outcome.parked,
+                    stats.reconnects,
+                    stats.reconciles,
+                );
+            }
+            Err(error) => log::error!("{} failed: {error:#}", lane.stream),
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+        let wait = BACKOFF[restarts.min(BACKOFF.len() - 1)];
+        restarts += 1;
+        log::warn!("restarting {} in {wait}s (restart {restarts})", lane.stream);
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(wait)) => {}
+            _ = shutdown.changed() => {}
+        }
     }
 }
 

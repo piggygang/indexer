@@ -32,6 +32,7 @@ pub mod synth;
 pub mod timeline;
 pub mod types;
 pub mod wallet;
+pub mod webhook_inbox;
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};

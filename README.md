@@ -166,6 +166,11 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
+| `INGEST_TRANSPORTS` | no | `ws` | ingester only: which transports run — `ws`, `webhook`, or `ws,webhook` for a dual run. Retirement is this one value becoming `webhook`; the on-`Connected` reconcile follows it automatically. An unknown member is a hard error, never a silently unrun transport |
+| `HELIUS_WEBHOOK_SECRET` | ingester (with `webhook`) | — | the **whole** `Authorization` header value Helius echoes on every delivery, set as the webhook's `authHeader` and compared verbatim. Helius offers no HMAC or signature scheme, so this is the entire authenticity check |
+| `WEBHOOK_URL` | `admin webhook` | — | the public HTTPS endpoint to register. Registration only — the receiver never reads it |
+| `HELIUS_WEBHOOK_API` | no | `https://api-mainnet.helius-rpc.com` | the management API host. Configurable because Helius's docs and their own SDK disagree on it |
+| `WEBHOOK_POLL_MS` / `WEBHOOK_BATCH` / `WEBHOOK_LEASE_SECS` / `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_GRACE_SECS` / `WEBHOOK_RETAIN_DAYS` | no | `1000` / `50` / `60` / `5` / `120` / `30` | drain pacing. `RETAIN_DAYS` must outlast a dual-run evaluation window — `coverage()` reads those rows |
 | `RECONCILE_TIP_INTERVAL_SECS` | no | `30` | ingester only: the tip probe — one `searchAssets` per collection filter, newest-acted-on first. This is the freshness knob; `0` disables it and leaves the hourly sweep as the only correction |
 | `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). `0` disables the schedule, leaving the on-`Connected` reconcile |
 | `RECONCILE_DEEP_INTERVAL_SECS` | no | `604800` | ingester only: the weekly deep pass — supply, burned assets, attribute changes |
@@ -350,7 +355,7 @@ builds the Dockerfile → `/health` must return 200 → traffic cutover. Rollbac
 |---|---|---|---|---|
 | `api` | `indexer-api` (default `BIN`) | image `CMD` | `/health`, 120 s | serves traffic |
 | `admin` | `indexer-admin` (`BIN=indexer-admin`) | idles — see below | none | a container to `railway ssh` into and run `migrate` / `seed` against Postgres over the private network |
-| `ingester` | `indexer-ingester` (`BIN=indexer-ingester`) | image `CMD` | none — binds no port | the ALG-623 live pipeline: one long-lived `transactionSubscribe`, writing ownership and activity |
+| `ingester` | `indexer-ingester` (`BIN=indexer-ingester`) | image `CMD` | `/health`, 120 s | the ALG-623 live pipeline **and** the Helius webhook endpoint: one long-lived `transactionSubscribe`, `POST /webhooks/helius`, and the drain that turns both into ownership and activity |
 
 **Deployment contract:** the Dockerfile builds workspace binary
 `${BIN}` (default `indexer-api`) and installs it under **its own name** at
@@ -364,7 +369,10 @@ serves traffic must listen on `[::]:$PORT`; `RAILWAY_GIT_COMMIT_SHA` is passed
 as a build arg and baked into `/health` as `commit`. The `ingester` service
 reuses the same Dockerfile with service variable `BIN=indexer-ingester`. It sets
 no healthcheck — unset means the deploy goes Active as soon as the container
-starts, which is what a service that binds no port needs — and **no restart
+starts, which is what a service that binds no port needs. The `ingester` no
+longer qualifies: it binds `$PORT` for the webhook endpoint and so takes
+`/health` and a domain, which means a broken ingester now fails its deploy
+instead of going Active regardless. `admin` keeps **no restart
 policy**: `restartPolicyType`, `restartPolicyMaxRetries` and `sleepApplication`
 are the three fields `config apply` silently drops, so the binary supervises
 itself and leans on Railway's default `ON_FAILURE`. (The rest of the `deploy`
@@ -1225,13 +1233,137 @@ it just means a standing backlog of escrow-era moves shows up as a sweep that
 spends its whole rate budget and reports `recorded=0`. `recover_ms` next to
 `corrections` is how you tell that apart from a sweep that is genuinely busy.
 
+## Webhooks (the second transport)
+
+The Enhanced WebSocket loses live updates: no `fromSlot`, no cursor, no delivery
+guarantee, so `ResumeFrom::Slot` is only a floor and every reconnect is a
+permanent hole. Production watched `integrity_owner_mismatch` climb 1216 → 1659
+overnight on a single reconnect in twelve hours. Helius webhooks move delivery
+off a socket this process has to stay glued to and onto Helius's own retries.
+
+**Both transports run at once**, selected by `INGEST_TRANSPORTS`. They write
+through the same signature-keyed idempotent `activity::record`, so double
+delivery is already a no-op — which is what makes the WebSocket's loss rate
+*measurable* instead of assumed.
+
+| | transport | cursor | what it costs |
+|---|---|---|---|
+| `ws` | `transactionSubscribe` | `helius-ws:mainnet` | included in the plan |
+| `webhook` | `POST /webhooks/helius` → `webhook_inbox` → drain | `helius-webhook:mainnet` | 1 credit/event + 1 `getTransaction` |
+
+### Be honest about what this buys
+
+Helius's own product table marks webhooks **Replay ❌** and scopes them to
+*"low-volume integrations"*, naming LaserStream gRPC as the option for
+*"indexers"* — which is Business-tier ($499/mo) and out of scope. Their retry
+policy is documented two incompatible ways: the FAQ says three retries a second
+apart, after which *"the event is permanently lost"*; the API index says
+exponential backoff for 24 hours. Ordering is never stated anywhere.
+
+So the gain is real but narrower than "gapless": the loss window shrinks from
+*the whole reconnect gap on a socket we must stay connected to* to *our endpoint
+being down for more than a few seconds*, and delivery stops depending on the
+ingester holding a connection. **The tip probe and the sweep stay load-bearing.**
+
+### Why the drain re-fetches every transaction
+
+A raw webhook delivers `encoding: "json"` instructions:
+
+```json
+{ "accounts": [0, 1, 2], "data": "3GyWrkssW12wSfxjTynBnbif", "programIdIndex": 10 }
+```
+
+`crates/ingest/src/decode.rs` needs `jsonParsed` — a string `programId`, string
+`accounts`, and `parsed.{type,info}`. Given index form it matches nothing and
+returns `Decoded::default()`: **no error, no log, no panic, just `recorded=0`
+forever with healthy-looking output.** That is pinned by
+`a_raw_webhook_payload_decodes_to_nothing`, which asserts both halves — the raw
+shape decodes to nothing, the `getTransaction` shape decodes to an event.
+
+So the webhook is a *trigger*, not a data source: the drain takes the signature
+and re-fetches with `getTransaction`, the same call `reconcile::recover_asset`
+already makes in production. One extra credit per event, correct regardless of
+whether `encoding: "jsonParsed"` turns out to be honoured on webhooks (the docs
+do not say, and the SDK hints it is not), and **zero changes to the decoder**.
+The raw body is stored anyway — it is the forensic record, and the input a
+future index-form decoder would read instead of re-fetching.
+
+### The invariants worth knowing
+
+- **A 200 means the row is committed.** The handler hands its batch to a writer
+  task on the main runtime and *waits for the reply*. An optimistic ACK would
+  reintroduce the loss window the inbox exists to close.
+- **The handler never touches Postgres.** A connection opened on an actix worker
+  breaks when that worker's runtime is dropped, and actix restarts faulted
+  workers. The writer task is the only thing in the HTTP path with a pool.
+- **The checkpoint is a watermark, never the chain tip**:
+  `LEAST(min(pending slot) - 1, max(processed slot older than the grace window))`
+  — the highest slot below which nothing is still owed. A stuck row *pins* the
+  cursor, which is correct and monitorable. It is never `0`: a persisted zero
+  would make `seed_cursor` return `Some(0)` and turn the sweep's fallback floor
+  into a full archival crawl.
+- **Claiming is `FOR UPDATE SKIP LOCKED` + a lease + an attempt cap** — for the
+  rolling-deploy overlap, for crash recovery, and for the poison row that would
+  otherwise be re-claimed forever *and* pin the watermark.
+
+### Registering it
+
+The dashboard caps at 25 addresses and we track ~17 100, so registration is the
+API, which means the subcommand:
+
+```sh
+indexer-admin webhook --dry-run     # lists, diffs, calls nothing, costs nothing
+indexer-admin webhook               # creates or updates (100 credits)
+```
+
+Every Helius webhook mutation costs 100 credits **and rewrites the whole address
+list**, so it lists first, diffs, and writes nothing when nothing changed.
+`--expect-unchanged` makes that a CI-style assertion.
+
+**Address-list drift is the failure mode to watch.** The WebSocket rebuilds its
+subscription from the registry every 300 s; a webhook's `accountAddresses` is
+server-side state with no refresh, and a drifted list looks perfectly healthy —
+200s, no errors, a quiet inbox — while delivering nothing for the assets it no
+longer covers. Both sides derive from one function, `registry::tracked_addresses`,
+so re-running the subcommand after a backfill is the whole remedy.
+
+### Deciding when to retire the WebSocket
+
+**Coverage, not wins.** The WebSocket wins nearly every race — it is sub-second,
+while the webhook path is a poll plus a re-fetch — so `source = 'webhook'` counts
+stay small even if webhooks are perfect. The number that must reach zero is the
+other one:
+
+```sql
+-- Events the WebSocket recorded that the webhook never even delivered.
+SELECT count(*) FROM activity a
+ WHERE a.source = 'live' AND a.block_time > now() - interval '7 days'
+   AND NOT EXISTS (SELECT 1 FROM webhook_inbox w WHERE w.signature = a.signature);
+
+-- And the queue's own health: a pending count that only grows means the drain
+-- is behind, or stuck behind a poison row.
+SELECT count(*) FILTER (WHERE processed_at IS NULL) AS pending,
+       count(*) FILTER (WHERE last_error IS NOT NULL) AS gave_up
+  FROM webhook_inbox;
+```
+
+`webhook_inbox::coverage()` is the same thing in Rust. Retention must outlast the
+evaluation window — pruning processed rows early deletes the evidence.
+
+Cutover is then `INGEST_TRANSPORTS=webhook`, with no code change. Expect
+`ownership_dirty` to rise *after* the cutover rather than during the dual run
+(the WebSocket was winning the races and hiding the reordering) and to be drained
+by the sweep; if it rises and does not drain, `RECONCILE_INTERVAL_SECS` comes
+down.
+
 ### Is the ingester alive? — the runbook
 
-It binds no port, so it has no healthcheck, no domain and no `/metrics`; a
-Railway deploy goes Active the moment the container starts, whether or not the
-pipeline is ingesting anything. Silence in the logs is normal — a healthy
-ingester prints nothing between subscribing and the next hourly sweep. So
-"alive" is a question you answer from the database, not from the process:
+Since the webhook transport it binds `$PORT`, so it has `/health` and a domain —
+but that only proves the *process* is up. `/health` is liveness-only by design
+(no DB ping, so a Postgres blip cannot block a cutover), and it says nothing
+about whether either transport is ingesting. Silence in the logs is normal too:
+a healthy ingester prints nothing between subscribing and the next sweep. So
+"alive" is still a question you answer from the database, not from the process:
 
 ```sh
 railway status                                   # → "- ingester: ● Online"
