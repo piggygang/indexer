@@ -232,7 +232,7 @@ async fn apply(
     }
     // Read BEFORE the state it stamps, so it stays a conservative lower bound
     // on the observation — exactly as `assets.owner_slot` documents.
-    let slot = das.get_slot().await.context("getSlot")? as i64;
+    let slot = das.get_slot().await.context("getSlot")?;
     for (collection_id, inputs) in by_collection {
         let mut tx = pool.begin().await?;
         report.updated += assets::apply_state(&mut tx, collection_id, slot, &inputs).await?;
