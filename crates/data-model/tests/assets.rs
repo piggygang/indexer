@@ -541,3 +541,210 @@ async fn backfill_leaves_ownership_history_empty(pool: PgPool) {
 async fn analyze_runs(pool: PgPool) {
     assets::analyze_after_backfill(&pool).await.unwrap();
 }
+
+#[sqlx::test(migrations = "./migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn apply_state_moves_ownership_and_touches_nothing_else(pool: PgPool) {
+    // The hazard this writer exists for: `upsert_batch` writes `name`, `symbol`
+    // and `metadata_uri` unconditionally, so a state-only caller that reached
+    // for it would blank the operator's re-hosted metadata on every asset it
+    // corrected. `apply_state` must move owner and burned and leave the rest
+    // exactly as it found it.
+    let collection_id = collection(&pool, "syn-state", &[]).await;
+    let address = pk(1);
+    let mut tx = pool.begin().await.unwrap();
+    assets::upsert_batch(
+        &mut tx,
+        collection_id,
+        100,
+        &[AssetInput {
+            address: address.clone(),
+            name: "Piggy #1".into(),
+            symbol: Some("PSG".into()),
+            metadata_uri: Some("https://example.invalid/1.json".into()),
+            metadata_source_uri: Some("https://rehosted.invalid/1.json".into()),
+            image_uri: Some("https://rehosted.invalid/1.png".into()),
+            burned: false,
+            owner: Some(pk(10)),
+            attributes: Some(vec![TraitInput {
+                trait_type: "Head".into(),
+                value: "Crown".into(),
+                position: 0,
+            }]),
+            document: None,
+        }],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let before = metadata(&pool, &address).await;
+    let traits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM asset_attributes aa JOIN assets a ON a.id = aa.asset_id \
+          WHERE a.address = $1",
+    )
+    .bind(&address)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(traits, 1);
+
+    // A newer observation moves the owner.
+    let mut tx = pool.begin().await.unwrap();
+    let moved = assets::apply_state(
+        &mut tx,
+        collection_id,
+        200,
+        &[assets::StateInput {
+            address: address.clone(),
+            owner: Some(pk(11)),
+            burned: false,
+        }],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(moved, 1);
+
+    let (owner, owner_slot, burned) = state_of(&pool, &address).await;
+    assert_eq!(owner.as_deref(), Some(pk(11).as_str()));
+    assert_eq!(owner_slot, Some(200));
+    assert!(!burned);
+    assert_eq!(
+        metadata(&pool, &address).await,
+        before,
+        "name, symbol and both URIs must be untouched"
+    );
+
+    // Re-running is a true no-op, so `--expect-unchanged` stays checkable.
+    let mut tx = pool.begin().await.unwrap();
+    let again = assets::apply_state(
+        &mut tx,
+        collection_id,
+        300,
+        &[assets::StateInput {
+            address: address.clone(),
+            owner: Some(pk(11)),
+            burned: false,
+        }],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(again, 0, "an unchanged row must not be written");
+
+    // A stale observation cannot walk the owner backwards.
+    let mut tx = pool.begin().await.unwrap();
+    assets::apply_state(
+        &mut tx,
+        collection_id,
+        150,
+        &[assets::StateInput {
+            address: address.clone(),
+            owner: Some(pk(12)),
+            burned: false,
+        }],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        state_of(&pool, &address).await.0.as_deref(),
+        Some(pk(11).as_str())
+    );
+
+    // `None` means DAS does not know, which never clears a stored owner.
+    let mut tx = pool.begin().await.unwrap();
+    assets::apply_state(
+        &mut tx,
+        collection_id,
+        400,
+        &[assets::StateInput {
+            address: address.clone(),
+            owner: None,
+            burned: false,
+        }],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        state_of(&pool, &address).await.0.as_deref(),
+        Some(pk(11).as_str())
+    );
+
+    // Burning is monotone, clears the owner, and still leaves metadata alone.
+    let mut tx = pool.begin().await.unwrap();
+    assets::apply_state(
+        &mut tx,
+        collection_id,
+        500,
+        &[assets::StateInput {
+            address: address.clone(),
+            owner: None,
+            burned: true,
+        }],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let (owner, owner_slot, burned) = state_of(&pool, &address).await;
+    assert!(burned && owner.is_none() && owner_slot.is_none());
+    assert_eq!(metadata(&pool, &address).await, before);
+
+    // An asset we do not have is not invented — discovering one is
+    // enumeration's job, and it needs the full input.
+    let mut tx = pool.begin().await.unwrap();
+    let created = assets::apply_state(
+        &mut tx,
+        collection_id,
+        600,
+        &[assets::StateInput {
+            address: pk(200),
+            owner: Some(pk(11)),
+            burned: false,
+        }],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(created, 0);
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM assets WHERE address = $1)")
+            .bind(pk(200))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(!exists, "apply_state must never insert");
+}
+
+/// The columns a state-only write must never touch.
+async fn metadata(
+    pool: &PgPool,
+    address: &str,
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    sqlx::query_as(
+        "SELECT name, symbol, metadata_uri, metadata_source_uri, image_uri \
+           FROM assets WHERE address = $1",
+    )
+    .bind(address)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Owner, its slot, and whether the asset is burned — the three columns
+/// `apply_state` is allowed to move.
+async fn state_of(pool: &PgPool, address: &str) -> (Option<String>, Option<i64>, bool) {
+    sqlx::query_as("SELECT owner, owner_slot, burned FROM assets WHERE address = $1")
+        .bind(address)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}

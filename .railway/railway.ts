@@ -126,9 +126,12 @@ export default defineRailway(() => {
       // exists `config plan` keeps reporting a pending change.
       HELIUS_API_KEY: preserve(),
       RUST_LOG: "info",
-      // One connection for the live writer, one for the concurrent reconciler,
-      // one spare.
-      DATABASE_MAX_CONNECTIONS: "3",
+      // One for the live writer, one for the reconcile the consumer spawns on
+      // `Connected`, one for the scheduler (tip probe or sweep — `run_job`
+      // runs one at a time), one for a Core mint's background attribute
+      // hydration, one spare. It was 3 while the on-connect reconcile was
+      // awaited inline and could not overlap anything; it can now.
+      DATABASE_MAX_CONNECTIONS: "5",
     },
   });
 

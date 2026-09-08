@@ -24,6 +24,11 @@ use crate::blocktime::BlockTimes;
 /// How long to keep asking DAS about a freshly minted Core asset before giving
 /// up on its attributes. DAS needs a moment to index a new mint, and the
 /// acceptance criterion allows 30 s.
+///
+/// This is spent in a spawned task, never on the caller's path — see
+/// [`Pipeline::spawn_hydrate`]. 26 s of `sleep` inside `handle` is 26 s the
+/// consumer is not reading its socket, on a transport that drops what it
+/// cannot deliver.
 const HYDRATE_BACKOFF_MS: [u64; 4] = [1_000, 3_000, 7_000, 15_000];
 
 pub struct Pipeline {
@@ -345,7 +350,7 @@ impl Pipeline {
                 }
                 // No ownership change: a metadata update. Refresh the row so
                 // the Explorer sees it, but write no activity.
-                self.upsert(&asset, stored.collection_id, slot).await?;
+                upsert(&self.pool, &asset, stored.collection_id, slot).await?;
                 Ok(None)
             }
             // Unknown asset: a new Core mint. Create the row first so the
@@ -357,85 +362,57 @@ impl Pipeline {
                 let Some(collection_id) = self.collection_id(&touch.collection).await? else {
                     return Ok(None);
                 };
-                let asset = self.hydrate(address, asset).await;
-                self.upsert(&asset, collection_id, slot).await?;
-                Ok(Some((
-                    address.to_string(),
-                    DecodedKind::Mint,
-                    None,
-                    asset.owner().map(str::to_string),
-                )))
-            }
-        }
-    }
-
-    /// Re-reads a fresh mint until DAS has its attributes, or the budget runs
-    /// out. A mint is visible on chain before DAS has indexed its metadata.
-    async fn hydrate(&self, address: &str, first: indexer_das::Asset) -> indexer_das::Asset {
-        if first.attributes().is_some_and(|a| !a.is_empty()) {
-            return first;
-        }
-        for delay in HYDRATE_BACKOFF_MS {
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            match self.das.get_asset_batch(&[address.to_string()]).await {
-                Ok(batch) => {
-                    if let Some(asset) = batch.found.into_iter().next() {
-                        if asset.attributes().is_some_and(|a| !a.is_empty()) {
-                            return asset;
-                        }
-                    }
+                let owner = asset.owner().map(str::to_string);
+                // Write what DAS gave us now and let the attributes catch up.
+                // The mint and its activity row must not wait on metadata
+                // indexing that has nothing to do with either.
+                upsert(&self.pool, &asset, collection_id, slot).await?;
+                if asset.attributes().is_none_or(|a| a.is_empty()) {
+                    self.spawn_hydrate(address.to_string(), collection_id, slot);
                 }
-                Err(error) => log::warn!("hydrating {address}: {error}"),
+                Ok(Some((address.to_string(), DecodedKind::Mint, None, owner)))
             }
         }
-        log::warn!("{address}: no attributes from DAS within the hydration budget");
-        first
     }
 
-    async fn upsert(
-        &self,
-        asset: &indexer_das::Asset,
-        collection_id: i32,
-        slot: i64,
-    ) -> anyhow::Result<()> {
-        let input = merge(asset, None);
-        let mut tx = self.pool.begin().await?;
-        let counts =
-            assets::upsert_batch(&mut tx, collection_id, slot, std::slice::from_ref(&input))
-                .await?;
-        tx.commit().await?;
-        self.rerank_after(collection_id, &counts).await;
-        Ok(())
-    }
-
-    /// Re-ranks the collection when the write that just committed invalidated
-    /// its ranks — a new Core mint, or a metadata update that moved attributes.
+    /// Keeps re-reading a fresh mint in the background until DAS has its
+    /// attributes, then rewrites the row.
     ///
-    /// `upsert_batch` already set `collections.rarity_dirty` transactionally,
-    /// so the scheduled drain would pick this up within a minute regardless.
-    /// Doing it here as well turns "a new Core mint triggers re-rank" from
-    /// eventually into immediately, at ~110 ms on a path that already spends
-    /// seconds in `hydrate` waiting for DAS to index the mint's metadata.
+    /// A mint is visible on chain before DAS has indexed its metadata, so the
+    /// first read routinely carries no attributes and the only remedy is to
+    /// wait. This used to wait inline, which meant up to 26 s inside `handle`
+    /// — 26 s during which the consumer read nothing from a socket that drops
+    /// what it cannot deliver, and 26 s before the mint appeared in the API at
+    /// all. The row and its activity are written from the first read now; only
+    /// the attributes arrive late, and the rank follows them.
     ///
-    /// **After the commit, never inside it**: the pass touches every asset row
-    /// of the collection, and holding those locks inside the live writer's
-    /// transaction would stall ingestion behind a bookkeeping job. A failure is
-    /// logged and dropped — the flag stands, and the drain is the backstop.
-    async fn rerank_after(&self, collection_id: i32, counts: &assets::BatchCounts) {
-        if counts.inserted == 0 && counts.attributes_written == 0 && counts.attributes_removed == 0
-        {
-            return;
-        }
-        match rarity::recompute(&self.pool, collection_id).await {
-            Ok(outcome) if outcome.changed > 0 => log::info!(
-                "rarity: collection {collection_id} re-ranked {} of {} asset(s), version {}",
-                outcome.changed,
-                outcome.ranked,
-                outcome.version
-            ),
-            Ok(_) => {}
-            Err(error) => log::warn!("rarity: collection {collection_id} not re-ranked: {error}"),
-        }
+    /// The task is stamped with the *mint's* slot, so `upsert_batch`'s
+    /// `owner_slot` guard makes a transfer that lands while it sleeps win —
+    /// late metadata can never resurrect a stale owner.
+    fn spawn_hydrate(&self, address: String, collection_id: i32, slot: i64) {
+        let pool = self.pool.clone();
+        let das = self.das.clone();
+        tokio::spawn(async move {
+            for delay in HYDRATE_BACKOFF_MS {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                match das.get_asset_batch(std::slice::from_ref(&address)).await {
+                    Ok(batch) => {
+                        let Some(asset) = batch.found.into_iter().next() else {
+                            continue;
+                        };
+                        if asset.attributes().is_none_or(|a| a.is_empty()) {
+                            continue;
+                        }
+                        if let Err(error) = upsert(&pool, &asset, collection_id, slot).await {
+                            log::warn!("hydrating {address}: {error:#}");
+                        }
+                        return;
+                    }
+                    Err(error) => log::warn!("hydrating {address}: {error}"),
+                }
+            }
+            log::warn!("{address}: no attributes from DAS within the hydration budget");
+        });
     }
 
     /// The registered collection with this address. Matching on the address
@@ -446,6 +423,55 @@ impl Pipeline {
             .into_iter()
             .find(|c| c.address.as_deref() == Some(address))
             .map(|c| c.id))
+    }
+}
+
+/// Writes one DAS asset through the shared batch writer.
+///
+/// A free function rather than a method: the background hydration outlives the
+/// borrow of `&self`, and both callers want exactly this.
+async fn upsert(
+    pool: &PgPool,
+    asset: &indexer_das::Asset,
+    collection_id: i32,
+    slot: i64,
+) -> anyhow::Result<()> {
+    let input = merge(asset, None);
+    let mut tx = pool.begin().await?;
+    let counts =
+        assets::upsert_batch(&mut tx, collection_id, slot, std::slice::from_ref(&input)).await?;
+    tx.commit().await?;
+    rerank_after(pool, collection_id, &counts).await;
+    Ok(())
+}
+
+/// Re-ranks the collection when the write that just committed invalidated
+/// its ranks — a new Core mint, or a metadata update that moved attributes.
+///
+/// `upsert_batch` already set `collections.rarity_dirty` transactionally,
+/// so the scheduled drain would pick this up within a minute regardless.
+/// Doing it here as well turns "a new Core mint triggers re-rank" from
+/// eventually into immediately, at ~110 ms — and since the hydration that
+/// supplies the attributes now runs in its own task, that cost is off the
+/// consumer's path too.
+///
+/// **After the commit, never inside it**: the pass touches every asset row
+/// of the collection, and holding those locks inside the live writer's
+/// transaction would stall ingestion behind a bookkeeping job. A failure is
+/// logged and dropped — the flag stands, and the drain is the backstop.
+async fn rerank_after(pool: &PgPool, collection_id: i32, counts: &assets::BatchCounts) {
+    if counts.inserted == 0 && counts.attributes_written == 0 && counts.attributes_removed == 0 {
+        return;
+    }
+    match rarity::recompute(pool, collection_id).await {
+        Ok(outcome) if outcome.changed > 0 => log::info!(
+            "rarity: collection {collection_id} re-ranked {} of {} asset(s), version {}",
+            outcome.changed,
+            outcome.ranked,
+            outcome.version
+        ),
+        Ok(_) => {}
+        Err(error) => log::warn!("rarity: collection {collection_id} not re-ranked: {error}"),
     }
 }
 

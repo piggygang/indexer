@@ -97,6 +97,12 @@ struct FakeHelius {
 }
 
 impl FakeHelius {
+    /// RPC calls served so far — how a test asserts that a cheap path really
+    /// was cheap.
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
+    }
+
     async fn bind() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -711,4 +717,127 @@ async fn a_timeline_that_contradicts_the_owner_is_swept_back_in(pool: PgPool) {
         .await
         .unwrap();
     assert!(again.is_noop());
+}
+
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn the_probe_corrects_a_stale_owner_without_reading_every_asset(pool: PgPool) {
+    // The tip probe's whole claim: find what moved with one query per
+    // collection filter instead of re-reading the collection. Same fake, same
+    // decoder, same writer as the sweep above — only the discovery is cheaper.
+    let (mint, other, stale, current) = (pk(1), pk(2), pk(10), pk(11));
+    let collection_id = allowlist_collection(&pool, &[mint.clone(), other.clone()]).await;
+    insert_asset(&pool, collection_id, &mint, &stale, 100).await;
+    insert_asset(&pool, collection_id, &other, &current, 100).await;
+
+    let mut fake = FakeHelius::bind().await;
+    fake.serve(Script {
+        slot: 1_000,
+        assets: BTreeMap::from([
+            (mint.clone(), das_asset(&mint, &current, false)),
+            // Already agrees — it must not become a correction.
+            (other.clone(), das_asset(&other, &current, false)),
+        ]),
+        signatures: BTreeMap::from([(
+            mint.clone(),
+            vec![
+                json!({"signature": sig(1), "slot": 500, "blockTime": 1_700_000_000, "err": null}),
+            ],
+        )]),
+        transactions: BTreeMap::from([(sig(1), transfer_tx(&mint, &stale, &current, 500))]),
+    });
+    let das = fake.client();
+    let pipeline = pipeline(&pool, &das);
+
+    let report = indexer_ingester::probe::run(&pool, &das, &pipeline)
+        .await
+        .unwrap();
+    report.log("test");
+
+    assert_eq!(report.targets, 1, "one verified creator, one query");
+    assert_eq!(report.tracked, 2);
+    assert_eq!(report.stale, 1, "only the asset that moved");
+    assert_eq!(report.updated, 1);
+    assert_eq!(
+        report.recovered_activity(),
+        1,
+        "and its timeline is rebuilt"
+    );
+
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner FROM assets WHERE address = $1")
+        .bind(&mint)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner.as_deref(), Some(current.as_str()));
+
+    // Recorded as reconciliation, not invented as live.
+    let source: String = sqlx::query_scalar("SELECT source FROM activity WHERE signature = $1")
+        .bind(sig(1))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source, "reconcile");
+
+    // The point of the probe: it did not enumerate the collection. One
+    // searchAssets, one getSlot, then the recovery walk for the single asset
+    // that moved — nowhere near a `getAssetBatch` sweep.
+    assert!(
+        fake.calls() <= 6,
+        "the probe must not read the whole collection: {} calls",
+        fake.calls()
+    );
+
+    // And a second pass corrects nothing.
+    let again = indexer_ingester::probe::run(&pool, &das, &pipeline)
+        .await
+        .unwrap();
+    assert!(again.is_noop(), "{again:?}");
+}
+
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn the_probe_stops_once_the_answers_stop_being_news(pool: PgPool) {
+    // `recent_action` is a tip, not a cursor: there is no "changed since"
+    // bound, so the walk stops after enough consecutive assets already agree
+    // rather than reading the page out. That bound is what keeps the probe at
+    // three calls and ~1 s, and it is also why the full sweep stays as the
+    // backstop — a change buried below the streak is the sweep's job. This
+    // pins the boundary so nobody deletes the sweep believing the probe is
+    // exhaustive.
+    use indexer_ingester::probe::{AGREE_STREAK, PAGE};
+
+    let mints: Vec<String> = (1..=AGREE_STREAK as u8 + 5).map(pk).collect();
+    let collection_id = allowlist_collection(&pool, &mints).await;
+    let owner = pk(11);
+    let mut assets = BTreeMap::new();
+    for mint in &mints {
+        insert_asset(&pool, collection_id, mint, &owner, 100).await;
+        assets.insert(mint.clone(), das_asset(mint, &owner, false));
+    }
+    assert!(
+        mints.len() < PAGE as usize,
+        "the page must not be the limit"
+    );
+
+    let mut fake = FakeHelius::bind().await;
+    fake.serve(Script {
+        slot: 1_000,
+        assets,
+        signatures: BTreeMap::new(),
+        transactions: BTreeMap::new(),
+    });
+    let das = fake.client();
+    let pipeline = pipeline(&pool, &das);
+
+    let report = indexer_ingester::probe::run(&pool, &das, &pipeline)
+        .await
+        .unwrap();
+    assert_eq!(report.stale, 0);
+    assert_eq!(
+        report.scanned, AGREE_STREAK,
+        "the walk stops at the streak instead of reading the page out"
+    );
+    assert!(report.scanned < mints.len(), "it really did stop early");
+    assert!(report.is_noop());
 }

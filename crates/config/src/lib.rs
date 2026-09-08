@@ -53,16 +53,31 @@ pub struct ReconcileConfig {
     /// `RECONCILE_DEEP_INTERVAL_SECS`, default 604800 (7 days). Supply,
     /// burned assets and attribute changes, through the DAS backfill.
     pub deep_interval_secs: u64,
-    /// `RECONCILE_RPS`, default 10 — the Helius Developer plan's limit. The
-    /// sweep shares a rate budget with the live path, so it is throttled where
-    /// the live consumer is not.
+    /// `RECONCILE_RPS`, default 10 — the DAS rate limit on the Helius
+    /// Developer plan, which is a *separate* bucket from RPC's 50/s. The sweep
+    /// shares a rate budget with the live path, so it is throttled where the
+    /// live consumer is not.
     pub rps: u32,
+    /// `RECONCILE_TIP_INTERVAL_SECS`, default 30. The tip probe: one
+    /// `searchAssets` per collection filter, newest-acted-on first, which
+    /// finds what moved without re-reading everything. Three calls and ~1.4 s
+    /// against the full sweep's 23 calls and ~35 s, which is what makes this
+    /// cadence affordable — roughly 2.6M credits a month, a quarter of the
+    /// plan. Zero disables it, leaving the full sweep as the only tier.
+    pub tip_interval_secs: u64,
 }
 
 impl ReconcileConfig {
-    /// Is the periodic schedule on at all?
+    /// Is the periodic full sweep on at all?
     pub fn enabled(&self) -> bool {
         self.interval_secs > 0
+    }
+
+    /// Is the tip probe on? Independent of the sweep: the probe needs no
+    /// cursor and no DAS enumeration, so disabling one must not disable the
+    /// other.
+    pub fn tip_enabled(&self) -> bool {
+        self.tip_interval_secs > 0
     }
 }
 
@@ -142,6 +157,7 @@ impl Config {
                 interval_secs: parsed_or("RECONCILE_INTERVAL_SECS", 3_600)?,
                 deep_interval_secs: parsed_or("RECONCILE_DEEP_INTERVAL_SECS", 604_800)?,
                 rps: parsed_or("RECONCILE_RPS", 10)?,
+                tip_interval_secs: parsed_or("RECONCILE_TIP_INTERVAL_SECS", 30)?,
             },
             rarity: RarityConfig {
                 interval_secs: parsed_or("RARITY_INTERVAL_SECS", 86_400)?,
@@ -175,7 +191,7 @@ where
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 10] = [
+    const KEYS: [&str; 11] = [
         "HOST",
         "PORT",
         "HELIUS_API_KEY",
@@ -186,6 +202,7 @@ mod tests {
         "RECONCILE_DEEP_INTERVAL_SECS",
         "RECONCILE_RPS",
         "RARITY_INTERVAL_SECS",
+        "RECONCILE_TIP_INTERVAL_SECS",
     ];
 
     fn clear() {
@@ -208,6 +225,8 @@ mod tests {
         assert_eq!(config.database.connect_timeout_secs, 5);
         assert_eq!(config.rarity.interval_secs, 86_400);
         assert!(config.rarity.enabled());
+        assert_eq!(config.reconcile.tip_interval_secs, 30);
+        assert!(config.reconcile.tip_enabled());
         assert!(config
             .database
             .required_url()

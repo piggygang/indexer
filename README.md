@@ -166,9 +166,10 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
+| `RECONCILE_TIP_INTERVAL_SECS` | no | `30` | ingester only: the tip probe — one `searchAssets` per collection filter, newest-acted-on first. This is the freshness knob; `0` disables it and leaves the hourly sweep as the only correction |
 | `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). `0` disables the schedule, leaving the on-`Connected` reconcile |
 | `RECONCILE_DEEP_INTERVAL_SECS` | no | `604800` | ingester only: the weekly deep pass — supply, burned assets, attribute changes |
-| `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling for the sweep, which shares the Helius budget with live ingestion |
+| `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling shared by the probe, the sweep and the on-`Connected` reconcile — one limiter for all three, because Helius meters DAS at 10 req/s on the Developer plan and two limiters set to 10 would ask for 20. The live writer is deliberately outside it |
 | `RARITY_INTERVAL_SECS` | no | `86400` | ingester only: backstop for the rarity drain (ALG-627). The dirty flag is the real trigger, so this only bounds how long a missed flag can sit; `0` disables the drain |
 
 ## Endpoints
@@ -890,6 +891,29 @@ invented. Measure the second one before relying on the timeline being complete;
 if coverage is short, ALG-624's periodic sweep is load-bearing rather than
 optional.
 
+**A fresh slot is not a missing slot.** The WebSocket notification carries no
+`blockTime` and `activity.block_time` is `NOT NULL`, so the live path resolves
+it with `getBlockTime` — and the stream delivers at `confirmed`, where a slot
+that new routinely answers *"Block not available for slot N"* simply because
+the block has not landed on the node that answered. Production lost a real
+transfer to exactly that on 2026-09-07: the event decoded, the block time did
+not resolve, the signature was parked and never written. A failure is now
+retried on a short backoff (400/900/2000 ms) before it is believed. Both halves
+are pinned by tests — one where the block lands on the third attempt and must
+be believed, one where it never lands and must still park rather than hang.
+Recovery is unaffected: `getSignaturesForAddress` carries `blockTime`, so that
+path seeds the cache and never calls `getBlockTime` at all.
+
+**A new Core mint's attributes arrive late, in their own task.** DAS indexes a
+mint's metadata a beat after the mint is visible on chain, so the first read
+routinely has no attributes and the only remedy is to wait. Waiting used to
+happen inline — up to 26 s inside `handle`, during which the consumer read
+nothing from a socket that drops what it cannot deliver, *and* 26 s before the
+mint appeared in the API at all. The row and its activity are now written from
+the first read and a spawned task fills the attributes in, stamped with the
+mint's slot so `upsert_batch`'s `owner_slot` guard lets a transfer that lands
+meanwhile win. Late metadata can never resurrect a stale owner.
+
 **Out-of-order events are flagged, not applied.** An event predating the
 asset's open interval — or one whose `from_owner` disagrees with it, which
 means an intermediate event was missed — is stored and sets
@@ -994,25 +1018,108 @@ would otherwise never reconcile at all.
 
 | | cadence | what it does |
 |---|---|---|
-| state sweep | `RECONCILE_INTERVAL_SECS`, default 3600 | `getAssetBatch` / `searchAssets` over every tracked asset → `upsert_batch`; assets that disagree get their signatures walked and replayed as `source = 'reconcile'`; Core departures flip `membership_status`; flagged assets get their intervals rebuilt |
+| tip probe | `RECONCILE_TIP_INTERVAL_SECS`, default 30 | one `searchAssets` per collection filter, sorted `recent_action` desc — *what changed*, rather than *everything, so we can find what changed*. Disagreeing assets get `apply_state` plus the same recovery walk |
+| state sweep | `RECONCILE_INTERVAL_SECS`, default 3600 | `getAssetBatch` / `searchAssets` over every tracked asset → `apply_state` (`upsert_batch` for assets it is discovering); assets that disagree get their signatures walked and replayed as `source = 'reconcile'`; Core departures flip `membership_status`; flagged assets get their intervals rebuilt |
 | deep pass | `RECONCILE_DEEP_INTERVAL_SECS`, default 604800 | the DAS backfill itself — supply, burned assets, attribute changes. It re-fetches only documents whose URI changed, so an unchanged collection issues zero HTTP |
 
-Measured on mainnet: a full sweep of 17 820 assets is ~20 DAS calls and about
-40 s, so hourly costs roughly 144k credits a month.
+### The tip probe: ask what changed
 
-### It is a spawned task, and its cadence is durable
+The sweep answers "what moved?" by reading all 17 820 assets — 23 DAS calls —
+to find the five that did. `searchAssets` with
+`sortBy: {sortBy: "recent_action", sortDirection: "desc"}` answers it directly.
+Measured against this catalogue on mainnet:
 
-Spawned rather than another arm of the consumer's `select!`: the `Connected`
-reconcile is `await`ed inline and stalls event handling for the length of a
-sweep, which is tolerable once at startup and not on a timer.
-`.railway/railway.ts` already budgeted the connection for it — *"one for the
-live writer, one for the concurrent reconciler, one spare"*.
+| | calls | wall clock |
+|---|---|---|
+| full sweep (`getAssetBatch` over all 17 820) | 23 | ~20 s local, ~40 s in production |
+| **tip probe** (`searchAssets`, newest-acted-on first) | **3** | **~1.4 s** |
+
+Three calls cover four collections: the probe derives its filters from the
+registry by `match`ing on `MembershipRule` — `core_collection` and
+`tm_collection` by their collection account, `tm_allowlist` by its verified
+creator, which is the only collection-wide handle a Token Metadata collection
+without a certified collection has — and deduplicates them, because Sol Gang
+and Girl Gang share a creator. No slugs, per the data-model rule.
+
+That is what makes a 30-second cadence affordable where an hourly full sweep
+was not: ~86k credits a day, ~26% of the Developer plan's monthly allowance.
+The interval is one env var if that share is uncomfortable — 60 s halves it.
+
+Two properties it leans on, and their limits:
+
+- **`recent_action` is a tip, not a cursor.** There is no "changed since"
+  bound and the order is not stable under concurrent activity, so the probe
+  reads one page and never pages through it. It stops after
+  `AGREE_STREAK` (20) consecutive assets that already agree; every
+  disagreement measured on mainnet sat inside the top 5, so that is roughly a
+  4× margin. The full sweep stays as the backstop rather than being deleted.
+- **It finds disagreements, not events.** An asset that left and came back
+  inside one interval agrees with DAS and stays invisible — exactly the limit
+  the sweep already has.
+
+An asset the probe surfaces that has never been crawled has no useful recovery
+floor, so it gets a full history walk; that is bounded at 5 per run, because it
+is the expensive case and the rest keep their corrected owner until the next
+run.
+
+### Everything that reconciles is a spawned task
+
+Spawned rather than another arm of the consumer's `select!`.  The `Connected`
+reconcile used to be `await`ed inline, which stalled event handling for the
+length of a sweep — on a transport with no replay, every event that arrived in
+that window was lost, which is the failure the reconcile exists to repair. A
+reconnect storm made it self-defeating. It now spawns, one at a time (a connect
+arriving while a sweep runs rides the one in flight), and the task is aborted if
+the consumer's run ends, so the supervisor can never leave two sweeping at once.
+Abandoning mid-run is safe for the same reason the scheduler's is: every step
+commits its own transaction and `finished_at` is written only on completion.
+`.railway/railway.ts` budgets the connections for it. That budget went from 3
+to **5** with this change: three things can now hold a connection at once (the
+live writer, the spawned reconcile, and the scheduler's probe or sweep), plus a
+Core mint's background attribute hydration, plus a spare. Changing it needs
+`railway config plan` then `apply` — a merge applies nothing.
 
 Due-ness lives in `backfill_state.finished_at`, not an in-memory timer, because
 the supervisor restarts the consumer with a backoff and a flapping ingester
 would otherwise either never reconcile or reconcile constantly. A job with no
 record is **seeded** as "finished now" rather than treated as due, so a fresh
 deploy does not kick off a full deep pass a minute after boot.
+
+### Where a sweep's time actually goes
+
+Every run records `enumerate_ms` / `write_ms` / `recover_ms` alongside
+`duration_ms`, because "the sweep is slow" is otherwise unanswerable after the
+fact — the state pass and the recovery walk have completely different cost
+drivers and only one of them is fixed by reading fewer assets. Same catalogue,
+same machine, before and after this change:
+
+| phase | before | after |
+|---|---|---|
+| enumerate (DAS) | ~40 s, 19 serial calls, one `getSlot` per collection | **4.3 s** — `buffer_unordered` at 6, one `getSlot` for the whole run |
+| write | included above, plus a read of all 17 820 metadata documents | **0.3 s** |
+| recover | — | 28.8 s |
+| **total** | **40.9 s** | **33.9 s** |
+
+The state pass is now ~4.6 s. What remains is the recovery walk, and it is
+**rate-bound, not slow**: ~275 `getSignaturesForAddress` + `getTransaction`
+calls at the 10 req/s DAS ceiling is ~28 s by arithmetic, and parallelising it
+would buy nothing. It is also no longer on any critical path — the sweep is
+spawned, and freshness comes from the 30-second probe.
+
+The read that disappeared is worth naming. The sweep used to load every stored
+metadata document each pass, purely so `merge` would not hand `upsert_batch` a
+`None` document and blank re-hosted metadata. `assets::apply_state` cannot touch
+those columns at all — it is a narrow `UPDATE` over owner, `owner_slot` and
+`burned`, with the same `owner_slot >` guard and the same no-op semantics — so
+for an asset we already know the question does not arise. Only assets the sweep
+is *discovering* still go through `merge` + `upsert_batch`, and those are rare
+enough that reading documents for just them costs nothing.
+
+**Do not reach for `upsert_batch` from a state-only caller.** It writes `name`,
+`symbol` and `metadata_uri` unconditionally (only `image_uri` and
+`metadata_source_uri` are coalesced), so a caller that never fetched a document
+would blank exactly the metadata the operator re-hosted. That is why
+`apply_state` exists.
 
 ### The drift metric
 
@@ -1100,6 +1207,24 @@ read by both — the discipline `owner_agrees` already states: the metric and th
 repair must not be able to drift apart. It deliberately excludes "has an owner
 and no history at all", which means *not crawled yet*, not *drift*.
 
+**The sweep cannot drain all of it, and the phase timings say so.** Measured
+locally against the real catalogue: 53 drifted assets, 236 signatures walked,
+222 transactions replayed, `recorded=0`, `recover_ms=28819`. Those assets are
+drifted precisely because the move that changed them is invisible from the mint
+address — a plain `spl-token` transfer between two existing token accounts names
+neither the mint nor a wallet — and `recover_asset` walks the mint. Expanding to
+the asset's token accounts is `crates/activity`'s job and always has been, so
+the repair is `backfill-activity`, not the sweep:
+
+```sh
+indexer-admin backfill-activity --drifted --limit 500
+```
+
+Folding drift into the sweep is still right for the subset the mint *can* see;
+it just means a standing backlog of escrow-era moves shows up as a sweep that
+spends its whole rate budget and reports `recorded=0`. `recover_ms` next to
+`corrections` is how you tell that apart from a sweep that is genuinely busy.
+
 ### Is the ingester alive? — the runbook
 
 It binds no port, so it has no healthcheck, no domain and no `/metrics`; a
@@ -1123,9 +1248,16 @@ SELECT (SELECT count(*) FROM integrity_owner_mismatch)     AS owner_mismatch,
        (SELECT count(*) FROM integrity_rarity_broken)      AS rarity_broken;
 
 -- What the last sweep actually did. `signatures = 0` with `candidates > 0` is
--- the shape of a recovery that is not recovering.
+-- the shape of a recovery that is not recovering; a large `recover_ms` with
+-- `recorded = 0` is the shape of a drift backlog the sweep cannot see.
 SELECT collection_id, progress, finished_at
   FROM backfill_state WHERE kind = 'reconcile' ORDER BY finished_at DESC;
+
+-- Is the fast path running? The probe is the freshness knob, so this is the
+-- one to watch after a deploy. `stale` is what it corrected.
+SELECT progress->>'scanned', progress->>'stale', progress->>'duration_ms',
+       finished_at
+  FROM backfill_state WHERE kind = 'reconcile_tip' ORDER BY finished_at DESC;
 ```
 
 Nothing alerts on any of this yet — ALG-628 owns that, and the predicates above
