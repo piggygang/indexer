@@ -51,6 +51,26 @@ enum Cmd {
         #[arg(long)]
         allow_identity_change: bool,
     },
+    /// Sync the Helius webhook's address list to the registry's tracked set.
+    ///
+    /// Manual, like `seed`, and for a sharper reason: every Helius webhook
+    /// mutation costs 100 credits and rewrites the whole list, so this lists
+    /// first, diffs, and writes nothing when nothing changed. It is also the
+    /// only way to register at all — the dashboard caps at 25 addresses.
+    Webhook {
+        /// Override `WEBHOOK_URL`.
+        #[arg(long)]
+        url: Option<String>,
+        /// Report the diff and call nothing. Costs no credits.
+        #[arg(long)]
+        dry_run: bool,
+        /// Fail when anything would change — the idempotency check.
+        #[arg(long)]
+        expect_unchanged: bool,
+        /// Delete the registered webhook instead of syncing it.
+        #[arg(long)]
+        delete: bool,
+    },
     /// DAS backfill: assets, attributes and owners (ALG-621). Idempotent —
     /// re-running an unchanged collection writes nothing and fetches nothing.
     Backfill {
@@ -369,6 +389,14 @@ async fn main() -> anyhow::Result<()> {
             {
                 bail!("activity backfill failed for {failed} (see backfill_state.last_error)");
             }
+        }
+        Cmd::Webhook {
+            url,
+            dry_run,
+            expect_unchanged,
+            delete,
+        } => {
+            webhook(&pool, &config, url, dry_run, expect_unchanged, delete).await?;
         }
         Cmd::Rarity {
             slug,
@@ -1002,5 +1030,160 @@ async fn bench(pool: &PgPool, options: BenchOptions) -> anyhow::Result<()> {
         );
     }
     println!("\nall scenarios under {} ms (p95)", options.max_ms);
+    Ok(())
+}
+
+/// Syncs the Helius webhook's `accountAddresses` to the registry's tracked set.
+///
+/// Three properties, all of them about not spending credits:
+///
+/// * **List first, always.** `GET /v0/webhooks` is free, and it is what tells
+///   us whether a webhook exists, what it holds, and — because a wrong
+///   `HELIUS_WEBHOOK_API` host fails right here — whether we are even talking
+///   to Helius. Nothing is written before it succeeds.
+/// * **A no-op writes nothing.** Every mutation costs 100 credits and rewrites
+///   the whole list, so an unchanged registry must cost zero. That is what
+///   makes this safe to run from a deploy script or a habit.
+/// * **The address set comes from `registry::tracked_addresses`**, the same
+///   function the WebSocket's subscription spec uses. A second derivation is
+///   how the registered list silently falls behind the registry — and a drifted
+///   webhook looks perfectly healthy while delivering nothing.
+async fn webhook(
+    pool: &PgPool,
+    config: &Config,
+    url: Option<String>,
+    dry_run: bool,
+    expect_unchanged: bool,
+    delete: bool,
+) -> anyhow::Result<()> {
+    use indexer_das::webhooks::{Diff, WebhookClient};
+
+    let api_key = config.helius.required_api_key()?;
+    let url = match url {
+        Some(url) => url,
+        None => config.helius.required_webhook_url()?.to_string(),
+    };
+    let client = WebhookClient::new(&config.helius.webhook_api, api_key)?;
+
+    let registered = client.list().await.with_context(|| {
+        format!(
+            "listing webhooks at {} — check HELIUS_WEBHOOK_API and HELIUS_API_KEY",
+            config.helius.webhook_api
+        )
+    })?;
+    // Matched by URL rather than by id: the id is Helius's, the URL is ours,
+    // and it is what a second environment would differ by.
+    let existing = registered.iter().find(|w| w.webhook_url == url);
+    println!(
+        "{} webhook(s) registered; {} for {url}",
+        registered.len(),
+        if existing.is_some() {
+            "one matches"
+        } else {
+            "none match"
+        }
+    );
+
+    if delete {
+        let Some(existing) = existing else {
+            println!("nothing to delete");
+            return Ok(());
+        };
+        if dry_run {
+            println!(
+                "dry run: would delete {} (100 credits)",
+                existing.webhook_id
+            );
+            return Ok(());
+        }
+        client.delete(&existing.webhook_id).await?;
+        println!("deleted {}", existing.webhook_id);
+        return Ok(());
+    }
+
+    let wanted = registry::tracked_addresses(pool).await?;
+    if wanted.is_empty() {
+        bail!("the registry tracks no addresses — run `seed` (and a backfill) first");
+    }
+    if wanted.len() > indexer_das::webhooks::MAX_ADDRESSES {
+        bail!(
+            "{} addresses exceeds Helius's limit of {}",
+            wanted.len(),
+            indexer_das::webhooks::MAX_ADDRESSES
+        );
+    }
+
+    let diff = match existing {
+        Some(existing) => Diff::between(existing, &url, &wanted),
+        // Nothing registered: everything is an addition.
+        None => Diff {
+            added: wanted.clone(),
+            removed: Vec::new(),
+            url_changed: true,
+            kept: 0,
+        },
+    };
+    println!(
+        "tracked={} registered={} +{} -{} kept={}{}",
+        wanted.len(),
+        existing.map_or(0, |w| w.account_addresses.len()),
+        diff.added.len(),
+        diff.removed.len(),
+        diff.kept,
+        if diff.url_changed { " url-changed" } else { "" }
+    );
+    for address in diff.added.iter().take(5) {
+        println!("  + {address}");
+    }
+    for address in diff.removed.iter().take(5) {
+        println!("  - {address}");
+    }
+
+    if diff.is_noop() {
+        println!("unchanged — no request made, no credits spent");
+        return Ok(());
+    }
+    if expect_unchanged {
+        bail!(
+            "--expect-unchanged: {} addition(s), {} removal(s){}",
+            diff.added.len(),
+            diff.removed.len(),
+            if diff.url_changed {
+                ", url changed"
+            } else {
+                ""
+            }
+        );
+    }
+    if dry_run {
+        println!(
+            "dry run: would write {} address(es) (100 credits)",
+            wanted.len()
+        );
+        return Ok(());
+    }
+
+    // The secret is written, never read back: Helius does not return it on
+    // every route, so the only way to be sure the registered value matches the
+    // one the receiver checks is to set it on every write.
+    let secret = config.helius.required_webhook_secret()?;
+    let result = match existing {
+        Some(existing) => {
+            client
+                .update(&existing.webhook_id, &url, &wanted, secret)
+                .await?
+        }
+        None => client.create(&url, &wanted, secret).await?,
+    };
+    println!(
+        "{} {} with {} address(es) (100 credits)",
+        if existing.is_some() {
+            "updated"
+        } else {
+            "created"
+        },
+        result.webhook_id,
+        wanted.len()
+    );
     Ok(())
 }

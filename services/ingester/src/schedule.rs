@@ -33,6 +33,7 @@ use indexer_data_model::{ingest_state, rarity, registry, PgPool};
 use serde_json::json;
 use tokio::sync::watch;
 
+use crate::consumer::Lane;
 use crate::pipeline::Pipeline;
 use crate::{probe, reconcile};
 
@@ -53,6 +54,9 @@ const TICK: Duration = Duration::from_secs(10);
 pub async fn run(
     pool: PgPool,
     das: DasClient,
+    // Whose cursor the sweep records as its `from_slot`: the reconciling lane,
+    // so the number in `backfill_state` names the transport it belongs to.
+    lane: Lane,
     config: ReconcileConfig,
     rarity_config: RarityConfig,
     mut shutdown: watch::Receiver<bool>,
@@ -132,7 +136,7 @@ pub async fn run(
                 }
                 if config.enabled()
                     && due(&pool, reconcile::KIND, sweep_every).await
-                    && !run_job("scheduled reconcile", sweep(&pool, &das), &mut shutdown).await
+                    && !run_job("scheduled reconcile", sweep(&pool, &das, lane), &mut shutdown).await
                 {
                     return;
                 }
@@ -233,7 +237,7 @@ async fn tip(pool: &PgPool, das: &DasClient) -> anyhow::Result<()> {
 }
 
 /// The hourly state sweep plus targeted activity recovery.
-async fn sweep(pool: &PgPool, das: &DasClient) -> anyhow::Result<()> {
+async fn sweep(pool: &PgPool, das: &DasClient, lane: Lane) -> anyhow::Result<()> {
     // Its own pipeline: the consumer owns its `DecodeContext` mutably, and a
     // fresh one also picks up registry changes without waiting for a restart.
     let pipeline = Pipeline::new(
@@ -242,7 +246,7 @@ async fn sweep(pool: &PgPool, das: &DasClient) -> anyhow::Result<()> {
         reconcile::context(pool).await?,
         "reconcile",
     );
-    let from = ingest_state::last_processed_slot(pool, crate::consumer::STREAM).await?;
+    let from = ingest_state::last_processed_slot(pool, lane.stream).await?;
     let report = reconcile::run(pool, das, &pipeline, from).await?;
     report.log("scheduled reconcile");
     Ok(())

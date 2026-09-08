@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use indexer_das::backfill::merge;
 use indexer_das::DasClient;
 use indexer_data_model::activity::{self, AssetRef, LiveEvent};
@@ -165,7 +165,19 @@ impl Pipeline {
 
         // Resolve the block time once per transaction. Without it no activity
         // row may be written at all, so the signature is parked instead.
-        let block_time = self.block_times.get(&self.das, slot).await;
+        //
+        // The payload's own `blockTime` wins when it has one — a
+        // `getTransaction` response and a webhook delivery both carry it, and
+        // believing them costs nothing and skips an RPC round trip. Only the
+        // WebSocket, which carries none, still pays for `getBlockTime`.
+        let block_time =
+            match decode::block_time(update).and_then(|secs| Utc.timestamp_opt(secs, 0).single()) {
+                Some(time) => {
+                    self.block_times.insert(slot, time).await;
+                    Some(time)
+                }
+                None => self.block_times.get(&self.das, slot).await,
+            };
         let Some(block_time) = block_time else {
             for asset in known.values() {
                 activity::park_signature(&self.pool, asset.id, &update.signature, slot, false)

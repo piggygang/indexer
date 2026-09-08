@@ -13,8 +13,18 @@ indexer-config = { workspace = true }
 indexer-das = { workspace = true }
 indexer-data-model = { workspace = true }
 indexer-ingest = { workspace = true, features = ["ws"] }
+# The webhook receiver. actix-web runs on the binary's existing multi-thread
+# tokio runtime (it branches on `Handle::try_current`), so `#[tokio::main]`
+# stays — `#[actix_web::main]` would move every background task in this service
+# onto a current-thread runtime. Adds no new crates: the api already pulls it.
+actix-web = { workspace = true }
+async-stream = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
+# Constant-time secret comparison. Already in the lock via digest/rustls, so
+# naming it directly costs nothing.
+sha2 = { workspace = true }
+subtle = { workspace = true }
 dotenv = { workspace = true }
 env_logger = { workspace = true }
 futures-util = { workspace = true }
@@ -26,6 +36,10 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
+actix-web = { workspace = true }
+futures-util = { workspace = true }
 bs58 = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
 sqlx = { workspace = true }
 tokio-tungstenite = { workspace = true }

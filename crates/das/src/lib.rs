@@ -15,6 +15,7 @@
 pub mod asset;
 pub mod backfill;
 pub mod client;
+pub mod webhooks;
 
 pub use asset::Asset;
 pub use backfill::{BackfillOptions, BackfillReport, BatchProgress, CollectionReport};

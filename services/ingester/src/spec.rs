@@ -1,14 +1,15 @@
 //! Registry → [`SubscriptionSpec`].
 //!
-//! Membership is decided by `match`ing on [`MembershipRule`], one arm per
-//! rule and never on a slug, so onboarding a collection stays a TOML change.
+//! Only the transport shaping lives here. *Which* addresses are tracked is
+//! `registry::tracked_addresses`, in `data-model`, because the Helius webhook's
+//! `accountAddresses` and the assertion that compares the two must derive the
+//! same set from the same code — a second copy is how address-list drift
+//! becomes real.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use anyhow::Context;
-use indexer_data_model::registry::CollectionRow;
 use indexer_data_model::types::MembershipRule;
-use indexer_data_model::{assets, registry, PgPool};
+use indexer_data_model::{registry, PgPool};
 use indexer_ingest::{Commitment, SubscriptionSpec, TransactionFilter};
 
 /// The single filter id. One filter rather than one per collection: a swap
@@ -19,42 +20,6 @@ pub const TRACKED: &str = "tracked";
 
 /// Helius's per-array limit; chunking above it keeps the spec compilable.
 const MAX_ADDRESSES: usize = indexer_ingest::ws::MAX_ADDRESSES;
-
-/// Every address the pipeline wants transactions for.
-pub async fn tracked_addresses(pool: &PgPool) -> anyhow::Result<Vec<String>> {
-    let mut addresses = BTreeSet::new();
-    for collection in registry::list_enabled(pool).await? {
-        addresses.extend(addresses_for(pool, &collection).await?);
-    }
-    Ok(addresses.into_iter().collect())
-}
-
-async fn addresses_for(pool: &PgPool, c: &CollectionRow) -> anyhow::Result<Vec<String>> {
-    let Some(rule) = c.membership_rule else {
-        return Ok(Vec::new());
-    };
-    match rule {
-        // The committed mint list, so the filter is correct even before the
-        // backfill has run.
-        MembershipRule::TmAllowlist => Ok(registry::allowlist(pool, c.id).await?),
-        // A certified collection mint never appears in a member's transfer, so
-        // the members themselves are the filter. New members are picked up by
-        // the next registry poll after a backfill adds them.
-        MembershipRule::TmCollection => Ok(assets::member_addresses(pool, c.id).await?),
-        // Metaplex Core passes the collection account on every member
-        // instruction, so this one address catches transfers *and mints of
-        // assets that do not exist yet* — which is why individual Core asset
-        // addresses never enter the filter, and why the address list only
-        // changes when the registry does.
-        MembershipRule::CoreCollection => {
-            let address = c
-                .address
-                .clone()
-                .with_context(|| format!("{} has rule {rule:?} but no address", c.slug))?;
-            Ok(vec![address])
-        }
-    }
-}
 
 /// Core collection addresses, for the decoder's structural recognition.
 pub async fn core_collections(pool: &PgPool) -> anyhow::Result<BTreeSet<String>> {
@@ -106,7 +71,7 @@ pub fn compile(addresses: Vec<String>) -> SubscriptionSpec {
 }
 
 pub async fn build(pool: &PgPool) -> anyhow::Result<SubscriptionSpec> {
-    Ok(compile(tracked_addresses(pool).await?))
+    Ok(compile(registry::tracked_addresses(pool).await?))
 }
 
 #[cfg(test)]
