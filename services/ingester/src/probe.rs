@@ -49,13 +49,27 @@ pub const PAGE: u32 = 100;
 /// not need.
 pub const AGREE_STREAK: usize = 20;
 
-/// Never-crawled assets given a full history walk per run.
+/// Never-crawled assets given a history walk per run.
 ///
 /// A probe hit with no recorded activity has no useful floor, so recovering it
-/// means walking its whole signature history — affordable for a handful,
-/// ruinous for thousands. The rest keep their corrected owner and wait for the
-/// next run.
+/// means walking its signature history — affordable for a handful, ruinous for
+/// thousands. The rest keep their corrected owner and wait for the next run.
 const MAX_DEEP_CRAWLS: usize = 5;
+
+/// Signatures one floorless walk may spend, per asset, per run.
+///
+/// Without a budget this is the probe's worst cost: `floor = 0` walks an
+/// asset's *entire* history at one `getTransaction` per signature, and if that
+/// history decodes to nothing — 2021-era escrow transfers name neither mint nor
+/// wallet — the asset still has no floor afterwards and is walked again in full
+/// on the next pass. 97.7% of tracked assets have no floor, so the eligible
+/// pool is effectively the whole catalogue.
+///
+/// 200 keeps a run's worst case at 5 × 200 = 1 000 signatures rather than
+/// unbounded. An asset that needs more than that needs
+/// `backfill-activity --address <mint>`, which expands to its token accounts;
+/// this path cannot resolve it however long it walks.
+const DEEP_CRAWL_BUDGET: u64 = 200;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
@@ -255,7 +269,14 @@ async fn apply(
             // will pick the timeline up.
             None => continue,
         };
-        match reconcile::recover_asset(pool, das, pipeline, stored, floor).await {
+        // A floorless walk is budgeted; a walk back to a known event is not,
+        // because it terminates at that event by construction.
+        let budget = if floor == 0 {
+            DEEP_CRAWL_BUDGET
+        } else {
+            u64::MAX
+        };
+        match reconcile::recover_asset_bounded(pool, das, pipeline, stored, floor, budget).await {
             Ok((_, outcome)) => report.activity.add(outcome),
             Err(error) => log::warn!("probe recovering {}: {error:#}", stored.address),
         }

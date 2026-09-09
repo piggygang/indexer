@@ -113,13 +113,19 @@ pub async fn put_backfill_state<'e>(
     Ok(())
 }
 
-/// When every collection last finished a pass of this `kind`.
+/// The oldest finish across enabled collections for this `kind`.
 ///
-/// `None` means at least one enabled collection has never finished one — a
-/// fresh database, a newly added collection, or a run that failed — and the
-/// caller should treat the job as due. Taking the **minimum** rather than the
-/// maximum is what makes a single lagging collection re-trigger the job
-/// instead of hiding behind its siblings.
+/// `None` means **no** enabled collection has ever finished one — a fresh
+/// database — and the caller should treat the job as due. Note the asymmetry:
+/// SQL's `min()` skips NULLs, so a *newly added* collection alongside
+/// already-finished ones does **not** force the job due; it waits out the
+/// current interval. That is acceptable because every job iterates all enabled
+/// collections when it does run, so the new one is picked up by the next
+/// ordinary pass rather than needing a special trigger.
+///
+/// Taking the minimum rather than the maximum still matters: a collection that
+/// is genuinely lagging — one whose record exists but is old — re-triggers the
+/// job instead of hiding behind fresher siblings.
 pub async fn last_finished<'e>(
     exec: impl PgExecutor<'e>,
     kind: &str,
@@ -151,6 +157,36 @@ pub async fn seed_schedule<'e>(exec: impl PgExecutor<'e>, kind: &str) -> sqlx::R
          ON CONFLICT (collection_id, kind) DO NOTHING",
     )
     .bind(kind)
+    .execute(exec)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Stamps a **failed** attempt so the scheduler backs the job off.
+///
+/// Without this a failing job is invisible to `due()`: the run returns early,
+/// `finished_at` keeps its old value, the job stays due, and the scheduler
+/// retries it on its next tick — which is seconds, not the configured interval.
+/// A dead Helius key turned that into 746 requests in 42 minutes, amplifying
+/// the hourly sweep 360× and the weekly deep pass 60,480×.
+///
+/// Deliberately writes only status/error/timestamps: `cursor` and `progress`
+/// keep the last *successful* run's values, so a failure annotates the row
+/// rather than erasing what the job last achieved.
+pub async fn record_failure<'e>(
+    exec: impl PgExecutor<'e>,
+    kind: &str,
+    error: &str,
+) -> sqlx::Result<u64> {
+    let done = sqlx::query(
+        "INSERT INTO backfill_state (collection_id, kind, status, last_error, started_at, finished_at) \
+         SELECT c.id, $1, 'failed', $2, now(), now() FROM collections c WHERE c.enabled \
+         ON CONFLICT (collection_id, kind) DO UPDATE \
+            SET status = 'failed', last_error = EXCLUDED.last_error, \
+                finished_at = now(), updated_at = now()",
+    )
+    .bind(kind)
+    .bind(error)
     .execute(exec)
     .await?;
     Ok(done.rows_affected())

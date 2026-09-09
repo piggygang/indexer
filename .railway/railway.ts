@@ -146,12 +146,18 @@ export default defineRailway(() => {
     env: {
       BIN: "indexer-ingester", // reaches the build only because the Dockerfile declares ARG BIN
       DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
-      // Both transports at once. They write through the same signature-keyed
-      // idempotent writer, so double delivery is a no-op — which is what makes
-      // the WebSocket's loss rate measurable instead of assumed. Retirement is
-      // this one value becoming "webhook"; the on-Connected reconcile follows
-      // it automatically.
-      INGEST_TRANSPORTS: "ws,webhook",
+      // Webhook only. The dual run was going to measure the WebSocket's loss
+      // rate — that rate turned out to be 100%: `transactionSubscribe` ACKed
+      // and then delivered nothing for its entire life (zero `source='live'`
+      // rows, ever, while `rootSubscribe` checkpointed happily on the same
+      // socket). There is nothing to compare against, and its reconnect loop
+      // was spawning a full ~480-credit reconcile per lap.
+      //
+      // The `ws` adapter stays in the tree: deleting it should wait until the
+      // webhook has actually delivered something, because right now neither
+      // transport has. `IngestConfig::reconciler()` moves the on-`Connected`
+      // reconcile to the webhook lane automatically.
+      INGEST_TRANSPORTS: "webhook",
       // The whole Authorization header Helius echoes back, and it must be set
       // in the dashboard **before** the apply that turns the webhook lane on,
       // not after: `serve()` calls `required_webhook_secret()?`, so the
@@ -184,7 +190,45 @@ export default defineRailway(() => {
     },
   });
 
+  // Reconciliation, on a cron rather than inside the ingester.
+  //
+  // Same image, same binary, one argument: `indexer-ingester reconcile` runs
+  // whatever `backfill_state` says is due and exits. Cadence still lives in the
+  // database, not in this schedule — the cron only decides how often to *ask*,
+  // so a tick with nothing due is a couple of cheap queries and an exit.
+  //
+  // Out of the ingester because a scheduler sharing a process with the live
+  // path inherits its lifecycle: a reconnect storm became a sweep storm, and a
+  // failing job retried on the process's tick instead of its own interval.
+  //
+  // No healthcheck and no domain — it binds no port, and an unset healthcheck
+  // is what lets a task that exits immediately count as a successful deploy.
+  const reconciler = service("reconciler", {
+    source: github(REPO, { branch: "main", checkSuites: true }),
+    build: {
+      builder: "DOCKERFILE",
+      dockerfilePath: "Dockerfile",
+      watchPatterns: ["services/ingester/**", ...COMMON],
+    },
+    // NOTE: `deploy.cronSchedule` is in the same block as the three fields
+    // `config apply` silently drops (see the top of this file). Verify with
+    // `config pull` after the first apply that it actually landed — a dropped
+    // schedule means this service runs once on deploy and then never again,
+    // which looks exactly like success.
+    deploy: { cronSchedule: "*/5 * * * *" },
+    start: "indexer-ingester reconcile",
+    replicas: { [REGION]: 1 },
+    env: {
+      BIN: "indexer-ingester",
+      DATABASE_URL: Postgres.env.DATABASE_URL,
+      HELIUS_API_KEY: preserve(),
+      RUST_LOG: "info",
+      // One at a time, and it exits between runs.
+      DATABASE_MAX_CONNECTIONS: "3",
+    },
+  });
+
   return project("Indexer", {
-    resources: [api, admin, ingester, Postgres, postgresVolume],
+    resources: [api, admin, ingester, reconciler, Postgres, postgresVolume],
   });
 });

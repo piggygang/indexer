@@ -77,15 +77,11 @@ pub async fn run(
     if !config.enabled() && !rarity_config.enabled() && !config.tip_enabled() {
         return;
     }
-    let tip_every = Duration::from_secs(config.tip_interval_secs);
-    let rarity_every = Duration::from_secs(rarity_config.interval_secs);
-    let sweep_every = Duration::from_secs(config.interval_secs);
-    let deep_every = Duration::from_secs(config.deep_interval_secs);
     log::info!(
         "tip probe every {}s, reconciling every {}s, deep pass every {}s, at {} rpc/s",
-        tip_every.as_secs(),
-        sweep_every.as_secs(),
-        deep_every.as_secs(),
+        config.tip_interval_secs,
+        config.interval_secs,
+        config.deep_interval_secs,
         config.rps
     );
 
@@ -111,44 +107,87 @@ pub async fn run(
             }
 
             _ = tick.tick() => {
-                // The rarity drain first, and every tick: the flag is the
-                // trigger, so a collection a writer touched is re-ranked on the
-                // next minute rather than at the interval. The interval is only
-                // the backstop for a flag that was somehow missed. It is also
-                // the cheapest job (~110 ms for everything) and needs no DAS,
-                // so it runs even when Helius is down.
-                if rarity_config.enabled()
-                    && !run_job("rarity drain", drain_rarity(&pool, rarity_every), &mut shutdown)
-                        .await
-                {
-                    return;
-                }
-                // The tip probe before the full sweep: it is 3 calls against
-                // 23 and answers the same question sooner. They share the DAS
-                // rate budget, and `run_job` runs one job at a time, so a
-                // sweep in progress simply delays the next probe by its own
-                // duration rather than competing with it.
-                if config.tip_enabled()
-                    && due(&pool, probe::KIND, tip_every).await
-                    && !run_job("tip probe", tip(&pool, &das), &mut shutdown).await
-                {
-                    return;
-                }
-                if config.enabled()
-                    && due(&pool, reconcile::KIND, sweep_every).await
-                    && !run_job("scheduled reconcile", sweep(&pool, &das, lane), &mut shutdown).await
-                {
-                    return;
-                }
-                if config.enabled()
-                    && due(&pool, reconcile::DEEP_KIND, deep_every).await
-                    && !run_job("deep reconcile", deep(&pool, &das), &mut shutdown).await
-                {
+                if !run_due(&pool, &das, lane, &config, &rarity_config, &mut shutdown).await {
                     return;
                 }
             }
         }
     }
+}
+
+/// One pass over the periodic jobs, running whatever is due.
+///
+/// Extracted so the cron entry point and the in-process loop cannot drift: the
+/// cadence lives in `backfill_state.finished_at`, and both callers read it
+/// through the same `due` predicate. Returns `false` if a shutdown interrupted
+/// a job, which is the caller's cue to stop.
+pub async fn run_due(
+    pool: &PgPool,
+    das: &DasClient,
+    lane: Lane,
+    config: &ReconcileConfig,
+    rarity_config: &RarityConfig,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    let tip_every = Duration::from_secs(config.tip_interval_secs);
+    let rarity_every = Duration::from_secs(rarity_config.interval_secs);
+    let sweep_every = Duration::from_secs(config.interval_secs);
+    let deep_every = Duration::from_secs(config.deep_interval_secs);
+
+    // The rarity drain first, and every pass: the flag is the trigger, so a
+    // collection a writer touched is re-ranked promptly rather than at the
+    // interval. The interval is only the backstop for a flag that was somehow
+    // missed. It is also the cheapest job (~110 ms for everything) and needs no
+    // DAS, so it runs even when Helius is down.
+    if rarity_config.enabled()
+        && !run_job(
+            pool,
+            "rarity drain",
+            RARITY_KIND,
+            drain_rarity(pool, rarity_every),
+            shutdown,
+        )
+        .await
+    {
+        return false;
+    }
+    // The tip probe before the full sweep: it is 3 calls against 23 and answers
+    // the same question sooner. They share the DAS rate budget, and `run_job`
+    // runs one job at a time, so a sweep in progress simply delays the next
+    // probe by its own duration rather than competing with it.
+    if config.tip_enabled()
+        && due(pool, probe::KIND, tip_every).await
+        && !run_job(pool, "tip probe", probe::KIND, tip(pool, das), shutdown).await
+    {
+        return false;
+    }
+    if config.enabled()
+        && due(pool, reconcile::KIND, sweep_every).await
+        && !run_job(
+            pool,
+            "scheduled reconcile",
+            reconcile::KIND,
+            sweep(pool, das, lane),
+            shutdown,
+        )
+        .await
+    {
+        return false;
+    }
+    if config.enabled()
+        && due(pool, reconcile::DEEP_KIND, deep_every).await
+        && !run_job(
+            pool,
+            "deep reconcile",
+            reconcile::DEEP_KIND,
+            deep(pool, das),
+            shutdown,
+        )
+        .await
+    {
+        return false;
+    }
+    true
 }
 
 /// Runs one job, abandoning it if the shutdown signal fires first.
@@ -161,7 +200,9 @@ pub async fn run(
 /// `backfill_state.finished_at` is only written when a run completes, so an
 /// abandoned job stays due.
 async fn run_job(
+    pool: &PgPool,
     label: &str,
+    kind: &str,
     job: impl std::future::Future<Output = anyhow::Result<()>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> bool {
@@ -179,6 +220,19 @@ async fn run_job(
         result = job => {
             if let Err(error) = result {
                 log::error!("{label} failed: {error:#}");
+                // Record the *attempt*, not just the failure. A job that ends
+                // early never reaches its own `put_backfill_state`, so without
+                // this its `finished_at` keeps an old value, `due` stays true,
+                // and the next tick runs it again — seconds later, not an hour.
+                // A dead API key turned that into 746 requests in 42 minutes.
+                //
+                // Abandonment (the arm above) deliberately does NOT record: a
+                // shutdown is not the job's failure, and the next process
+                // should find it still due.
+                if let Err(write) = ingest_state::record_failure(pool, kind, &format!("{error:#}")).await
+                {
+                    log::warn!("could not record the {kind} failure: {write}");
+                }
             }
             true
         }
@@ -193,7 +247,7 @@ async fn run_job(
 /// interval out instead of immediately. Startup is already covered by the
 /// reconcile the consumer runs on `Connected`; without the seed, a new
 /// deployment would also kick off a full deep pass a minute after boot.
-async fn due(pool: &PgPool, kind: &str, interval: Duration) -> bool {
+pub async fn due(pool: &PgPool, kind: &str, interval: Duration) -> bool {
     match ingest_state::last_finished(pool, kind).await {
         Ok(None) => {
             match ingest_state::seed_schedule(pool, kind).await {

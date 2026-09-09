@@ -669,13 +669,23 @@ fn archived_tx(row: &Value) -> Option<ArchivedTx> {
     })
 }
 
+/// Which failures are worth spending another metered request on.
+///
+/// **429 is deliberately absent.** Helius bills rejected requests, so retrying
+/// a rate-limit error multiplies the cost of every call by `max_attempts`
+/// exactly when the budget is already the problem — and the immediate retry is
+/// what earns the next 429. A caller that hits one should slow down, which the
+/// scheduler now does: a failed job records the attempt and backs off to its
+/// configured interval instead of trying again on the next tick.
+///
+/// It is also how a plan runs out of credits and then keeps spending: once
+/// exhausted, Helius answers `429 max usage reached`, and a retrying client
+/// turns every remaining call into four.
 fn is_retryable(error: &DasError) -> bool {
     match error {
         DasError::Transport(_) => true,
         DasError::Status { status, .. } => {
-            status.is_server_error()
-                || *status == StatusCode::TOO_MANY_REQUESTS
-                || *status == StatusCode::REQUEST_TIMEOUT
+            status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
         }
         DasError::Rpc { .. } | DasError::Decode { .. } | DasError::BatchTooLarge(_) => false,
     }
@@ -728,8 +738,13 @@ mod tests {
             status: StatusCode::from_u16(code).unwrap(),
         };
         assert!(is_retryable(&DasError::Transport("reset".into())));
-        assert!(is_retryable(&status(429)));
         assert!(is_retryable(&status(503)));
+        assert!(is_retryable(&status(408)));
+        // 429 is NOT retryable, on purpose: Helius meters rejected requests,
+        // so retrying a rate-limit error multiplies the bill by `max_attempts`
+        // exactly when the budget is the problem — and it is also how an
+        // exhausted plan ("429 max usage reached") keeps on spending.
+        assert!(!is_retryable(&status(429)));
         // The dead-host case: one request per asset, never four.
         assert!(!is_retryable(&status(404)));
         assert!(!is_retryable(&status(403)));

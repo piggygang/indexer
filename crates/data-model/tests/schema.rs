@@ -781,3 +781,90 @@ async fn attributes_cannot_cross_collections(pool: PgPool) {
     assert_eq!(counts.len(), 1);
     assert_eq!((counts[0].trait_type.as_str(), counts[0].count), ("Hat", 1));
 }
+
+/// The amplifier that turned a dead API key into 746 requests in 42 minutes.
+///
+/// A job that fails never reaches its own `put_backfill_state`, so without
+/// `record_failure` its `finished_at` keeps an old value, the scheduler's
+/// `due` predicate stays true, and the job runs again on the next tick —
+/// seconds later, not at its configured interval. For the hourly sweep that is
+/// a 360× amplification; for the weekly deep pass, 60,480×.
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_failed_job_stamps_its_schedule_so_it_backs_off(pool: PgPool) {
+    use indexer_data_model::ingest_state;
+
+    let creator = bs58::encode([7u8; 32]).into_string();
+    let id = insert_collection(
+        &pool,
+        "c",
+        Some("token_metadata"),
+        None,
+        Some(&creator),
+        true,
+    )
+    .await
+    .unwrap();
+
+    // No record at all: the job has never run, so there is nothing to back off
+    // from and `last_finished` must report "due".
+    assert_eq!(
+        ingest_state::last_finished(&pool, "reconcile")
+            .await
+            .unwrap(),
+        None
+    );
+
+    let rows = ingest_state::record_failure(&pool, "reconcile", "getSlot: HTTP 401")
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "one row per enabled collection");
+
+    // Now it reports a finish, which is what makes the interval apply. Without
+    // this the scheduler would retry on its next tick regardless of cadence.
+    let finished = ingest_state::last_finished(&pool, "reconcile")
+        .await
+        .unwrap()
+        .expect("a failed attempt still counts as an attempt");
+    assert!(
+        chrono::Utc::now()
+            .signed_duration_since(finished)
+            .num_seconds()
+            < 60
+    );
+
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM backfill_state WHERE collection_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "failed", "and the failure is visible in the table");
+    assert_eq!(error.as_deref(), Some("getSlot: HTTP 401"));
+
+    // A later success replaces it, so a recovered job is not stuck looking
+    // failed — and `cursor`/`progress` are left alone by the failure path, so a
+    // failure annotates the row rather than erasing what the job last achieved.
+    let state = ingest_state::BackfillState {
+        collection_id: id,
+        kind: "reconcile".to_string(),
+        status: "done".to_string(),
+        cursor: serde_json::json!({"mode": "reconcile"}),
+        progress: serde_json::json!({"corrections": 0}),
+        last_error: None,
+        started_at: Some(chrono::Utc::now()),
+        finished_at: Some(chrono::Utc::now()),
+        updated_at: chrono::Utc::now(),
+    };
+    ingest_state::put_backfill_state(&pool, &state)
+        .await
+        .unwrap();
+    let (status, error): (String, Option<String>) =
+        sqlx::query_as("SELECT status, last_error FROM backfill_state WHERE collection_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "done");
+    assert_eq!(error, None);
+}

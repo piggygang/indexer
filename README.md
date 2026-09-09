@@ -171,7 +171,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `WEBHOOK_URL` | `admin webhook` | — | the public HTTPS endpoint to register. Registration only — the receiver never reads it |
 | `HELIUS_WEBHOOK_API` | no | `https://api-mainnet.helius-rpc.com` | the management API host. Configurable because Helius's docs and their own SDK disagree on it |
 | `WEBHOOK_POLL_MS` / `WEBHOOK_BATCH` / `WEBHOOK_LEASE_SECS` / `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_GRACE_SECS` / `WEBHOOK_RETAIN_DAYS` | no | `1000` / `50` / `60` / `5` / `120` / `30` | drain pacing. `RETAIN_DAYS` must outlast a dual-run evaluation window — `coverage()` reads those rows |
-| `RECONCILE_TIP_INTERVAL_SECS` | no | `30` | ingester only: the tip probe — one `searchAssets` per collection filter, newest-acted-on first. This is the freshness knob; `0` disables it and leaves the hourly sweep as the only correction |
+| `RECONCILE_TIP_INTERVAL_SECS` | no | `300` | ingester only: the tip probe — one `searchAssets` per collection filter, newest-acted-on first. the freshness knob **and the largest line on the Helius bill** — 3 DAS calls at 10 credits each, so 30 s cost 2.6M credits/month and 300 s costs 263k. `0` disables it |
 | `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). `0` disables the schedule, leaving the on-`Connected` reconcile |
 | `RECONCILE_DEEP_INTERVAL_SECS` | no | `604800` | ingester only: the weekly deep pass — supply, burned assets, attribute changes |
 | `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling shared by the probe, the sweep and the on-`Connected` reconcile — one limiter for all three, because Helius meters DAS at 10 req/s on the Developer plan and two limiters set to 10 would ask for 20. The live writer is deliberately outside it |
@@ -355,6 +355,7 @@ builds the Dockerfile → `/health` must return 200 → traffic cutover. Rollbac
 |---|---|---|---|---|
 | `api` | `indexer-api` (default `BIN`) | image `CMD` | `/health`, 120 s | serves traffic |
 | `admin` | `indexer-admin` (`BIN=indexer-admin`) | idles — see below | none | a container to `railway ssh` into and run `migrate` / `seed` against Postgres over the private network |
+| `reconciler` | `indexer-ingester reconcile` (`BIN=indexer-ingester`) | cron `*/5 * * * *` | none — exits | the periodic jobs, out of the ingester's process: runs whatever `backfill_state` says is due, then exits |
 | `ingester` | `indexer-ingester` (`BIN=indexer-ingester`) | image `CMD` | `/health`, 120 s | the ALG-623 live pipeline **and** the Helius webhook endpoint: one long-lived `transactionSubscribe`, `POST /webhooks/helius`, and the drain that turns both into ownership and activity |
 
 **Deployment contract:** the Dockerfile builds workspace binary
@@ -1054,7 +1055,7 @@ would otherwise never reconcile at all.
 
 | | cadence | what it does |
 |---|---|---|
-| tip probe | `RECONCILE_TIP_INTERVAL_SECS`, default 30 | one `searchAssets` per collection filter, sorted `recent_action` desc — *what changed*, rather than *everything, so we can find what changed*. Disagreeing assets get `apply_state` plus the same recovery walk |
+| tip probe | `RECONCILE_TIP_INTERVAL_SECS`, default 300 | one `searchAssets` per collection filter, sorted `recent_action` desc — *what changed*, rather than *everything, so we can find what changed*. Disagreeing assets get `apply_state` plus the same recovery walk |
 | state sweep | `RECONCILE_INTERVAL_SECS`, default 3600 | `getAssetBatch` / `searchAssets` over every tracked asset → `apply_state` (`upsert_batch` for assets it is discovering); assets that disagree get their signatures walked and replayed as `source = 'reconcile'`; Core departures flip `membership_status`; flagged assets get their intervals rebuilt |
 | deep pass | `RECONCILE_DEEP_INTERVAL_SECS`, default 604800 | the DAS backfill itself — supply, burned assets, attribute changes. It re-fetches only documents whose URI changed, so an unchanged collection issues zero HTTP |
 
@@ -1097,6 +1098,76 @@ An asset the probe surfaces that has never been crawled has no useful recovery
 floor, so it gets a full history walk; that is bounded at 5 per run, because it
 is the expensive case and the rest keep their corrected owner until the next
 run.
+
+### What it costs, and the two amplifiers that made it cost more
+
+Helius meters DAS at **10 credits a call** and plain RPC at 1, so the shape of the
+bill is not the shape of the code. At the defaults:
+
+| job | per run | runs/day | credits/day |
+|---|---|---|---|
+| tip probe | 3 × `searchAssets` = 30 | 288 | 8,640 |
+| state sweep | ~480 (18 `getAssetBatch` + ~289 RPC) | 24 | 11,520 |
+| deep pass | ~209 | 0.14 | 30 |
+
+~20k/day, about 6% of a 10M-credit month. The probe at its **old** 30-second
+cadence was 86,400/day on its own — 2.6M a month, a quarter of the plan — because
+three cheap-looking calls every 30 seconds is 8,640 DAS calls a day. It was sized
+on the assumption that the WebSocket carried the live traffic and the probe only
+had to catch its gaps.
+
+Two amplifiers turned that into a runaway bill, and both had the same root cause:
+**a job whose last attempt was not recorded looks perpetually due.**
+
+- **A failing job retried on the tick, not on its interval.** `tip()` and
+  `sweep()` returned early on error, never reaching their own
+  `put_backfill_state`, so `finished_at` kept an old value and `due` stayed true.
+  With `TICK` at 10 s that is a 360× amplification of the hourly sweep and
+  60,480× of the weekly deep pass. A dead API key produced **746 requests in 42
+  minutes**. `run_job` now calls `ingest_state::record_failure`, which stamps
+  `status = 'failed'` and `finished_at` so the interval applies — and makes the
+  failure visible in the table instead of only in the logs.
+- **The on-`Connected` reconcile was ungated.** Every connect spawned a full
+  ~480-credit sweep, throttled only by "one at a time". A socket that connects,
+  delivers nothing and times out bills a sweep per lap; the logs showed restart
+  **#369**. It now asks the same `schedule::due` question every scheduled job
+  asks.
+
+Both are pinned by `services/ingester/tests/cadence.rs`. A third change belongs
+with them: **429 is no longer retried** (`crates/das/src/client.rs`). Helius bills
+rejected requests, so retrying a rate-limit error multiplied every call by
+`max_attempts` exactly when the budget was the problem — and an exhausted plan
+answers `429 max usage reached`, so a retrying client keeps spending after the
+credits are gone.
+
+To see where credits actually went, ask Helius rather than inferring:
+
+```sh
+curl -H "X-Api-Key: $HELIUS_API_KEY" \
+  https://admin-api.helius.xyz/v0/admin/projects/<id>/usage
+```
+
+It breaks down `credits{rpc, das, archival, laserstreamWebsocket, webhooks, …}`
+and `dataTransfer{}`. WebSocket streaming is billed **per byte** — 2 credits per
+0.1 MB, so 10M credits is 500 GB/month — which is why `rootSubscribe` at 2.5
+messages a second costs about 13k credits a month and is never the problem.
+
+### Reconciliation runs on a cron, not in the ingester
+
+The `reconciler` service is the same image and the same binary with one argument:
+`indexer-ingester reconcile` runs whatever is due and exits. Cadence still lives
+in `backfill_state.finished_at`, so the cron only decides how often to *ask* —
+`schedule::run_due` is shared by both callers and a tick with nothing due is a
+couple of queries and an exit.
+
+It left the ingester because a scheduler sharing a process with the live path
+inherits its lifecycle: that is how a reconnect storm became a sweep storm.
+
+**Verify `cronSchedule` actually landed.** It sits in the same `deploy` block as
+the three fields `config apply` silently drops, so after the first apply run
+`railway config pull` and confirm it survived — a dropped schedule means the
+service runs once on deploy and then never again, which looks exactly like
+success.
 
 ### Everything that reconciles is a spawned task
 

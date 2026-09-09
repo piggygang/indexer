@@ -15,7 +15,7 @@ use indexer_ingest::{IngestEvent, IngestSource, ResumeFrom, StreamStatus, Subscr
 use tokio::sync::watch;
 
 use crate::pipeline::{Outcome, Pipeline};
-use crate::{reconcile, spec};
+use crate::{reconcile, schedule, spec};
 
 /// The durable identity of one transport.
 ///
@@ -72,6 +72,15 @@ pub struct Consumer {
     /// transport moves the reconcile with no second variable to forget. Two
     /// lanes reconciling would ask Helius for twice `RECONCILE_RPS`.
     pub reconcile_das: Option<DasClient>,
+    /// The floor between two on-`Connected` reconciles.
+    ///
+    /// Without it a reconnect storm is a sweep storm: `Connected` fires per
+    /// reconnect, each sweep is ~480 Helius credits, and nothing else throttles
+    /// it — "one at a time" only serialises them. A socket that connects,
+    /// delivers nothing and times out can bill more than the entire scheduled
+    /// workload. Gated on the same `backfill_state` cadence every scheduled job
+    /// uses, so a connect that arrives inside the window is a no-op.
+    pub reconcile_every: Duration,
     pub source: Arc<dyn IngestSource>,
     pub lane: Lane,
 }
@@ -228,6 +237,14 @@ impl Consumer {
                             if let Some(das) = &self.reconcile_das {
                                 if reconciling.in_flight() {
                                     log::info!("reconcile already in flight; this connect rides it");
+                                } else if !schedule::due(
+                                    &self.pool,
+                                    reconcile::KIND,
+                                    self.reconcile_every,
+                                )
+                                .await
+                                {
+                                    log::debug!("reconciled recently; this connect skips it");
                                 } else {
                                     stats.reconciles += 1;
                                     reconciling.0 = Some(tokio::spawn(reconcile_once(

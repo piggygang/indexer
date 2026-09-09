@@ -631,6 +631,32 @@ pub(crate) async fn recover_asset(
     asset: &AssetRef,
     floor: i64,
 ) -> anyhow::Result<(u64, Outcome)> {
+    recover_asset_bounded(pool, das, pipeline, asset, floor, u64::MAX).await
+}
+
+/// As [`recover_asset`], but refusing to walk more than `budget` signatures.
+///
+/// The floorless case needs this. An asset with no `last_activity_slot` gets
+/// `floor = 0`, which means "walk the entire history" — and if that history
+/// decodes to nothing (2021-era escrow transfers name neither mint nor wallet,
+/// so `activity::record` writes no row), the asset *still* has no floor
+/// afterwards and is walked again in full on the very next pass. At one
+/// `getTransaction` per signature, on a 30-second cadence, that is an unbounded
+/// bill for an asset that can never converge.
+///
+/// The budget makes each attempt cost a bounded amount and lets the caller
+/// decide how much archaeology a live path may do. Genuinely completing such an
+/// asset's timeline is `indexer-admin backfill-activity`'s job — it expands to
+/// the asset's token accounts, which is the only thing that can actually
+/// resolve those transfers.
+pub(crate) async fn recover_asset_bounded(
+    pool: &PgPool,
+    das: &DasClient,
+    pipeline: &Pipeline,
+    asset: &AssetRef,
+    floor: i64,
+    budget: u64,
+) -> anyhow::Result<(u64, Outcome)> {
     let mut before: Option<String> = None;
     let mut seen = 0u64;
     let mut outcome = Outcome::default();
@@ -646,6 +672,15 @@ pub(crate) async fn recover_asset(
 
         for info in &page {
             if info.slot <= floor {
+                return Ok((seen, outcome));
+            }
+            if seen >= budget {
+                log::info!(
+                    "{}: stopping at the {budget}-signature budget; \
+                     run `backfill-activity --address {}` for the full history",
+                    asset.address,
+                    asset.address
+                );
                 return Ok((seen, outcome));
             }
             seen += 1;

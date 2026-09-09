@@ -135,12 +135,19 @@ pub struct ReconcileConfig {
     /// shares a rate budget with the live path, so it is throttled where the
     /// live consumer is not.
     pub rps: u32,
-    /// `RECONCILE_TIP_INTERVAL_SECS`, default 30. The tip probe: one
+    /// `RECONCILE_TIP_INTERVAL_SECS`, default 300. The tip probe: one
     /// `searchAssets` per collection filter, newest-acted-on first, which
     /// finds what moved without re-reading everything. Three calls and ~1.4 s
-    /// against the full sweep's 23 calls and ~35 s, which is what makes this
-    /// cadence affordable — roughly 2.6M credits a month, a quarter of the
-    /// plan. Zero disables it, leaving the full sweep as the only tier.
+    /// against the full sweep's 23 calls and ~35 s. Zero disables it, leaving
+    /// the full sweep as the only tier.
+    ///
+    /// **This was 30 s and it cost a quarter of the plan.** DAS is 10 credits a
+    /// call, so 3 calls every 30 s is 8 640 calls and 86 400 credits a day —
+    /// 2.6M a month. It was sized on the assumption that the WebSocket carried
+    /// the live traffic and the probe only had to catch its gaps; the WebSocket
+    /// in fact delivered nothing, so the probe was doing all the work at the
+    /// cadence of a gap-filler. 300 s costs 263k a month for a worst-case
+    /// staleness of five minutes.
     pub tip_interval_secs: u64,
 }
 
@@ -277,7 +284,7 @@ impl Config {
                 interval_secs: parsed_or("RECONCILE_INTERVAL_SECS", 3_600)?,
                 deep_interval_secs: parsed_or("RECONCILE_DEEP_INTERVAL_SECS", 604_800)?,
                 rps: parsed_or("RECONCILE_RPS", 10)?,
-                tip_interval_secs: parsed_or("RECONCILE_TIP_INTERVAL_SECS", 30)?,
+                tip_interval_secs: parsed_or("RECONCILE_TIP_INTERVAL_SECS", 300)?,
             },
             rarity: RarityConfig {
                 interval_secs: parsed_or("RARITY_INTERVAL_SECS", 86_400)?,
@@ -375,7 +382,7 @@ mod tests {
         assert_eq!(config.database.connect_timeout_secs, 5);
         assert_eq!(config.rarity.interval_secs, 86_400);
         assert!(config.rarity.enabled());
-        assert_eq!(config.reconcile.tip_interval_secs, 30);
+        assert_eq!(config.reconcile.tip_interval_secs, 300);
         assert!(config.reconcile.tip_enabled());
         assert_eq!(config.helius.webhook_secret, None);
         assert_eq!(config.helius.webhook_url, None);

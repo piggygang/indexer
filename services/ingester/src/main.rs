@@ -33,10 +33,26 @@ use indexer_ingester::schedule;
 /// retries is a better answer than an unbounded queue.
 const WRITE_QUEUE: usize = 64;
 
+/// The one-shot argument. No arguments is the daemon; `reconcile` runs whatever
+/// the schedule says is due and exits, which is what a Railway cron service
+/// needs — it starts the container on a schedule and requires it to exit.
+const RECONCILE_ONCE: &str = "reconcile";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+
+    // Deliberately not clap: one optional word, and pulling a parser into the
+    // ingester for it would be the tail wagging the dog. An unknown argument is
+    // an error rather than a silent daemon start — a cron service that quietly
+    // became a long-running process would never exit and never run again.
+    let mode = std::env::args().nth(1);
+    match mode.as_deref() {
+        None => {}
+        Some(RECONCILE_ONCE) => return reconcile_once().await,
+        Some(other) => anyhow::bail!("unknown argument '{other}' (expected none, or 'reconcile')"),
+    }
 
     let config = Config::try_from_env()?;
     let db = &config.database;
@@ -105,6 +121,7 @@ async fn main() -> anyhow::Result<()> {
             pool: pool.clone(),
             das: DasClient::new(api_key)?,
             reconcile_das: (reconciler == Some(Transport::Ws)).then(|| reconcile_das.clone()),
+            reconcile_every: Duration::from_secs(config.reconcile.interval_secs),
             source: Arc::new(HeliusWs::new(api_key)),
             lane: consumer::WS,
         });
@@ -114,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
             pool: pool.clone(),
             das: DasClient::new(api_key)?,
             reconcile_das: (reconciler == Some(Transport::Webhook)).then(|| reconcile_das.clone()),
+            reconcile_every: Duration::from_secs(config.reconcile.interval_secs),
             source: Arc::new(WebhookInbox::new(
                 pool.clone(),
                 // Its own budget: a burst of deliveries must not consume the
@@ -201,4 +219,50 @@ fn serve(
             log::error!("webhook receiver stopped: {error}");
         }
     }))
+}
+
+/// Runs every due periodic job once, then exits — the cron entry point.
+///
+/// Shares `schedule::run_due` with the in-process loop, so the cadence lives in
+/// `backfill_state.finished_at` and cannot drift between the two callers. A
+/// cron tick that arrives while nothing is due is a few cheap queries and an
+/// immediate exit, which is what makes a short cron schedule affordable.
+async fn reconcile_once() -> anyhow::Result<()> {
+    let config = Config::try_from_env()?;
+    let db = &config.database;
+    let pool = indexer_data_model::connect_with_retry(
+        db.required_url()?,
+        db.max_connections,
+        Duration::from_secs(db.connect_timeout_secs),
+        Duration::from_secs(60),
+    )
+    .await?;
+    // Deliberately no `migrate` here: a cron job racing a deploy's migration is
+    // a lock contention no one asked for, and the api and the ingester both
+    // migrate at boot already.
+    let das =
+        DasClient::new(config.helius.required_api_key()?)?.with_rate_limit(config.reconcile.rps);
+    // Whichever lane owns the reconcile owns the `from_slot` this records.
+    let lane = match config.ingest.reconciler() {
+        Some(Transport::Webhook) => consumer::WEBHOOK,
+        _ => consumer::WS,
+    };
+
+    let mut shutdown = consumer::shutdown_signal();
+    let started = std::time::Instant::now();
+    let completed = schedule::run_due(
+        &pool,
+        &das,
+        lane,
+        &config.reconcile,
+        &config.rarity,
+        &mut shutdown,
+    )
+    .await;
+    log::info!(
+        "reconcile pass {} in {:?}",
+        if completed { "finished" } else { "abandoned" },
+        started.elapsed()
+    );
+    Ok(())
 }
