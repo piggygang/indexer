@@ -93,4 +93,12 @@ pub enum StreamStatus {
     },
     /// A live [`crate::SubscriptionSpec`] change was applied.
     Resubscribed,
+    /// The transport is alive and found nothing to report.
+    ///
+    /// Liveness only: it claims no slot and must never advance a cursor. It
+    /// exists for poll-based sources, where "nothing arrived" and "the source
+    /// is dead" are otherwise the same silence — a consumer watchdog that
+    /// resets only on [`IngestEvent::SlotCheckpoint`] cannot tell them apart
+    /// and restarts a healthy stream forever.
+    Idle,
 }

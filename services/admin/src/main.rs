@@ -133,13 +133,21 @@ enum Cmd {
         #[arg(long, default_value_t = 4)]
         concurrency: usize,
         /// Archival RPC calls per second. The Helius Developer plan allows 10.
+        ///
+        /// It paces REQUESTS and is not a spend limit. Every request here is
+        /// `getTransactionsForAddress`, billed at a 10-credit minimum, so
+        /// `--rps 10` is up to 100 credits a second — 360k an hour.
         #[arg(long, default_value_t = 10)]
         rps: u32,
         /// Venue registry: marketplace program id -> label.
         #[arg(long, default_value = "config/marketplaces.toml")]
         marketplaces: PathBuf,
-        /// Throw away each asset's derived rows and re-derive them. The raw
-        /// signatures survive, so this re-fetches nothing it already has.
+        /// Throw away each asset's derived rows and re-derive them.
+        ///
+        /// COSTS A FULL CRAWL. The stored signatures survive, but nothing
+        /// reads them back: the archival crawl runs in full first and the
+        /// re-derivation happens afterwards, inside the write. Budget it like
+        /// a fresh run. `--reprice-only` is the genuinely network-free mode.
         #[arg(long)]
         reclassify: bool,
         /// Database-only: promote stored transfers to sales using the current

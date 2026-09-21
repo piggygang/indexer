@@ -38,6 +38,24 @@ pub enum DasError {
     BatchTooLarge(usize),
 }
 
+impl DasError {
+    /// Was this a rate limit or a spent plan?
+    ///
+    /// Distinct from "retryable" on purpose. Retrying a 429 is what makes a
+    /// budget problem worse, so [`is_retryable`] says no — but a caller that
+    /// can *wait* rather than fail needs to tell "slow down" apart from
+    /// "definitively absent", and the two are the same `Err` otherwise. The
+    /// webhook drain defers a row instead of burning one of its attempts on
+    /// it; `fetch_document` returns the error instead of reporting a document
+    /// that exists as missing.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(
+            self,
+            DasError::Status { status, .. } if *status == StatusCode::TOO_MANY_REQUESTS
+        )
+    }
+}
+
 /// What one `getAssetBatch` produced. Assets are matched **by id**, never by
 /// position — DAS is under no obligation to preserve request order.
 #[derive(Debug, Default)]
@@ -585,6 +603,14 @@ impl DasClient {
                 Err(e) => DasError::Transport(e.to_string()),
             };
 
+            // `Ok(None)` is load-bearing: it means "the host answered
+            // definitively that this is not there", which reaches
+            // `upsert_batch` as `attributes: Some(vec![])` and DELETES the
+            // asset's stored attributes. A throttled gateway has answered
+            // nothing of the kind, so it must surface as an error.
+            if error.is_rate_limited() {
+                return Err(error);
+            }
             if !is_retryable(&error) {
                 return Ok(None);
             }
@@ -669,13 +695,20 @@ fn archived_tx(row: &Value) -> Option<ArchivedTx> {
     })
 }
 
+/// Retryable means "the same request might succeed next time, and asking again
+/// is worth what it costs".
+///
+/// **429 is deliberately absent.** Helius bills rejected requests, so retrying
+/// a rate-limit answer multiplied every call by `max_attempts` at exactly the
+/// moment the budget was the constraint — and an exhausted plan answers `429`
+/// to everything, so a retrying client keeps spending after the credits are
+/// gone. Callers that can do something better than fail — wait, defer a queued
+/// row — ask [`DasError::is_rate_limited`] instead.
 fn is_retryable(error: &DasError) -> bool {
     match error {
         DasError::Transport(_) => true,
         DasError::Status { status, .. } => {
-            status.is_server_error()
-                || *status == StatusCode::TOO_MANY_REQUESTS
-                || *status == StatusCode::REQUEST_TIMEOUT
+            status.is_server_error() || *status == StatusCode::REQUEST_TIMEOUT
         }
         DasError::Rpc { .. } | DasError::Decode { .. } | DasError::BatchTooLarge(_) => false,
     }
@@ -728,8 +761,13 @@ mod tests {
             status: StatusCode::from_u16(code).unwrap(),
         };
         assert!(is_retryable(&DasError::Transport("reset".into())));
-        assert!(is_retryable(&status(429)));
         assert!(is_retryable(&status(503)));
+        // Helius bills rejected requests, so a retried 429 spends four credits
+        // to learn the same thing once. Callers branch on `is_rate_limited`.
+        assert!(!is_retryable(&status(429)));
+        assert!(status(429).is_rate_limited());
+        assert!(!status(503).is_rate_limited());
+        assert!(!DasError::Transport("reset".into()).is_rate_limited());
         // The dead-host case: one request per asset, never four.
         assert!(!is_retryable(&status(404)));
         assert!(!is_retryable(&status(403)));

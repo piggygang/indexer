@@ -61,44 +61,22 @@ const WATCHDOG: Duration = Duration::from_secs(300);
 pub struct Consumer {
     pub pool: PgPool,
     pub das: DasClient,
-    /// The client the spawned reconcile uses — rate-limited, and the **same
-    /// instance** `schedule::run` holds so the two share one budget rather than
-    /// two. The live `das` above stays unthrottled: it is the half that cannot
-    /// wait.
+    /// Told, on every `Connected`, that a transport just (re)connected and a
+    /// gap may exist.
     ///
-    /// `None` on every lane but one. An `Option` rather than a flag because a
-    /// flag and a client can disagree and an absent client cannot — and which
-    /// lane holds it is *derived* (`IngestConfig::reconciler`), so retiring a
-    /// transport moves the reconcile with no second variable to forget. Two
-    /// lanes reconciling would ask Helius for twice `RECONCILE_RPS`.
-    pub reconcile_das: Option<DasClient>,
+    /// This consumer no longer *runs* a reconcile. It used to spawn one on
+    /// every connect, gated by nothing but "one at a time", so a socket that
+    /// connects, delivers nothing and times out on the 90 s idle timeout billed
+    /// a full catalogue sweep per lap. The scheduler owns the sweep now and
+    /// answers the same due-ness question every other job answers, which means
+    /// a reconnect storm costs one sweep per interval instead of one per
+    /// connect.
+    ///
+    /// Every lane nudges; there is one scheduler per process, so there is no
+    /// double-budget risk to derive around.
+    pub nudge: Arc<tokio::sync::Notify>,
     pub source: Arc<dyn IngestSource>,
     pub lane: Lane,
-}
-
-/// The on-`Connected` reconcile, owned by the consumer's run so it cannot
-/// outlive it.
-///
-/// Abandoning a sweep in flight is safe for the same reason `schedule::run_job`
-/// abandons one: every step commits its own transaction, and `finished_at` is
-/// written only on completion, so the next run picks up from the same state.
-/// What is *not* safe is leaving one running while the supervisor starts a
-/// fresh consumer — hence the `Drop`.
-#[derive(Default)]
-struct Reconciling(Option<tokio::task::JoinHandle<()>>);
-
-impl Reconciling {
-    fn in_flight(&self) -> bool {
-        self.0.as_ref().is_some_and(|handle| !handle.is_finished())
-    }
-}
-
-impl Drop for Reconciling {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            handle.abort();
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -106,7 +84,10 @@ pub struct Stats {
     pub events: u64,
     pub outcome: Outcome,
     pub reconnects: u64,
-    pub reconciles: u64,
+    /// Connects that asked the scheduler to look at its work, not sweeps run.
+    /// A high number here with a flat `reconcile` cadence is the healthy shape:
+    /// it means the gate held.
+    pub nudges: u64,
 }
 
 impl Consumer {
@@ -137,7 +118,6 @@ impl Consumer {
         );
 
         let mut stats = Stats::default();
-        let mut reconciling = Reconciling::default();
         let mut pending_checkpoint: Option<u64> = None;
         let mut last_checkpoint_write = Instant::now();
         let mut last_progress = Instant::now();
@@ -176,7 +156,7 @@ impl Consumer {
                     if last_progress.elapsed() > WATCHDOG {
                         anyhow::bail!(
                             "no checkpoint in {}s — exiting so the restart policy reconnects \
-                             and reconciles",
+                             and the reconnect nudges the schedule",
                             last_progress.elapsed().as_secs()
                         );
                     }
@@ -211,32 +191,18 @@ impl Consumer {
                             }
                         }
                         IngestEvent::Status(StreamStatus::Connected) => {
-                            // Reconcile on EVERY connect, so cold start, crash
-                            // restart and mid-run reconnect are one path.
-                            //
-                            // Spawned, not awaited. A sweep takes tens of
-                            // seconds, and awaiting it here meant the consumer
-                            // stopped reading the socket for exactly as long —
-                            // on a transport with no replay, every event that
-                            // arrived in that window was lost, which is the
-                            // failure this reconcile exists to repair. A
-                            // reconnect storm is the worst case and the one
-                            // that made it self-defeating.
+                            // Tell the scheduler a transport connected; do not
+                            // reconcile here. Cold start, crash restart and
+                            // mid-run reconnect are still one path — it is just
+                            // a path that now asks the same due-ness question
+                            // every scheduled job asks, so a socket that
+                            // connects, delivers nothing and times out every
+                            // 90 s no longer bills a full catalogue sweep per
+                            // lap. What a connect buys is a *lower* interval,
+                            // not an exemption: see `schedule::RECONNECT_FLOOR`.
                             last_progress = Instant::now();
-                            // Only the reconciling lane, so a dual run does not
-                            // double the DAS budget.
-                            if let Some(das) = &self.reconcile_das {
-                                if reconciling.in_flight() {
-                                    log::info!("reconcile already in flight; this connect rides it");
-                                } else {
-                                    stats.reconciles += 1;
-                                    reconciling.0 = Some(tokio::spawn(reconcile_once(
-                                        self.pool.clone(),
-                                        das.clone(),
-                                        self.lane.stream,
-                                    )));
-                                }
-                            }
+                            stats.nudges += 1;
+                            self.nudge.notify_one();
                         }
                         IngestEvent::Status(StreamStatus::Reconnecting { attempt }) => {
                             stats.reconnects += 1;
@@ -247,6 +213,12 @@ impl Consumer {
                         }
                         IngestEvent::Status(StreamStatus::Resubscribed) => {
                             log::info!("subscriptions updated without a reconnect");
+                        }
+                        IngestEvent::Status(StreamStatus::Idle) => {
+                            // A poll that succeeded and found nothing. Proof of
+                            // life, not progress: it feeds the watchdog and
+                            // touches no cursor.
+                            last_progress = Instant::now();
                         }
                         IngestEvent::Account(_) => {}
                     }
@@ -263,29 +235,6 @@ impl Consumer {
             ingest_state::checkpoint(&self.pool, self.lane.stream, slot).await?;
         }
         Ok(())
-    }
-}
-
-/// One reconcile, with its own pipeline and its own error handling.
-///
-/// A failure is logged rather than returned: this no longer runs on the
-/// consumer's path, so it has no consumer to take down, and every connect and
-/// every scheduled tick is another attempt. It builds a fresh `DecodeContext`
-/// for the same reason `schedule::sweep` does — the consumer owns its own
-/// mutably, and a fresh one picks up registry changes without a restart.
-async fn reconcile_once(pool: PgPool, das: DasClient, stream: &'static str) {
-    let context = match reconcile::context(&pool).await {
-        Ok(context) => context,
-        Err(error) => return log::error!("reconcile could not read the venue registry: {error:#}"),
-    };
-    let pipeline = Pipeline::new(pool.clone(), das.clone(), context, "reconcile");
-    let from = match ingest_state::last_processed_slot(&pool, stream).await {
-        Ok(from) => from,
-        Err(error) => return log::error!("reconcile could not read the cursor: {error:#}"),
-    };
-    match reconcile::run(&pool, &das, &pipeline, from).await {
-        Ok(report) => report.log("reconcile"),
-        Err(error) => log::error!("reconcile failed: {error:#}"),
     }
 }
 
@@ -309,7 +258,7 @@ pub async fn supervise(consumer: Consumer, mut shutdown: watch::Receiver<bool>) 
             Ok(stats) => {
                 log::info!(
                     "{} stopped: events={} recorded={} redelivered={} dirty={} \
-                     parked={} reconnects={} reconciles={}",
+                     parked={} reconnects={} nudges={}",
                     lane.stream,
                     stats.events,
                     stats.outcome.recorded,
@@ -317,7 +266,7 @@ pub async fn supervise(consumer: Consumer, mut shutdown: watch::Receiver<bool>) 
                     stats.outcome.dirty,
                     stats.outcome.parked,
                     stats.reconnects,
-                    stats.reconciles,
+                    stats.nudges,
                 );
             }
             Err(error) => log::error!("{} failed: {error:#}", lane.stream),

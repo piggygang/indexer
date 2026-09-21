@@ -52,15 +52,21 @@ async fn main() -> anyhow::Result<()> {
     log::info!("database migrated");
 
     let api_key = config.helius.required_api_key()?;
-    // One throttled client for everything that reconciles, built here and
-    // shared, so the scheduled sweep and the one a consumer spawns on
-    // `Connected` draw on a single rate budget instead of two. Helius meters
-    // DAS at 10 req/s on the Developer plan; two independent limiters set to
-    // that value would ask for 20.
+    // One throttled client for everything that reconciles. There is exactly
+    // one reconciling task in this process now — the schedule — so this is the
+    // whole reconcile budget rather than one share of it. Helius meters DAS at
+    // 10 req/s on the Developer plan; two independent limiters set to that
+    // value would ask for 20.
     let reconcile_das = DasClient::new(api_key)?.with_rate_limit(config.reconcile.rps);
     let shutdown = consumer::shutdown_signal();
 
-    // The lane that owns the on-`Connected` reconcile is derived, never
+    // Every consumer signals this on `Connected`; the schedule decides what to
+    // do about it. A connect no longer runs a sweep of its own — it lowers the
+    // sweep's interval to `schedule::RECONNECT_FLOOR`, which is what stops a
+    // reconnect storm from being a sweep storm.
+    let nudge = Arc::new(tokio::sync::Notify::new());
+
+    // Whose cursor a sweep records as its `from_slot`: derived, never
     // configured, so retiring a transport moves it automatically.
     let reconciler = config.ingest.reconciler();
     log::info!(
@@ -91,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         },
         config.reconcile.clone(),
         config.rarity.clone(),
+        nudge.clone(),
         shutdown.clone(),
     ));
 
@@ -104,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         lanes.push(Consumer {
             pool: pool.clone(),
             das: DasClient::new(api_key)?,
-            reconcile_das: (reconciler == Some(Transport::Ws)).then(|| reconcile_das.clone()),
+            nudge: nudge.clone(),
             source: Arc::new(HeliusWs::new(api_key)),
             lane: consumer::WS,
         });
@@ -113,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
         lanes.push(Consumer {
             pool: pool.clone(),
             das: DasClient::new(api_key)?,
-            reconcile_das: (reconciler == Some(Transport::Webhook)).then(|| reconcile_das.clone()),
+            nudge: nudge.clone(),
             source: Arc::new(WebhookInbox::new(
                 pool.clone(),
                 // Its own budget: a burst of deliveries must not consume the

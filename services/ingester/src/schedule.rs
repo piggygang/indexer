@@ -24,6 +24,7 @@
 //! the documents whose URI changed, and reports through the same
 //! `BatchCounts` this crate uses for corrections.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use indexer_config::{RarityConfig, ReconcileConfig};
@@ -31,7 +32,7 @@ use indexer_das::backfill::{self, BackfillOptions};
 use indexer_das::DasClient;
 use indexer_data_model::{ingest_state, rarity, registry, PgPool};
 use serde_json::json;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 
 use crate::consumer::Lane;
 use crate::pipeline::Pipeline;
@@ -46,6 +47,31 @@ use crate::{probe, reconcile};
 /// query per job.
 const TICK: Duration = Duration::from_secs(10);
 
+/// The shortest interval a *connect* can pull the state sweep forward to.
+///
+/// A connect is evidence a transport was away, and this transport has no
+/// replay, so it has to be able to bring the sweep forward — but it must not be
+/// an exemption. It used to be one: the consumer spawned a full catalogue sweep
+/// on every `Connected`, gated only by "one at a time", and a socket that
+/// connects, delivers nothing and times out on its 90 s idle timeout billed a
+/// sweep per lap. Lowering the interval instead of bypassing it bounds the
+/// worst case — a restart loop can cost at most one sweep per floor — and it
+/// keeps the decision in `backfill_state.finished_at`, so it survives the
+/// supervisor restarts that reset anything held in memory.
+///
+/// Short gaps do not need it: the tip probe runs far more often and answers
+/// exactly "what moved recently", which is what a short gap produces.
+const RECONNECT_FLOOR: Duration = Duration::from_secs(600);
+
+/// The four cadences one pass over the schedule honours.
+#[derive(Clone, Copy)]
+struct Intervals {
+    tip: Duration,
+    rarity: Duration,
+    sweep: Duration,
+    deep: Duration,
+}
+
 /// Runs the schedule until the shutdown signal fires.
 ///
 /// Errors are logged and the loop continues: a reconciliation that cannot
@@ -59,6 +85,9 @@ pub async fn run(
     lane: Lane,
     config: ReconcileConfig,
     rarity_config: RarityConfig,
+    // Signalled by every consumer on `Connected`. The schedule owns the sweep
+    // now, so a connect asks rather than acts — see [`RECONNECT_FLOOR`].
+    nudge: Arc<Notify>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     // Two independent schedules share one task. The early return is per
@@ -66,7 +95,12 @@ pub async fn run(
     // silently freeze ranks, which is a different subsystem with a different
     // knob.
     if !config.enabled() {
-        log::info!("periodic reconciliation disabled (RECONCILE_INTERVAL_SECS=0)");
+        // Now genuinely off: the sweep a consumer used to run on every connect
+        // is gone, so this is the only switch there is.
+        log::info!(
+            "state sweep and deep pass disabled (RECONCILE_INTERVAL_SECS=0); \
+             no reconcile runs on connect either"
+        );
     }
     if !rarity_config.enabled() {
         log::info!("periodic rarity drain disabled (RARITY_INTERVAL_SECS=0)");
@@ -77,15 +111,19 @@ pub async fn run(
     if !config.enabled() && !rarity_config.enabled() && !config.tip_enabled() {
         return;
     }
-    let tip_every = Duration::from_secs(config.tip_interval_secs);
-    let rarity_every = Duration::from_secs(rarity_config.interval_secs);
-    let sweep_every = Duration::from_secs(config.interval_secs);
-    let deep_every = Duration::from_secs(config.deep_interval_secs);
+    let every = Intervals {
+        tip: Duration::from_secs(config.tip_interval_secs),
+        rarity: Duration::from_secs(rarity_config.interval_secs),
+        sweep: Duration::from_secs(config.interval_secs),
+        deep: Duration::from_secs(config.deep_interval_secs),
+    };
     log::info!(
-        "tip probe every {}s, reconciling every {}s, deep pass every {}s, at {} rpc/s",
-        tip_every.as_secs(),
-        sweep_every.as_secs(),
-        deep_every.as_secs(),
+        "tip probe every {}s, reconciling every {}s (floor {}s on a connect), \
+         deep pass every {}s, at {} rpc/s",
+        every.tip.as_secs(),
+        every.sweep.as_secs(),
+        RECONNECT_FLOOR.as_secs(),
+        every.deep.as_secs(),
         config.rps
     );
 
@@ -95,8 +133,9 @@ pub async fn run(
     // for twice `config.rps`. Throttled at all because the live writer is not,
     // and this is the half that can wait.
     let mut tick = tokio::time::interval(TICK);
-    // `interval` fires immediately; the boot-time reconcile is the consumer's
-    // job on `Connected`, so the first scheduled run is one interval away.
+    // `interval` fires immediately; a boot-time reconcile arrives as the first
+    // consumer's `Connected` nudge, so the first scheduled run is one interval
+    // away.
     tick.tick().await;
 
     loop {
@@ -110,45 +149,82 @@ pub async fn run(
                 }
             }
 
+            // A transport connected. Same pass as a tick, with the sweep's
+            // interval pulled down to `RECONNECT_FLOOR` — a lower bar, never
+            // an exemption. Arms of one `select!` in one task, so a nudge
+            // arriving mid-job waits for it rather than racing it; that is the
+            // property the old `Reconciling::in_flight` flag was approximating.
+            _ = nudge.notified() => {
+                let mut every = every;
+                every.sweep = every.sweep.min(RECONNECT_FLOOR);
+                if !run_due(&pool, &das, lane, &config, &rarity_config, every, &mut shutdown).await
+                {
+                    return;
+                }
+            }
+
             _ = tick.tick() => {
-                // The rarity drain first, and every tick: the flag is the
-                // trigger, so a collection a writer touched is re-ranked on the
-                // next minute rather than at the interval. The interval is only
-                // the backstop for a flag that was somehow missed. It is also
-                // the cheapest job (~110 ms for everything) and needs no DAS,
-                // so it runs even when Helius is down.
-                if rarity_config.enabled()
-                    && !run_job("rarity drain", drain_rarity(&pool, rarity_every), &mut shutdown)
-                        .await
-                {
-                    return;
-                }
-                // The tip probe before the full sweep: it is 3 calls against
-                // 23 and answers the same question sooner. They share the DAS
-                // rate budget, and `run_job` runs one job at a time, so a
-                // sweep in progress simply delays the next probe by its own
-                // duration rather than competing with it.
-                if config.tip_enabled()
-                    && due(&pool, probe::KIND, tip_every).await
-                    && !run_job("tip probe", tip(&pool, &das), &mut shutdown).await
-                {
-                    return;
-                }
-                if config.enabled()
-                    && due(&pool, reconcile::KIND, sweep_every).await
-                    && !run_job("scheduled reconcile", sweep(&pool, &das, lane), &mut shutdown).await
-                {
-                    return;
-                }
-                if config.enabled()
-                    && due(&pool, reconcile::DEEP_KIND, deep_every).await
-                    && !run_job("deep reconcile", deep(&pool, &das), &mut shutdown).await
+                if !run_due(&pool, &das, lane, &config, &rarity_config, every, &mut shutdown).await
                 {
                     return;
                 }
             }
         }
     }
+}
+
+/// One pass over the schedule: runs whatever is due, cheapest first.
+///
+/// Returns `false` when a job was abandoned for shutdown, which is the caller's
+/// cue to stop.
+///
+/// Note what is *not* closed here: a job that fails never reaches its own
+/// `put_backfill_state`, so `finished_at` keeps its old value and the job stays
+/// due on the next tick. That is a re-fire amplifier of `interval / TICK`, and
+/// it is closed by recording the attempt at the *start* of a run rather than
+/// the end — a `job_run` claim, not a wider `due`.
+async fn run_due(
+    pool: &PgPool,
+    das: &DasClient,
+    lane: Lane,
+    config: &ReconcileConfig,
+    rarity_config: &RarityConfig,
+    every: Intervals,
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    // The rarity drain first, and every pass: the flag is the trigger, so a
+    // collection a writer touched is re-ranked promptly rather than at the
+    // interval. The interval is only the backstop for a flag that was somehow
+    // missed. It is also the cheapest job (~110 ms for everything) and needs no
+    // DAS, so it runs even when Helius is down.
+    if rarity_config.enabled()
+        && !run_job("rarity drain", drain_rarity(pool, every.rarity), shutdown).await
+    {
+        return false;
+    }
+    // The tip probe before the full sweep: it is 3 calls against 23 and answers
+    // the same question sooner. They share the DAS rate budget, and `run_job`
+    // runs one job at a time, so a sweep in progress simply delays the next
+    // probe by its own duration rather than competing with it.
+    if config.tip_enabled()
+        && due(pool, probe::KIND, every.tip).await
+        && !run_job("tip probe", tip(pool, das), shutdown).await
+    {
+        return false;
+    }
+    if config.enabled()
+        && due(pool, reconcile::KIND, every.sweep).await
+        && !run_job("scheduled reconcile", sweep(pool, das, lane), shutdown).await
+    {
+        return false;
+    }
+    if config.enabled()
+        && due(pool, reconcile::DEEP_KIND, every.deep).await
+        && !run_job("deep reconcile", deep(pool, das), shutdown).await
+    {
+        return false;
+    }
+    true
 }
 
 /// Runs one job, abandoning it if the shutdown signal fires first.
@@ -190,9 +266,10 @@ async fn run_job(
 ///
 /// A collection with no record of the job is seeded as "finished now" rather
 /// than treated as due, so the first run after a fresh deploy lands one
-/// interval out instead of immediately. Startup is already covered by the
-/// reconcile the consumer runs on `Connected`; without the seed, a new
-/// deployment would also kick off a full deep pass a minute after boot.
+/// interval out instead of immediately. Startup is covered by the first
+/// `Connected` nudge, which brings the sweep's interval down to
+/// [`RECONNECT_FLOOR`]; without the seed, a new deployment would also kick off
+/// a full deep pass a minute after boot.
 async fn due(pool: &PgPool, kind: &str, interval: Duration) -> bool {
     match ingest_state::last_finished(pool, kind).await {
         Ok(None) => {

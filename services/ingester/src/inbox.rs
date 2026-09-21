@@ -194,7 +194,23 @@ impl IngestSource for WebhookInbox {
                 rows.sort_by_key(|row| (row.slot, row.id));
                 let drained = !rows.is_empty();
 
+                // Set by the first 429 of the batch. Being throttled says
+                // nothing about any individual signature, so the rest of the
+                // batch is handed back untouched rather than each row spending
+                // one of its `WEBHOOK_MAX_ATTEMPTS` on a shared condition.
+                let mut throttled = false;
+                let mut deferred = 0usize;
+
                 for row in rows {
+                    if throttled {
+                        if let Err(error) =
+                            webhook_inbox::defer(&pool, row.id, "helius rate limited").await
+                        {
+                            log::warn!("deferring {}: {error}", row.signature);
+                        }
+                        deferred += 1;
+                        continue;
+                    }
                     if row.failed {
                         // The decoder drops failed transactions, so fetching one
                         // would spend a credit to learn nothing.
@@ -237,6 +253,20 @@ impl IngestSource for WebhookInbox {
                             )
                             .await;
                         }
+                        Err(error) if error.is_rate_limited() => {
+                            // Stop the batch here. Draining on through a rate
+                            // limit at one poll per second is how a throttled
+                            // drain retires a whole backlog of real events:
+                            // Helius gives up redelivering after about three
+                            // tries, so a row retired for this is lost.
+                            throttled = true;
+                            if let Err(e) =
+                                webhook_inbox::defer(&pool, row.id, &error.to_string()).await
+                            {
+                                log::warn!("deferring {}: {e}", row.signature);
+                            }
+                            deferred += 1;
+                        }
                         Err(error) => {
                             retire_or_retry(
                                 &pool,
@@ -249,12 +279,29 @@ impl IngestSource for WebhookInbox {
                     }
                 }
 
+                if throttled {
+                    log::warn!(
+                        "helius rate limited the webhook drain; deferred {deferred} \
+                         delivery(ies) with their attempt counts intact"
+                    );
+                }
+
                 if drained || last_beat.elapsed() >= HEARTBEAT {
-                    if let Some(slot) = checkpoint(&pool, grace, last_checkpoint, floor).await {
-                        last_checkpoint = Some(slot);
-                        yield Ok(IngestEvent::SlotCheckpoint(SlotCheckpoint {
-                            slot: slot as u64,
-                        }));
+                    match checkpoint(&pool, grace, last_checkpoint, floor).await {
+                        Some(slot) => {
+                            last_checkpoint = Some(slot);
+                            yield Ok(IngestEvent::SlotCheckpoint(SlotCheckpoint {
+                                slot: slot as u64,
+                            }));
+                        }
+                        // Nothing this stream can honestly claim yet: an empty
+                        // inbox on a database with no backfilled cursor, so the
+                        // floor is 0 and 0 is the one value this checkpoint may
+                        // never emit. The poll still succeeded, so the transport
+                        // is alive — say so, or the consumer's watchdog trips at
+                        // 300 s and the supervisor restarts a healthy lane every
+                        // five minutes forever.
+                        None => yield Ok(IngestEvent::Status(StreamStatus::Idle)),
                     }
                     last_beat = Instant::now();
                 }
@@ -270,8 +317,10 @@ impl IngestSource for WebhookInbox {
                     last_prune = Instant::now();
                 }
 
-                // A full batch means there is more waiting: keep draining.
-                if !full {
+                // A full batch means there is more waiting: keep draining —
+                // unless we were throttled, where the whole point is to stop
+                // asking for a moment.
+                if !full || throttled {
                     tokio::time::sleep(poll).await;
                 }
             }
@@ -327,9 +376,106 @@ async fn checkpoint(pool: &PgPool, grace: Duration, last: Option<i64>, floor: i6
         }
     };
     // `GREATEST` in the writer makes a lower value a no-op rather than a
-    // rewind, but emitting one would still be a false claim about this stream.
+    // rewind, but emitting one would still be a false claim about this stream —
+    // so a watermark *below* the last claim is dropped.
+    //
+    // An *equal* one is deliberately kept. The watermark is
+    // `least(min(pending slot) - 1, max(settled slot))`, which is a constant
+    // while nothing arrives, so suppressing it meant a quiet inbox emitted
+    // exactly one checkpoint ever. That starved the consumer's watchdog — which
+    // resets only on `SlotCheckpoint` and `Connected` — into restarting the
+    // process every five minutes, and every restart fires a full DAS sweep on
+    // `Connected`. Re-emitting is free: the writer's `GREATEST` makes it a
+    // no-op on `last_processed_slot`, and it keeps `ingest_state.updated_at`
+    // moving, which is the runbook's liveness signal.
     watermark
         .or(last)
         .or(Some(floor))
-        .filter(|slot| *slot > 0 && Some(*slot) != last)
+        .filter(|slot| *slot > 0 && *slot >= last.unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use indexer_data_model::webhook_inbox::Delivery;
+
+    /// In-module rather than in `tests/`, because the property worth pinning
+    /// is `checkpoint`'s own filter and that is private. Driving it through
+    /// the stream instead would mean waiting out a 60 s [`HEARTBEAT`] against
+    /// a 300 s watchdog — and simulated time is not available here, since
+    /// pausing the clock stalls the sqlx pool's own timers.
+    const NO_GRACE: Duration = Duration::ZERO;
+
+    fn sig(seed: u8) -> String {
+        bs58::encode([seed; 64]).into_string()
+    }
+
+    /// The regression, stated as a table.
+    ///
+    /// `watermark` is `least(min(pending slot) - 1, max(settled slot))`, which
+    /// is a **constant** while nothing arrives. The filter used to be
+    /// `Some(*slot) != last`, so a quiet inbox emitted exactly one checkpoint
+    /// ever, the consumer's watchdog — which resets only on `SlotCheckpoint`
+    /// and `Connected` — tripped at 300 s, and the restart's `Connected` fired
+    /// a full DAS sweep. Every five minutes, on a perfectly healthy stream.
+    #[sqlx::test(migrations = "../../crates/data-model/migrations")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_quiet_inbox_re_emits_its_checkpoint(pool: PgPool) {
+        // First heartbeat: nothing stored, so the resume floor stands.
+        assert_eq!(checkpoint(&pool, NO_GRACE, None, 500).await, Some(500));
+        // Every heartbeat after it. This is the one that used to return None.
+        assert_eq!(
+            checkpoint(&pool, NO_GRACE, Some(500), 500).await,
+            Some(500),
+            "an unchanged watermark is still a true claim, and it is what \
+             feeds the watchdog"
+        );
+    }
+
+    /// Equal is fine; *lower* is a false claim about this stream.
+    ///
+    /// The writer's `GREATEST` would discard it silently, which is precisely
+    /// why emitting it is worth refusing rather than tolerating.
+    #[sqlx::test(migrations = "../../crates/data-model/migrations")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn the_checkpoint_never_goes_backwards(pool: PgPool) {
+        // A late delivery lands below everything already claimed, dragging
+        // `min(pending) - 1` under the last emitted slot.
+        webhook_inbox::enqueue(
+            &pool,
+            &[Delivery {
+                signature: sig(7),
+                slot: 100,
+                block_time: None,
+                failed: false,
+                body: serde_json::json!({}),
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            checkpoint(&pool, NO_GRACE, Some(600), 500).await,
+            None,
+            "watermark 99 is below the last claim of 600"
+        );
+        assert_eq!(
+            checkpoint(&pool, NO_GRACE, Some(50), 0).await,
+            Some(99),
+            "and it is emitted when it genuinely advances"
+        );
+    }
+
+    /// A cold start against a database the backfill has never seeded.
+    ///
+    /// There is no slot to claim: the floor is 0, and 0 is the one value this
+    /// may never emit — a persisted zero makes `reconcile::seed_cursor` return
+    /// `Some(0)` and turns the sweep's fallback floor into a full archival
+    /// crawl. `None` is the caller's cue to emit `StreamStatus::Idle` instead,
+    /// so the transport still says it is alive.
+    #[sqlx::test(migrations = "../../crates/data-model/migrations")]
+    #[ignore = "needs DATABASE_URL"]
+    async fn a_floorless_cold_start_claims_nothing(pool: PgPool) {
+        assert_eq!(checkpoint(&pool, NO_GRACE, None, 0).await, None);
+    }
 }

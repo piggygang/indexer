@@ -142,6 +142,29 @@ pub async fn release<'e>(exec: impl PgExecutor<'e>, id: i64, error: &str) -> sql
     Ok(())
 }
 
+/// Releases a claim *and refunds the attempt*, for a failure that says nothing
+/// about the row.
+///
+/// [`release`] is for "this delivery failed": the `attempts` increment stands,
+/// so a row that only ever fails reaches the cap and retires. A rate limit is
+/// not that. Helius stops retrying a delivery after about three tries, so a
+/// row retired here is an event lost for good — and being throttled is the one
+/// failure guaranteed to hit every row in the batch equally, which would retire
+/// the whole backlog in `WEBHOOK_MAX_ATTEMPTS` polls. Refunding keeps the cap
+/// meaning "this signature is poison" rather than "Helius was busy".
+pub async fn defer<'e>(exec: impl PgExecutor<'e>, id: i64, error: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE webhook_inbox \
+         SET claimed_at = NULL, attempts = greatest(attempts - 1, 0), last_error = $2 \
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(error)
+    .execute(exec)
+    .await?;
+    Ok(())
+}
+
 /// The highest slot below which nothing is still pending, held back by a grace
 /// window to cover deliveries that have not arrived yet.
 ///
