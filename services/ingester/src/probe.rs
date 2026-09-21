@@ -57,6 +57,19 @@ pub const AGREE_STREAK: usize = 20;
 /// next run.
 const MAX_DEEP_CRAWLS: usize = 5;
 
+/// Signatures the whole run may walk, across every asset it recovers.
+///
+/// A per-asset cap is not a budget: five floorless walks at an unbounded
+/// length each is what made this probe's real cost roughly 30× the "3 calls,
+/// 30 credits" its cadence was sized on. One number for the run, spent in
+/// arrival order, is the thing that can actually be multiplied by the run rate
+/// to get a credits-per-day figure — at the default cadence this is the
+/// difference between a bounded ~200 extra credits a run and an unbounded one.
+///
+/// What it buys is a ceiling, not convergence: there is no resume cursor yet,
+/// so a truncated walk is repeated next run rather than continued.
+const RECOVER_BUDGET: u64 = 200;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Report {
     /// Distinct DAS queries issued — one per filter.
@@ -69,6 +82,11 @@ pub struct Report {
     pub stale: usize,
     /// Assets given a full history walk because they had no floor.
     pub deep_crawled: usize,
+    /// Signatures the recovery walked — the run's RPC cost, and the number
+    /// [`RECOVER_BUDGET`] caps.
+    pub signatures: u64,
+    /// The run stopped recovering because it hit [`RECOVER_BUDGET`].
+    pub budget_exhausted: bool,
     /// Rows whose owner or burned flag actually moved.
     pub updated: u64,
     pub activity: Outcome,
@@ -243,7 +261,14 @@ async fn apply(
     // with none has no floor at all, so it gets a full history crawl — bounded,
     // because that is the expensive case.
     let mut deep = 0usize;
+    let mut budget = RECOVER_BUDGET;
     for (stored, _) in stale {
+        if budget == 0 {
+            // Spent. Every remaining asset already has its owner corrected
+            // above; only the timeline waits, and the next run picks it up.
+            report.budget_exhausted = true;
+            break;
+        }
         let floor = match stored.last_activity_slot {
             Some(slot) => slot,
             None if deep < MAX_DEEP_CRAWLS => {
@@ -255,10 +280,20 @@ async fn apply(
             // will pick the timeline up.
             None => continue,
         };
-        match reconcile::recover_asset(pool, das, pipeline, stored, floor).await {
-            Ok((_, outcome)) => report.activity.add(outcome),
+        match reconcile::recover_asset(pool, das, pipeline, stored, floor, budget).await {
+            Ok((seen, outcome)) => {
+                budget = budget.saturating_sub(seen);
+                report.signatures += seen;
+                report.activity.add(outcome);
+            }
             Err(error) => log::warn!("probe recovering {}: {error:#}", stored.address),
         }
+    }
+    if report.budget_exhausted {
+        log::info!(
+            "tip probe spent its {RECOVER_BUDGET}-signature recovery budget; \
+             owners are corrected, timelines resume next run"
+        );
     }
     Ok(())
 }
@@ -283,6 +318,8 @@ pub async fn write_state(
                 "tracked": report.tracked,
                 "stale": report.stale,
                 "deep_crawled": report.deep_crawled,
+                "signatures": report.signatures,
+                "budget_exhausted": report.budget_exhausted,
                 "updated": report.updated,
                 "recorded": report.activity.recorded,
                 // The same word every other periodic job uses for "rows this

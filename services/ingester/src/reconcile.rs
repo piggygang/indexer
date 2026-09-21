@@ -490,7 +490,11 @@ pub async fn run(
         let floor = candidate
             .last_activity_slot
             .unwrap_or(from.unwrap_or(0) as i64);
-        let (signatures, outcome) = recover_asset(pool, das, pipeline, candidate, floor)
+        // Unbounded, deliberately and visibly: the sweep's own MAX_CANDIDATES
+        // cap is what bounds it today, and a per-asset budget without a resume
+        // cursor would re-buy the same newest N every run instead of making
+        // progress. Both belong with the repair watermark, not here.
+        let (signatures, outcome) = recover_asset(pool, das, pipeline, candidate, floor, u64::MAX)
             .await
             .unwrap_or_else(|error| {
                 log::warn!("recovering {}: {error:#}", candidate.address);
@@ -618,18 +622,31 @@ async fn enumerate(
     }
 }
 
-/// Walks one asset's signatures back to the cursor and replays them through
-/// the live decoder.
+/// Walks one asset's signatures back to `floor` and replays them through the
+/// live decoder, stopping after `budget` signatures.
 ///
-/// Shared by all three callers that ever need to rebuild a timeline: the
-/// on-connect sweep, the scheduled sweep, and the tip probe. There is exactly
-/// one implementation on purpose — a second would drift.
+/// Shared by every caller that needs to rebuild a timeline: the scheduled
+/// sweep and the tip probe. There is exactly one implementation on purpose — a
+/// second would drift — and exactly one signature, so an unbounded walk has to
+/// be written as `u64::MAX` at a call site rather than hidden behind a
+/// pleasant-sounding wrapper.
+///
+/// `budget` counts signatures *considered*, which is the thing that costs: one
+/// `getTransaction` each, plus one `getSignaturesForAddress` per 1 000. The
+/// floor is the real bound in the healthy case; the budget is what stops an
+/// asset with a floor of 0, or one whose floor never advances because the walk
+/// records nothing, from being unbounded.
+///
+/// A truncated walk is logged and is **not** recorded as covered anywhere —
+/// there is no resume cursor yet, so the next run repeats it. That is a bounded
+/// leak rather than a fix, and closing it needs a per-asset repair watermark.
 pub(crate) async fn recover_asset(
     pool: &PgPool,
     das: &DasClient,
     pipeline: &Pipeline,
     asset: &AssetRef,
     floor: i64,
+    budget: u64,
 ) -> anyhow::Result<(u64, Outcome)> {
     let mut before: Option<String> = None;
     let mut seen = 0u64;
@@ -646,6 +663,14 @@ pub(crate) async fn recover_asset(
 
         for info in &page {
             if info.slot <= floor {
+                return Ok((seen, outcome));
+            }
+            if seen >= budget {
+                log::info!(
+                    "recovering {}: stopped at the {budget}-signature budget, \
+                     still above floor {floor}",
+                    asset.address
+                );
                 return Ok((seen, outcome));
             }
             seen += 1;

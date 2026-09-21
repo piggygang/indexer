@@ -166,15 +166,15 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
-| `INGEST_TRANSPORTS` | no | `ws` | ingester only: which transports run — `ws`, `webhook`, or `ws,webhook` for a dual run. Retirement is this one value becoming `webhook`; the on-`Connected` reconcile follows it automatically. An unknown member is a hard error, never a silently unrun transport |
+| `INGEST_TRANSPORTS` | no | `ws` | ingester only: which transports run — `ws`, `webhook`, or `ws,webhook` for a dual run. Retirement is this one value becoming `webhook`. An unknown member is a hard error, never a silently unrun transport |
 | `HELIUS_WEBHOOK_SECRET` | ingester (with `webhook`) | — | the **whole** `Authorization` header value Helius echoes on every delivery, set as the webhook's `authHeader` and compared verbatim. Helius offers no HMAC or signature scheme, so this is the entire authenticity check |
 | `WEBHOOK_URL` | `admin webhook` | — | the public HTTPS endpoint to register. Registration only — the receiver never reads it |
 | `HELIUS_WEBHOOK_API` | no | `https://api-mainnet.helius-rpc.com` | the management API host. Configurable because Helius's docs and their own SDK disagree on it |
 | `WEBHOOK_POLL_MS` / `WEBHOOK_BATCH` / `WEBHOOK_LEASE_SECS` / `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_GRACE_SECS` / `WEBHOOK_RETAIN_DAYS` | no | `1000` / `50` / `60` / `5` / `120` / `30` | drain pacing. `RETAIN_DAYS` must outlast a dual-run evaluation window — `coverage()` reads those rows |
 | `RECONCILE_TIP_INTERVAL_SECS` | no | `30` | ingester only: the tip probe — one `searchAssets` per collection filter, newest-acted-on first. This is the freshness knob; `0` disables it and leaves the hourly sweep as the only correction |
-| `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). `0` disables the schedule, leaving the on-`Connected` reconcile |
+| `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). A connect lowers it to `RECONNECT_FLOOR` (600 s) for one run rather than bypassing it. `0` disables the sweep **and** the deep pass outright — there is no longer a separate on-`Connected` reconcile for it to leave behind |
 | `RECONCILE_DEEP_INTERVAL_SECS` | no | `604800` | ingester only: the weekly deep pass — supply, burned assets, attribute changes |
-| `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling shared by the probe, the sweep and the on-`Connected` reconcile — one limiter for all three, because Helius meters DAS at 10 req/s on the Developer plan and two limiters set to 10 would ask for 20. The live writer is deliberately outside it |
+| `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling for everything the schedule runs — the probe, the sweep and the deep pass share one limiter, because Helius meters DAS at 10 req/s on the Developer plan and two limiters set to 10 would ask for 20. The live writer is deliberately outside it |
 | `RARITY_INTERVAL_SECS` | no | `86400` | ingester only: backstop for the rarity drain (ALG-627). The dirty flag is the real trigger, so this only bounds how long a missed flag can sit; `0` disables the drain |
 
 ## Endpoints
