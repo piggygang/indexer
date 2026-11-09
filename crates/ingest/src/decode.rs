@@ -22,9 +22,11 @@
 //! - **No on-chain address appears in this file.** `jsonParsed` labels SPL
 //!   instructions by *name*, so matching is on strings. Metaplex Core is not
 //!   parsed by the RPC, so it is recognised structurally against the
-//!   collection address the registry supplies at runtime. Every invoked
-//!   program id is *captured as data* for `activity.details`, which is what
-//!   lets ALG-622 reclassify a marketplace transfer into a priced sale later.
+//!   collection address the registry supplies at runtime, and its ownership
+//!   changes are read from the instruction itself — Core's discriminator is a
+//!   protocol constant, not an address. Every invoked program id is *captured
+//!   as data* for `activity.details`, which is what lets ALG-622 reclassify a
+//!   marketplace transfer into a priced sale later.
 //!
 //! The payload is accepted in both shapes the two callers produce: the
 //! WebSocket notification (`result.transaction.{transaction,meta}`) and
@@ -71,7 +73,8 @@ pub enum DecodedKind {
 /// One classified ownership change of one token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenEvent {
-    /// The mint — `assets.address` for a Token Metadata asset.
+    /// `assets.address`: the mint of a Token Metadata asset, the asset account
+    /// of a Metaplex Core one.
     pub address: String,
     pub kind: DecodedKind,
     pub from_owner: Option<String>,
@@ -83,9 +86,12 @@ pub struct TokenEvent {
     pub instruction: String,
 }
 
-/// A Metaplex Core instruction touching one of our collections. The kind is
-/// resolved one layer up against DAS, because doing it here would mean
-/// hardcoding Core's Borsh discriminators.
+/// A Metaplex Core asset instruction naming one of our collections.
+///
+/// Every touched asset is reported, whether or not the instruction could also
+/// be classified into a [`TokenEvent`]: the pipeline needs the touch to create
+/// the row for a mint it has never seen, and to refresh metadata after the
+/// instructions that carry no ownership change (`UpdateV2`, the plugin family).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreTouch {
     pub asset: String,
@@ -198,20 +204,36 @@ pub fn decode_json(payload: &Value, ctx: &DecodeContext) -> Decoded {
             }
         }
 
-        // Metaplex Core: unparsed, so recognised by the collection account it
-        // carries. Account 0 is the asset for every Core asset instruction.
+        // Metaplex Core: unparsed, so recognised by its account layout against
+        // the collection the registry supplies. Every Core *asset* instruction
+        // opens with (asset, collection). A marketplace instruction that only
+        // passes the collection along for its CPI carries it elsewhere — 2, 8
+        // and 9 on the mainnet sales this was checked against — and matching
+        // it anywhere in the list turned each of those into a touch on
+        // whatever its account 0 happened to be.
         if let Some(accounts) = instruction.get("accounts").and_then(Value::as_array) {
             let accounts: Vec<&str> = accounts.iter().filter_map(Value::as_str).collect();
-            if let Some(collection) = accounts
-                .iter()
-                .find(|a| ctx.core_collections.contains(**a))
-                .map(|a| a.to_string())
-            {
-                if let Some(asset) = accounts.first().filter(|a| **a != collection) {
+            if let [asset, collection, ..] = accounts[..] {
+                if asset != collection && ctx.core_collections.contains(collection) {
+                    if let Some((kind, to_owner, name)) = core_event(instruction, &accounts) {
+                        let seq = seq_by_address.entry(asset.to_string()).or_insert(0);
+                        decoded.events.push(TokenEvent {
+                            address: asset.to_string(),
+                            kind,
+                            // Core keeps the owner in the asset account, which a
+                            // transaction does not carry, and `authority` may be
+                            // a delegate. The sender is unknown, not empty.
+                            from_owner: None,
+                            to_owner,
+                            seq: *seq,
+                            instruction: name.to_string(),
+                        });
+                        *seq += 1;
+                    }
                     if core_seen.insert(asset.to_string()) {
                         decoded.core.push(CoreTouch {
                             asset: asset.to_string(),
-                            collection,
+                            collection: collection.to_string(),
                         });
                     }
                 }
@@ -312,6 +334,87 @@ fn token_mint(info: &Value, post: &BTreeMap<String, Balance>) -> Option<Classifi
     // `activity_mint_shape` requires a receiver and forbids a sender.
     to_owner.as_ref()?;
     Some((minted.mint.clone(), DecodedKind::Mint, None, to_owner))
+}
+
+/// Metaplex Core's instruction discriminators: the first byte of the data, an
+/// index into Core's instruction enum. Protocol constants, not addresses, and
+/// each one was checked against a Piggy Gang mainnet transaction and the
+/// program's own `Instruction: …` log line on 2026-10-27.
+const CORE_BURN_V1: u8 = 12;
+const CORE_TRANSFER_V1: u8 = 14;
+const CORE_CREATE_V2: u8 = 20;
+
+/// The ownership change a Core asset instruction states outright, if any.
+///
+/// Until this existed every Core move was inferred by asking DAS who owned the
+/// asset *now* and diffing that against the database. DAS trails the chain, so
+/// the live path asked too early and saw no change, and the reconcile path
+/// asked only after the tip probe had already patched the owner — so it saw
+/// none either. Owners came out right and not one Core transfer was ever
+/// recorded. The instruction names the new owner itself.
+///
+/// Only shapes seen on mainnet are classified; everything else (a compressed
+/// asset's transfer carrying its proof, `CreateV1`, which no Piggy Gang mint
+/// uses, the plugin and update family) stays a bare touch and keeps the DAS
+/// path. Each shape is exact enough that an Anchor marketplace instruction —
+/// eight bytes of discriminator at least — cannot satisfy it:
+///
+/// - `TransferV1 { compression_proof: None }`: data `[14, 0]`, accounts
+///   `(asset, collection, payer, authority, new_owner, system, log_wrapper)`.
+/// - `BurnV1 { compression_proof: None }`: data `[12, 0]`. The burner is not
+///   the owner in general, so no sender is claimed.
+/// - `CreateV2`: data `[20, data_state, name, uri, …]`, accounts
+///   `(asset, collection, authority, payer, owner, …)`.
+///
+/// An optional account Core was not given is passed as Core's own program id.
+/// An omitted `new_owner`/`owner` therefore reads as the program, and Core's
+/// rule for defaulting it is not restated here — that one stays with DAS.
+fn core_event(
+    instruction: &Value,
+    accounts: &[&str],
+) -> Option<(DecodedKind, Option<String>, &'static str)> {
+    let program = instruction.get("programId").and_then(Value::as_str)?;
+    let data = bs58::decode(instruction.get("data").and_then(Value::as_str)?)
+        .into_vec()
+        .ok()?;
+    let named = |index: usize| {
+        accounts
+            .get(index)
+            .filter(|account| **account != program)
+            .map(|account| account.to_string())
+    };
+    match data.as_slice() {
+        [CORE_TRANSFER_V1, 0] if accounts.len() >= 7 => {
+            Some((DecodedKind::Transfer, Some(named(4)?), "TransferV1"))
+        }
+        [CORE_BURN_V1, 0] if accounts.len() >= 6 => Some((DecodedKind::Burn, None, "BurnV1")),
+        [CORE_CREATE_V2, args @ ..] if accounts.len() >= 8 && is_create_args(args) => {
+            Some((DecodedKind::Mint, Some(named(4)?), "CreateV2"))
+        }
+        _ => None,
+    }
+}
+
+/// `CreateV2`'s leading arguments: a `DataState` byte, then the name and the
+/// URI as Borsh strings (`u32` length, then bytes), each of which must fit in
+/// what is left. Plugins follow; they are not read.
+fn is_create_args(args: &[u8]) -> bool {
+    let Some((&data_state, mut rest)) = args.split_first() else {
+        return false;
+    };
+    if data_state > 1 {
+        return false;
+    }
+    for _ in 0..2 {
+        let Some((len, tail)) = rest.split_first_chunk::<4>() else {
+            return false;
+        };
+        let Some(after) = tail.get(u32::from_le_bytes(*len) as usize..) else {
+            return false;
+        };
+        rest = after;
+    }
+    true
 }
 
 /// Static keys plus the address-lookup-table entries, in the index order the
@@ -975,6 +1078,246 @@ mod tests {
             vec![],
         );
         assert!(decode_json(&p, &ctx).core.is_empty());
+    }
+
+    fn core_ctx(collection: &str) -> DecodeContext {
+        DecodeContext {
+            core_collections: [collection.to_string()].into_iter().collect(),
+            ..DecodeContext::default()
+        }
+    }
+
+    /// An unparsed Core instruction. `pk(91)` stands in for the Core program,
+    /// which is also what Core expects in place of an omitted optional account.
+    fn core_ix(accounts: &[String], data: &[u8]) -> Value {
+        json!({
+            "programId": pk(91),
+            "accounts": accounts,
+            "data": bs58::encode(data).into_string(),
+        })
+    }
+
+    /// `CreateV2` data: `AccountState`, name, URI, no plugins, no adapters.
+    fn create_v2(name: &str, uri: &str) -> Vec<u8> {
+        let mut data = vec![CORE_CREATE_V2, 0];
+        for text in [name, uri] {
+            data.extend((text.len() as u32).to_le_bytes());
+            data.extend(text.as_bytes());
+        }
+        data.extend([0, 0]);
+        data
+    }
+
+    /// The shape of every Piggy Gang sale on mainnet: a marketplace
+    /// instruction that carries the collection somewhere in its list, and
+    /// Core's `TransferV1` as its CPI. The transfer is read from the
+    /// instruction; the marketplace instruction is not a touch at all.
+    #[test]
+    fn a_core_transfer_names_its_new_owner() {
+        let (asset, collection, buyer, escrow) = (pk(10), pk(11), pk(30), pk(31));
+        let core = pk(91);
+        let keys = vec![buyer.clone(), asset.clone(), collection.clone()];
+        let mut p = payload(
+            &keys,
+            vec![json!({
+                "programId": pk(92),
+                "accounts": [buyer.clone(), pk(40), pk(41), collection.clone(), asset.clone(), core.clone()],
+                // An Anchor discriminator that happens to open with TransferV1's byte.
+                "data": bs58::encode([CORE_TRANSFER_V1, 1, 2, 3, 4, 5, 6, 7, 8]).into_string(),
+            })],
+            vec![],
+            vec![],
+        );
+        p["transaction"]["meta"]["innerInstructions"] = json!([{
+            "index": 0,
+            "instructions": [core_ix(
+                &[asset.clone(), collection.clone(), buyer.clone(), escrow, buyer.clone(), core.clone(), core],
+                &[CORE_TRANSFER_V1, 0],
+            )],
+        }]);
+
+        let out = decode_json(&p, &core_ctx(&collection));
+        assert_eq!(
+            out.events,
+            vec![TokenEvent {
+                address: asset.clone(),
+                kind: DecodedKind::Transfer,
+                from_owner: None,
+                to_owner: Some(buyer),
+                seq: 0,
+                instruction: "TransferV1".into(),
+            }]
+        );
+        assert_eq!(out.core, vec![CoreTouch { asset, collection }]);
+    }
+
+    /// The Core swap: one transaction mints the asset to its owner. A burn
+    /// carries no owner at all, so none is claimed.
+    #[test]
+    fn a_core_mint_and_burn_are_read_from_the_instruction() {
+        let (minted, burned, collection, owner) = (pk(10), pk(12), pk(11), pk(30));
+        let core = pk(91);
+        let keys = vec![owner.clone(), minted.clone(), collection.clone()];
+        let p = payload(
+            &keys,
+            vec![
+                core_ix(
+                    &[
+                        minted.clone(),
+                        collection.clone(),
+                        pk(40),
+                        owner.clone(),
+                        owner.clone(),
+                        core.clone(),
+                        pk(41),
+                        core.clone(),
+                    ],
+                    &create_v2("#6388", "https://example.invalid/6388.json"),
+                ),
+                core_ix(
+                    &[
+                        burned.clone(),
+                        collection.clone(),
+                        owner.clone(),
+                        core.clone(),
+                        core.clone(),
+                        core,
+                    ],
+                    &[CORE_BURN_V1, 0],
+                ),
+            ],
+            vec![],
+            vec![],
+        );
+
+        let out = decode_json(&p, &core_ctx(&collection));
+        let kinds: Vec<_> = out
+            .events
+            .iter()
+            .map(|e| {
+                (
+                    e.address.as_str(),
+                    e.kind,
+                    e.to_owner.as_deref(),
+                    e.instruction.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (
+                    minted.as_str(),
+                    DecodedKind::Mint,
+                    Some(owner.as_str()),
+                    "CreateV2"
+                ),
+                (burned.as_str(), DecodedKind::Burn, None, "BurnV1"),
+            ]
+        );
+        assert!(out.events.iter().all(|e| e.from_owner.is_none()));
+        assert_eq!(out.core.len(), 2);
+    }
+
+    /// Core passes its own program id for an optional account it was not
+    /// given. An omitted owner is a default Core resolves, not one we restate.
+    #[test]
+    fn an_omitted_core_owner_is_left_to_das() {
+        let (asset, collection) = (pk(10), pk(11));
+        let core = pk(91);
+        let keys = vec![pk(30), asset.clone(), collection.clone()];
+        let p = payload(
+            &keys,
+            vec![
+                core_ix(
+                    &[
+                        asset.clone(),
+                        collection.clone(),
+                        pk(40),
+                        pk(30),
+                        core.clone(),
+                        core.clone(),
+                        pk(41),
+                        core.clone(),
+                    ],
+                    &create_v2("#1", "https://example.invalid/1.json"),
+                ),
+                core_ix(
+                    &[
+                        asset.clone(),
+                        collection.clone(),
+                        pk(30),
+                        core.clone(),
+                        core.clone(),
+                        core.clone(),
+                        core,
+                    ],
+                    &[CORE_TRANSFER_V1, 0],
+                ),
+            ],
+            vec![],
+            vec![],
+        );
+
+        let out = decode_json(&p, &core_ctx(&collection));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert_eq!(out.core, vec![CoreTouch { asset, collection }]);
+    }
+
+    /// What carries no ownership change, and what this decoder has never seen
+    /// on mainnet, stays a touch: the pipeline refreshes it from DAS.
+    #[test]
+    fn other_core_instructions_stay_touches() {
+        let collection = pk(11);
+        let core = pk(91);
+        let seven = |asset: &String| {
+            vec![
+                asset.clone(),
+                collection.clone(),
+                pk(30),
+                pk(30),
+                pk(31),
+                core.clone(),
+                core.clone(),
+            ]
+        };
+        let (updated, compressed, malformed) = (pk(10), pk(12), pk(13));
+        let keys = vec![pk(30), updated.clone(), collection.clone()];
+        let mut truncated = create_v2("#1", "https://example.invalid/1.json");
+        truncated.truncate(12);
+        let p = payload(
+            &keys,
+            vec![
+                // UpdateV2.
+                core_ix(&seven(&updated), &[30, 1, 2, 3]),
+                // A compressed asset's transfer carries its proof.
+                core_ix(&seven(&compressed), &[CORE_TRANSFER_V1, 1, 9, 9, 9]),
+                // A CreateV2 whose URI runs past the end of the data.
+                core_ix(
+                    &[
+                        malformed.clone(),
+                        collection.clone(),
+                        pk(40),
+                        pk(30),
+                        pk(30),
+                        core.clone(),
+                        pk(41),
+                        core,
+                    ],
+                    &truncated,
+                ),
+            ],
+            vec![],
+            vec![],
+        );
+
+        let out = decode_json(&p, &core_ctx(&collection));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        let touched: Vec<&str> = out.core.iter().map(|t| t.asset.as_str()).collect();
+        assert_eq!(
+            touched,
+            vec![updated.as_str(), compressed.as_str(), malformed.as_str()]
+        );
     }
 
     /// The gap-recovery path feeds `getTransaction`'s nesting into the same

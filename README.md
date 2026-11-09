@@ -846,12 +846,20 @@ chain says, and it is what keeps the derived history consistent with
 `assets.owner` — DAS reports the escrow as owner too — so
 `integrity_owner_mismatch` stays empty.
 
-### Metaplex Core is stored, not classified
+### Metaplex Core is classified from its own instructions
 
-Core instructions are Borsh and the RPC does not parse them, so a Core asset
-yields signatures but no ownership events. Those are stored raw and reported as
-`unverifiable` rather than guessed at; the live pipeline covers Core going
-forward.
+The RPC does not parse Core's Borsh instructions, but the decoder reads the
+three that move ownership (see [Live pipeline](#live-pipeline-alg-623)), and the
+crawl uses the same decoder — so a Core asset's history comes out as mint,
+transfers and burn like any other, checked against DAS by the same chain verdict.
+Core marketplace sales are priced from the same lamport deltas; a venue missing
+from `config/marketplaces.toml` leaves an honest transfer with its
+`price_candidate`, for `--reprice-only` later. Anything the decoder does not
+classify is stored raw and, if nothing else was, reported as `unverifiable`.
+
+Core history recorded before this existed is empty, not wrong:
+`backfill-activity --slug piggy-gang` fills it in, and writes are signature-keyed,
+so events the live pipeline has meanwhile stored are redeliveries.
 
 ### Verifying a run
 
@@ -901,6 +909,27 @@ marketplace instruction, and token-2022 alike. It gates on
 transaction is never read as an NFT move. No on-chain address appears in Rust:
 `jsonParsed` labels SPL instructions by name, and Metaplex Core is recognised
 structurally against the collection address the registry supplies.
+
+**Metaplex Core has no token balances, so its moves are read from the
+instruction.** A Core asset instruction opens with `(asset, collection)`, and the
+first data byte is Core's discriminator — a protocol constant, not an address.
+Three shapes are classified, each checked against a Piggy Gang mainnet transaction
+and Core's own `Instruction: …` log line: `TransferV1` (`[14, 0]`, new owner at
+account 4), `BurnV1` (`[12, 0]`) and `CreateV2` (`20`, owner at account 4). A
+2-byte instruction cannot be an Anchor marketplace's, whose discriminator alone is
+8. The sender is left `NULL`: Core keeps the owner in the asset account, which a
+transaction does not carry. Everything else — `UpdateV2`, the plugin family, a
+compressed asset's transfer, `CreateV1`, which no Piggy Gang mint uses — stays a
+bare touch, and the pipeline still refreshes it from DAS.
+
+This replaced asking DAS who owned the asset *now* and diffing that against the
+database, which recorded **no** Core transfer from 2026-09-03 to 2026-10-27 while
+the owners stayed right. DAS trails the chain, so the live path read the seller
+and saw no change; the tip probe then patched the owner with `apply_state`
+*before* replaying the signature, so the replay saw none either. Eight marketplace
+moves went unrecorded — five sales and three listings returned from escrow.
+`live_pipeline.rs` pins both halves with DAS unroutable, and both tests fail
+against the old decoder.
 
 **Sales are not classified here.** A marketplace-mediated change is recorded
 honestly as a `transfer`, with the invoked program ids in `activity.details` so

@@ -119,8 +119,8 @@ pub struct Counts {
     /// write and any rebuild — the acceptance criterion, asked of the same
     /// view the acceptance query uses.
     pub mismatched: u64,
-    /// Assets with no ownership events to check — Metaplex Core, whose
-    /// instructions the RPC does not parse.
+    /// Assets with no ownership events to check — e.g. a Metaplex Core asset
+    /// whose only instructions are ones the decoder does not classify.
     pub unverifiable: u64,
     pub rebuilt: u64,
     /// Events dropped for want of a `blockTime`; their signatures stay
@@ -404,9 +404,9 @@ where
 
     if counts.unverifiable > 0 && counts.events == 0 && counts.signatures > 0 {
         warnings.push(format!(
-            "{}: {} asset(s) yielded signatures but no ownership events. Metaplex Core \
-             instructions are Borsh and the RPC does not parse them, so their timeline is \
-             stored raw and left unclassified rather than guessed at",
+            "{}: {} asset(s) yielded signatures but no ownership events. For Metaplex Core \
+             the decoder reads only TransferV1, BurnV1 and CreateV2; anything else is stored \
+             raw and left unclassified rather than guessed at",
             collection.slug, counts.unverifiable
         ));
     }
