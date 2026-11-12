@@ -44,8 +44,8 @@ pub enum Verdict {
         observed: Option<String>,
     },
     /// Nothing to check against: DAS has no owner for a live asset, or the
-    /// crawl produced no ownership events at all (a Metaplex Core asset, whose
-    /// instructions the RPC does not parse).
+    /// crawl produced no ownership events at all (e.g. a Metaplex Core asset
+    /// whose only instructions are ones the decoder does not classify).
     Unverifiable,
 }
 

@@ -6,10 +6,11 @@
 //! same set from the same code — a second copy is how address-list drift
 //! becomes real.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use indexer_data_model::types::MembershipRule;
 use indexer_data_model::{registry, PgPool};
+use indexer_ingest::decode::CoreCollections;
 use indexer_ingest::{Commitment, SubscriptionSpec, TransactionFilter};
 
 /// The single filter id. One filter rather than one per collection: a swap
@@ -21,13 +22,14 @@ pub const TRACKED: &str = "tracked";
 /// Helius's per-array limit; chunking above it keeps the spec compilable.
 const MAX_ADDRESSES: usize = indexer_ingest::ws::MAX_ADDRESSES;
 
-/// Core collection addresses, for the decoder's structural recognition.
-pub async fn core_collections(pool: &PgPool) -> anyhow::Result<BTreeSet<String>> {
+/// Core collection addresses, for the decoder's structural recognition, each
+/// with the program the registry says owns it.
+pub async fn core_collections(pool: &PgPool) -> anyhow::Result<CoreCollections> {
     Ok(registry::list_enabled(pool)
         .await?
         .into_iter()
         .filter(|c| c.membership_rule == Some(MembershipRule::CoreCollection))
-        .filter_map(|c| c.address)
+        .filter_map(|c| Some((c.address?, c.program)))
         .collect())
 }
 
