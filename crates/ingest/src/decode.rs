@@ -24,7 +24,8 @@
 //!   parsed by the RPC, so it is recognised structurally against the
 //!   collection address the registry supplies at runtime, and its ownership
 //!   changes are read from the instruction itself — Core's discriminator is a
-//!   protocol constant, not an address. Every invoked program id is *captured
+//!   protocol constant, not an address — but only from the program the
+//!   registry names for that collection. Every invoked program id is *captured
 //!   as data* for `activity.details`, which is what lets ALG-622 reclassify a
 //!   marketplace transfer into a priced sale later.
 //!
@@ -40,13 +41,19 @@ use serde_json::Value;
 
 use crate::event::{RawPayload, TransactionUpdate};
 
+/// Metaplex Core collection address → the program that owns it, when the
+/// registry names one (`collections.program`).
+pub type CoreCollections = BTreeMap<String, Option<String>>;
+
 /// What the registry knows that the decoder needs.
 #[derive(Debug, Clone, Default)]
 pub struct DecodeContext {
-    /// Metaplex Core collection addresses. Core passes the collection account
-    /// on every member instruction, which is what lets one address identify
-    /// transfers *and* mints of assets that do not exist yet.
-    pub core_collections: BTreeSet<String>,
+    /// Metaplex Core collections. Core passes the collection account on every
+    /// member instruction, which is what lets one address identify transfers
+    /// *and* mints of assets that do not exist yet. The program is what makes
+    /// reading ownership from such an instruction safe: without one, every
+    /// instruction naming the collection stays a bare touch.
+    pub core_collections: CoreCollections,
     /// Token account → wallet, consulted wherever a token balance omits
     /// `owner`.
     ///
@@ -214,8 +221,15 @@ pub fn decode_json(payload: &Value, ctx: &DecodeContext) -> Decoded {
         if let Some(accounts) = instruction.get("accounts").and_then(Value::as_array) {
             let accounts: Vec<&str> = accounts.iter().filter_map(Value::as_str).collect();
             if let [asset, collection, ..] = accounts[..] {
-                if asset != collection && ctx.core_collections.contains(collection) {
-                    if let Some((kind, to_owner, name)) = core_event(instruction, &accounts) {
+                let core_program = ctx
+                    .core_collections
+                    .get(collection)
+                    .filter(|_| asset != collection);
+                if let Some(core_program) = core_program {
+                    let event = core_program
+                        .as_deref()
+                        .and_then(|program| core_event(instruction, program, &accounts));
+                    if let Some((kind, to_owner, name)) = event {
                         let seq = seq_by_address.entry(asset.to_string()).or_insert(0);
                         decoded.events.push(TokenEvent {
                             address: asset.to_string(),
@@ -353,6 +367,13 @@ const CORE_CREATE_V2: u8 = 20;
 /// none either. Owners came out right and not one Core transfer was ever
 /// recorded. The instruction names the new owner itself.
 ///
+/// Nothing is read unless `programId` is `core_program`, the one the registry
+/// names for the collection. The layout proves nothing about who issued it:
+/// any program can be invoked with our collection at account 1 and `[14, 0]`
+/// as its data, the transaction succeeds, and believing it would move an owner
+/// on a stranger's say-so. Such an instruction stays a touch, and DAS answers
+/// that truthfully.
+///
 /// Only shapes seen on mainnet are classified; everything else (a compressed
 /// asset's transfer carrying its proof, `CreateV1`, which no Piggy Gang mint
 /// uses, the plugin and update family) stays a bare touch and keeps the DAS
@@ -371,16 +392,19 @@ const CORE_CREATE_V2: u8 = 20;
 /// rule for defaulting it is not restated here — that one stays with DAS.
 fn core_event(
     instruction: &Value,
+    core_program: &str,
     accounts: &[&str],
 ) -> Option<(DecodedKind, Option<String>, &'static str)> {
-    let program = instruction.get("programId").and_then(Value::as_str)?;
+    if instruction.get("programId").and_then(Value::as_str)? != core_program {
+        return None;
+    }
     let data = bs58::decode(instruction.get("data").and_then(Value::as_str)?)
         .into_vec()
         .ok()?;
     let named = |index: usize| {
         accounts
             .get(index)
-            .filter(|account| **account != program)
+            .filter(|account| **account != core_program)
             .map(|account| account.to_string())
     };
     match data.as_slice() {
@@ -1034,10 +1058,7 @@ mod tests {
     #[test]
     fn a_core_instruction_is_found_by_its_collection_account() {
         let (asset, collection) = (pk(10), pk(11));
-        let ctx = DecodeContext {
-            core_collections: [collection.clone()].into_iter().collect(),
-            ..DecodeContext::default()
-        };
+        let ctx = core_ctx(&collection);
         let keys = vec![pk(50), asset.clone(), collection.clone()];
         let p = payload(
             &keys,
@@ -1064,10 +1085,7 @@ mod tests {
     #[test]
     fn a_collection_level_instruction_is_not_an_asset_touch() {
         let collection = pk(11);
-        let ctx = DecodeContext {
-            core_collections: [collection.clone()].into_iter().collect(),
-            ..DecodeContext::default()
-        };
+        let ctx = core_ctx(&collection);
         let keys = vec![pk(50), collection.clone()];
         let p = payload(
             &keys,
@@ -1080,9 +1098,12 @@ mod tests {
         assert!(decode_json(&p, &ctx).core.is_empty());
     }
 
+    /// `collection`, registered with `pk(91)` standing in for the Core program.
     fn core_ctx(collection: &str) -> DecodeContext {
         DecodeContext {
-            core_collections: [collection.to_string()].into_iter().collect(),
+            core_collections: [(collection.to_string(), Some(pk(91)))]
+                .into_iter()
+                .collect(),
             ..DecodeContext::default()
         }
     }
@@ -1262,6 +1283,68 @@ mod tests {
         let out = decode_json(&p, &core_ctx(&collection));
         assert!(out.events.is_empty(), "{:?}", out.events);
         assert_eq!(out.core, vec![CoreTouch { asset, collection }]);
+    }
+
+    /// A `TransferV1` laid out exactly as Core lays it out, issued by `program`.
+    fn transfer_v1(asset: &str, collection: &str, to: &str, program: &str) -> Value {
+        json!({
+            "programId": program,
+            "accounts": [asset, collection, to, to, to, program, program],
+            "data": bs58::encode([CORE_TRANSFER_V1, 0]).into_string(),
+        })
+    }
+
+    /// Core's layout is no proof that Core issued it: any program can be
+    /// invoked with our collection at account 1 and `[14, 0]` as its data, and
+    /// the transaction succeeds. Believing it would hand the asset to whoever
+    /// wrote it. It stays a touch, which DAS answers truthfully.
+    #[test]
+    fn a_lookalike_from_another_program_is_only_a_touch() {
+        let (asset, collection, stranger) = (pk(10), pk(11), pk(66));
+        let keys = vec![stranger.clone(), asset.clone(), collection.clone()];
+        let p = payload(
+            &keys,
+            vec![transfer_v1(&asset, &collection, &stranger, &pk(92))],
+            vec![],
+            vec![],
+        );
+
+        let out = decode_json(&p, &core_ctx(&collection));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert_eq!(out.core, vec![CoreTouch { asset, collection }]);
+    }
+
+    /// A collection the registry names no program for gets the DAS path for
+    /// every instruction, Core's own included.
+    #[test]
+    fn without_a_registered_program_core_stays_a_touch() {
+        let (asset, collection, buyer) = (pk(10), pk(11), pk(30));
+        let keys = vec![buyer.clone(), asset.clone(), collection.clone()];
+        let p = payload(
+            &keys,
+            vec![transfer_v1(&asset, &collection, &buyer, &pk(91))],
+            vec![],
+            vec![],
+        );
+        let unregistered = DecodeContext {
+            core_collections: [(collection.clone(), None)].into_iter().collect(),
+            ..DecodeContext::default()
+        };
+
+        let out = decode_json(&p, &unregistered);
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        assert_eq!(
+            out.core,
+            vec![CoreTouch {
+                asset: asset.clone(),
+                collection: collection.clone()
+            }]
+        );
+        assert_eq!(
+            decode_json(&p, &core_ctx(&collection)).events.len(),
+            1,
+            "the same instruction is read once the program is registered"
+        );
     }
 
     /// What carries no ownership change, and what this decoder has never seen

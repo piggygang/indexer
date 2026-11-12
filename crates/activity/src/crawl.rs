@@ -25,7 +25,8 @@ use anyhow::{Context, Result};
 use indexer_das::{ArchivedTx, DasClient};
 use indexer_data_model::activity::{AssetRef, CrawledSignature};
 use indexer_ingest::decode::{
-    self, harvest_token_account_owners, token_accounts_for_mint, DecodeContext, TokenEvent,
+    self, harvest_token_account_owners, token_accounts_for_mint, CoreCollections, DecodeContext,
+    TokenEvent,
 };
 
 use crate::chain::{self, Chain, Verdict};
@@ -62,7 +63,7 @@ pub struct AssetCrawl {
 pub async fn crawl_asset(
     das: &DasClient,
     venues: &Venues,
-    core_collections: &BTreeSet<String>,
+    core_collections: &CoreCollections,
     asset: &AssetRef,
 ) -> Result<AssetCrawl> {
     let mut transactions: BTreeMap<String, ArchivedTx> = BTreeMap::new();
@@ -135,7 +136,7 @@ async fn page_address(das: &DasClient, address: &str) -> Result<Vec<ArchivedTx>>
 /// instruction of that year's transaction, and needed by every transfer after.
 fn analyze(
     venues: &Venues,
-    core_collections: &BTreeSet<String>,
+    core_collections: &CoreCollections,
     asset: &AssetRef,
     transactions: &BTreeMap<String, ArchivedTx>,
     rounds: usize,

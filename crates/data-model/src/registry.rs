@@ -14,6 +14,10 @@ pub struct CollectionRow {
     /// `None` only on disabled placeholders (DB CHECK).
     pub standard: Option<Standard>,
     pub address: Option<String>,
+    /// The program that owns a Core collection's `address`. Core instructions
+    /// are read as ownership changes only when they come from it; `None`
+    /// leaves every one of them to DAS.
+    pub program: Option<String>,
     pub verified_creator: Option<String>,
     pub update_authority: Option<String>,
     pub symbol: Option<String>,
@@ -30,7 +34,7 @@ pub struct CollectionRow {
     pub rarity_version: i32,
 }
 
-const COLLECTION_COLUMNS: &str = "id, slug, name, standard, address, verified_creator, \
+const COLLECTION_COLUMNS: &str = "id, slug, name, standard, address, program, verified_creator, \
      update_authority, symbol, image_url, metadata_uri_template, facet_exclude, enabled, \
      membership_rule, rarity_version";
 

@@ -364,7 +364,7 @@ async fn a_core_sale_is_recorded_from_the_instruction(pool: PgPool) {
     pipeline
         .context_mut()
         .core_collections
-        .insert(collection.clone());
+        .insert(collection.clone(), Some(pk(91)));
 
     let (message, meta) = core_sale(&address, &collection, &buyer);
     let update = TransactionUpdate {
@@ -428,7 +428,7 @@ async fn a_core_sale_replayed_after_the_owner_was_patched_is_still_recorded(pool
     pipeline
         .context_mut()
         .core_collections
-        .insert(collection.clone());
+        .insert(collection.clone(), Some(pk(91)));
 
     let (message, meta) = core_sale(&address, &collection, &buyer);
     let rpc = json!({

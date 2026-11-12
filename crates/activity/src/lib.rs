@@ -27,7 +27,6 @@
 //! the rebuild itself, so a backfill over a running system converges rather
 //! than leaving work behind.
 
-use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -35,6 +34,7 @@ use indexer_das::DasClient;
 use indexer_data_model::activity::{self, AssetRef, LiveEvent};
 use indexer_data_model::types::MembershipRule;
 use indexer_data_model::{ingest_state, registry, PgPool};
+use indexer_ingest::decode::CoreCollections;
 use serde_json::json;
 
 pub mod chain;
@@ -552,13 +552,13 @@ async fn reprice(pool: &PgPool, venues: &Venues, collection_id: i32) -> Result<u
 }
 
 /// Metaplex Core collection addresses, for the decoder's structural
-/// recognition.
-async fn core_collections(pool: &PgPool) -> Result<BTreeSet<String>> {
+/// recognition, each with the program the registry says owns it.
+async fn core_collections(pool: &PgPool) -> Result<CoreCollections> {
     Ok(registry::list_enabled(pool)
         .await?
         .into_iter()
         .filter(|c| c.membership_rule == Some(MembershipRule::CoreCollection))
-        .filter_map(|c| c.address)
+        .filter_map(|c| Some((c.address?, c.program)))
         .collect())
 }
 

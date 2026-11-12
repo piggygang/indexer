@@ -282,7 +282,7 @@ TOML entry, `seed`, backfill — zero code:
 |---|---|---|---|
 | Token Metadata with a certified collection | `standard="token_metadata"`, `address` | `tm_collection` | DAS `searchAssets` by collection |
 | Token Metadata without one (the three Piggy TM collections: `collection: null` on chain) | `verified_creator`, `symbol`, `mints = { file, count }` | `tm_allowlist` | the committed mint list (`getAssetBatch`); creator/symbol are validation signals |
-| Metaplex Core | `standard="core"`, `address` (CollectionV1) | `core_collection` | DAS `searchAssets` by collection; new mints appear automatically |
+| Metaplex Core | `standard="core"`, `address` (CollectionV1), `program` (the Core program, which owns it) | `core_collection` | DAS `searchAssets` by collection; new mints appear automatically |
 | Announced / unknown | `enabled = false`, nothing else | NULL | skipped |
 
 Optional per-collection keys: `update_authority`, `image_url`,
@@ -858,6 +858,7 @@ from `config/marketplaces.toml` leaves an honest transfer with its
 classify is stored raw and, if nothing else was, reported as `unverifiable`.
 
 Core history recorded before this existed is empty, not wrong:
+`seed` (which fills `collections.program`, added empty by its migration), then
 `backfill-activity --slug piggy-gang` fills it in, and writes are signature-keyed,
 so events the live pipeline has meanwhile stored are redeliveries.
 
@@ -917,7 +918,11 @@ Three shapes are classified, each checked against a Piggy Gang mainnet transacti
 and Core's own `Instruction: …` log line: `TransferV1` (`[14, 0]`, new owner at
 account 4), `BurnV1` (`[12, 0]`) and `CreateV2` (`20`, owner at account 4). A
 2-byte instruction cannot be an Anchor marketplace's, whose discriminator alone is
-8. The sender is left `NULL`: Core keeps the owner in the asset account, which a
+8. None of it is read unless `programId` is the collection's `program` in the
+registry: the layout proves nothing about who issued it — any program can be
+invoked with our collection at account 1 and `[14, 0]` as its data — and a
+lookalike, like every Core instruction while `program` is unset, stays a touch
+for DAS to answer. The sender is left `NULL`: Core keeps the owner in the asset account, which a
 transaction does not carry. Everything else — `UpdateV2`, the plugin family, a
 compressed asset's transfer, `CreateV1`, which no Piggy Gang mint uses — stays a
 bare touch, and the pipeline still refreshes it from DAS.
