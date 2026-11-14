@@ -74,6 +74,10 @@ enabled = true
 # Metaplex Core CollectionV1. Dynamic: swapping a SOL Gang piggy burns the
 # mint and creates a Core asset named "#N" in this collection.
 address = "J3nHgSDJj6CPj2ypuDWNuvuiYii965RcSmFAPQVDWA18"
+# The Metaplex Core program, which owns `address`. A transfer, burn or mint is
+# read from the instruction only when it comes from this program; leave it out
+# and every Core move is left to the DAS diff, which in practice recorded none.
+program = "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
 
 [[tokens]]
 mint = "FUtxQAXuC4TgQvF7C5RTRsgqHvPqn4iHhMicRZKV775E"

@@ -17,6 +17,9 @@ ws = ["dep:futures-util", "dep:log", "dep:rustls", "dep:tokio-tungstenite", "tok
 
 [dependencies]
 async-stream = { workspace = true }
+# Metaplex Core instruction data arrives base58-encoded and unparsed; decode
+# reads its discriminator.
+bs58 = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true, optional = true }
 log = { workspace = true, optional = true }
@@ -28,7 +31,6 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true, optional = true }
 
 [dev-dependencies]
-bs58 = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util"] }
 tokio-tungstenite = { workspace = true }

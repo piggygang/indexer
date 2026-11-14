@@ -311,3 +311,162 @@ async fn a_replayed_transaction_is_recorded_as_reconcile(pool: PgPool) {
     assert_eq!(outcome.redelivered, 1);
     assert_eq!(outcome.recorded, 0);
 }
+
+async fn core_collection(pool: &PgPool, address: &str) -> i32 {
+    sqlx::query_scalar(
+        "INSERT INTO collections (slug, name, standard, address, enabled) \
+         VALUES ('syn-core', 'Syn Core', 'core', $1, true) RETURNING id",
+    )
+    .bind(address)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A Metaplex Core sale the way every mainnet Piggy Gang sale looks: a
+/// marketplace instruction carrying the collection somewhere in its list, and
+/// Core's `TransferV1` as its CPI. `pk(91)` stands in for the Core program.
+/// Returns the `(message, meta)` pair both nestings share.
+fn core_sale(asset: &str, collection: &str, buyer: &str) -> (Value, Value) {
+    let core = pk(91);
+    let message = json!({
+        "accountKeys": [{"pubkey": buyer}, {"pubkey": asset}, {"pubkey": collection}],
+        "instructions": [{
+            "programId": pk(92),
+            "accounts": [buyer, pk(40), collection, asset, core],
+            "data": bs58::encode([7u8; 9]).into_string(),
+        }],
+    });
+    let meta = json!({
+        "err": null,
+        "preTokenBalances": [],
+        "postTokenBalances": [],
+        "innerInstructions": [{"index": 0, "instructions": [{
+            "programId": core,
+            "accounts": [asset, collection, buyer, pk(41), buyer, core, core],
+            "data": bs58::encode([14u8, 0]).into_string(),
+        }]}],
+    });
+    (message, meta)
+}
+
+/// The regression behind an empty Piggy Gang timeline (2026-09-03 →
+/// 2026-10-27): the notification arrives while DAS still reports the seller,
+/// and diffing against DAS saw no change. The instruction names the buyer, so
+/// the sale is recorded with DAS unroutable.
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_core_sale_is_recorded_from_the_instruction(pool: PgPool) {
+    let (address, collection, seller, buyer) = (pk(1), pk(200), pk(50), pk(51));
+    let c = core_collection(&pool, &collection).await;
+    let id = asset(&pool, c, &address, &seller).await;
+    let mut pipeline = pipeline(&pool, 443_800_000).await;
+    pipeline
+        .context_mut()
+        .core_collections
+        .insert(collection.clone(), Some(pk(91)));
+
+    let (message, meta) = core_sale(&address, &collection, &buyer);
+    let update = TransactionUpdate {
+        filters: vec!["tracked".into()],
+        slot: 443_800_000,
+        signature: sig(1),
+        failed: false,
+        account_keys: vec![buyer.clone()],
+        raw: RawPayload::Json(json!({
+            "signature": sig(1),
+            "slot": 443_800_000,
+            "transaction": {"transaction": {"message": message}, "meta": meta},
+        })),
+    };
+    let outcome = pipeline.handle(&update).await.unwrap();
+    assert_eq!(outcome.recorded, 1);
+    assert_eq!(outcome.untracked, 0);
+
+    let (kind, from, to, instruction): (String, Option<String>, Option<String>, Value) =
+        sqlx::query_as(
+            "SELECT kind, from_owner, to_owner, details->'instruction' \
+               FROM activity WHERE asset_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kind, "transfer");
+    // Core keeps the owner in the asset account, which the transaction does
+    // not carry: the sender is unknown, not guessed.
+    assert_eq!(from, None);
+    assert_eq!(to.as_deref(), Some(buyer.as_str()));
+    assert_eq!(instruction, json!("TransferV1"));
+
+    let owner: Option<String> = sqlx::query_scalar("SELECT owner FROM assets WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(owner.as_deref(), Some(buyer.as_str()));
+}
+
+/// The other half. The tip probe corrects the owner from DAS *before* it walks
+/// the asset's signatures, so by the time the sale is replayed the row already
+/// agrees with it — and a DAS diff found nothing to record. The replay must
+/// still record the sale, and move nothing.
+#[sqlx::test(migrations = "../../crates/data-model/migrations")]
+#[ignore = "needs DATABASE_URL"]
+async fn a_core_sale_replayed_after_the_owner_was_patched_is_still_recorded(pool: PgPool) {
+    let (address, collection, buyer) = (pk(1), pk(200), pk(51));
+    let c = core_collection(&pool, &collection).await;
+    let id = asset(&pool, c, &address, &buyer).await;
+    // What `assets::apply_state` leaves behind: the new owner, stamped with
+    // the probe's slot, which is later than the sale's.
+    sqlx::query("UPDATE assets SET owner_slot = 443_800_100 WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut pipeline = pipeline(&pool, 443_800_000).await;
+    pipeline
+        .context_mut()
+        .core_collections
+        .insert(collection.clone(), Some(pk(91)));
+
+    let (message, meta) = core_sale(&address, &collection, &buyer);
+    let rpc = json!({
+        "slot": 443_800_000,
+        "blockTime": 1_700_000_000,
+        "transaction": {"message": message},
+        "meta": meta,
+    });
+    let outcome = pipeline.replay(&sig(1), 443_800_000, &rpc).await.unwrap();
+    assert_eq!(outcome.recorded, 1);
+    assert_eq!((outcome.parked, outcome.dirty), (0, 0));
+
+    let (kind, source, to): (String, String, Option<String>) =
+        sqlx::query_as("SELECT kind, source, to_owner FROM activity WHERE asset_id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (kind.as_str(), source.as_str(), to.as_deref()),
+        ("transfer", "reconcile", Some(buyer.as_str()))
+    );
+
+    let (owner, owner_slot): (Option<String>, Option<i64>) =
+        sqlx::query_as("SELECT owner, owner_slot FROM assets WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(owner.as_deref(), Some(buyer.as_str()));
+    assert_eq!(owner_slot, Some(443_800_100));
+
+    let open: Option<String> = sqlx::query_scalar(
+        "SELECT owner FROM ownership_history WHERE asset_id = $1 AND to_slot IS NULL",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(open.as_deref(), Some(buyer.as_str()));
+}

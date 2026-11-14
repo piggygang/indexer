@@ -136,10 +136,18 @@ impl Pipeline {
         // Core assets are resolved against DAS first: a brand-new mint has no
         // `assets` row yet, and creating it here is what lets the very same
         // transaction's activity row satisfy the `asset_id` FK.
+        //
+        // A Core asset whose instruction the decoder could read already has
+        // its event in `decoded.events` — Token Metadata events are keyed by
+        // mint, which is never a Core asset address, so membership here means
+        // exactly that.
+        let classified: BTreeSet<&str> =
+            decoded.events.iter().map(|e| e.address.as_str()).collect();
         let mut core_events: Vec<(String, DecodedKind, Option<String>, Option<String>)> =
             Vec::new();
         for touch in &decoded.core {
-            match self.resolve_core(touch, slot).await {
+            let decided = classified.contains(touch.asset.as_str());
+            match self.resolve_core(touch, slot, decided).await {
                 Ok(Some(event)) => {
                     outcome.hydrated += 1;
                     core_events.push(event);
@@ -315,25 +323,33 @@ impl Pipeline {
         Ok(Outcome::default())
     }
 
-    /// Classifies a Metaplex Core touch from DAS state rather than from the
-    /// instruction.
+    /// Resolves a Metaplex Core touch against DAS: creates the row for an
+    /// asset we have never seen, and classifies the instructions the decoder
+    /// could not read from DAS state.
     ///
-    /// Decoding Core's Borsh discriminators would mean hardcoding protocol
-    /// constants for a rare event; asking DAS what the asset looks like now is
-    /// self-correcting and reuses the backfill's own merge. The cost is stated
-    /// in the README: two ownership changes for one asset inside the DAS read
-    /// window would attribute the first transfer's receiver to the final
-    /// owner, which reconciliation later heals.
+    /// `decided` means the decoder already classified this asset's
+    /// instruction, and for a known asset DAS is then not asked at all. Asking
+    /// it is what lost every Core transfer between 2026-09-03 and 2026-10-27:
+    /// DAS trails the chain, so the live path read the old owner and saw no
+    /// change, and the reconcile path ran only after the tip probe had patched
+    /// the owner, so it saw none either. The DAS fallback keeps the cost the
+    /// README states — two ownership changes inside one DAS read window
+    /// attribute the first transfer's receiver to the final owner — but only
+    /// for instructions the decoder does not classify.
     async fn resolve_core(
         &self,
         touch: &CoreTouch,
         slot: i64,
+        decided: bool,
     ) -> anyhow::Result<Option<(String, DecodedKind, Option<String>, Option<String>)>> {
         let address = touch.asset.as_str();
         let stored = activity::assets_by_address(&self.pool, &[address.to_string()])
             .await?
             .into_iter()
             .next();
+        if decided && stored.is_some() {
+            return Ok(None);
+        }
 
         let batch = self.das.get_asset_batch(&[address.to_string()]).await?;
         let Some(asset) = batch.found.into_iter().next() else {
@@ -381,6 +397,13 @@ impl Pipeline {
                 upsert(&self.pool, &asset, collection_id, slot).await?;
                 if asset.attributes().is_none_or(|a| a.is_empty()) {
                     self.spawn_hydrate(address.to_string(), collection_id, slot);
+                }
+                // The decoder's own event — the mint, or a move of an asset
+                // whose mint we never saw — now finds its row. Reporting a
+                // mint here as well would be a second claim on the same
+                // `(asset, signature, seq)`, and for a move a false one.
+                if decided {
+                    return Ok(None);
                 }
                 Ok(Some((address.to_string(), DecodedKind::Mint, None, owner)))
             }

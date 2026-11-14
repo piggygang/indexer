@@ -79,7 +79,7 @@ async fn migrations_rerun_is_noop(pool: PgPool) {
         })
         .count() as i64;
     assert_eq!(applied, on_disk);
-    assert_eq!(applied, 9);
+    assert_eq!(applied, 10);
 }
 
 #[sqlx::test]
@@ -173,6 +173,28 @@ async fn registry_checks(pool: PgPool) {
     .await
     .unwrap();
 
+    // Only a Core collection names its program, and it must be a pubkey.
+    let set_program = "UPDATE collections SET program = $2 WHERE id = $1";
+    for (id, program) in [
+        (certified, pk(5)),
+        (placeholder, pk(5)),
+        (core, "not-base58-0OIl".to_string()),
+    ] {
+        let err = sqlx::query(set_program)
+            .bind(id)
+            .bind(program)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(code(err), CHECK_VIOLATION);
+    }
+    sqlx::query(set_program)
+        .bind(core)
+        .bind(pk(5))
+        .execute(&pool)
+        .await
+        .unwrap();
+
     let rows = registry::list(&pool, false).await.unwrap();
     let rule = |id: i32| rows.iter().find(|r| r.id == id).unwrap().membership_rule;
     assert_eq!(rule(placeholder), None);
@@ -185,6 +207,7 @@ async fn registry_checks(pool: PgPool) {
     let core_row = rows.iter().find(|r| r.id == core).unwrap();
     assert_eq!(core_row.standard, Some(Standard::Core));
     assert_eq!(core_row.address.as_deref(), Some(pk(1).as_str()));
+    assert_eq!(core_row.program.as_deref(), Some(pk(5).as_str()));
     let placeholder_row = rows.iter().find(|r| r.id == placeholder).unwrap();
     assert_eq!(placeholder_row.standard, None);
     let enabled = registry::list_enabled(&pool).await.unwrap();

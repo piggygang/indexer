@@ -36,6 +36,11 @@ pub struct CollectionSeed {
     pub enabled: bool,
     #[serde(default)]
     pub address: Option<String>,
+    /// Core only: the program that owns `address`. Without it the decoder
+    /// cannot tell a Core instruction from a lookalike, and leaves them all
+    /// to DAS.
+    #[serde(default)]
+    pub program: Option<String>,
     #[serde(default)]
     pub verified_creator: Option<String>,
     #[serde(default)]
@@ -181,6 +186,7 @@ pub fn validate(file: &SeedFile, mints: &BTreeMap<String, Vec<String>>) -> Vec<S
         }
         for (field, value) in [
             ("address", &c.address),
+            ("program", &c.program),
             ("verified_creator", &c.verified_creator),
             ("update_authority", &c.update_authority),
         ] {
@@ -217,6 +223,9 @@ pub fn validate(file: &SeedFile, mints: &BTreeMap<String, Vec<String>>) -> Vec<S
                 }
             }
             Some(Standard::TokenMetadata) => {
+                if c.program.is_some() {
+                    p("program is a core collection field".into());
+                }
                 if c.enabled && c.address.is_none() && c.verified_creator.is_none() {
                     p("enabled token_metadata collection needs address (certified collection) or verified_creator".into());
                 }
@@ -231,7 +240,7 @@ pub fn validate(file: &SeedFile, mints: &BTreeMap<String, Vec<String>>) -> Vec<S
                 if c.enabled {
                     p("enabled collection needs a standard".into());
                 }
-                if has_tm_fields || c.address.is_some() {
+                if has_tm_fields || c.address.is_some() || c.program.is_some() {
                     p("a placeholder without standard cannot carry addresses or mints".into());
                 }
             }
@@ -488,21 +497,24 @@ async fn upsert_collection(
     let row: Option<(i32, bool)> = sqlx::query_as(
         "INSERT INTO collections \
             (slug, name, standard, address, verified_creator, update_authority, symbol, image_url, \
-             metadata_uri_template, facet_exclude, enabled) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+             metadata_uri_template, facet_exclude, enabled, program) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
          ON CONFLICT (slug) DO UPDATE SET \
             name = EXCLUDED.name, standard = EXCLUDED.standard, address = EXCLUDED.address, \
             verified_creator = EXCLUDED.verified_creator, update_authority = EXCLUDED.update_authority, \
             symbol = EXCLUDED.symbol, image_url = EXCLUDED.image_url, \
             metadata_uri_template = EXCLUDED.metadata_uri_template, \
-            facet_exclude = EXCLUDED.facet_exclude, enabled = EXCLUDED.enabled \
+            facet_exclude = EXCLUDED.facet_exclude, enabled = EXCLUDED.enabled, \
+            program = EXCLUDED.program \
          WHERE (collections.name, collections.standard, collections.address, collections.verified_creator, \
                 collections.update_authority, collections.symbol, collections.image_url, \
-                collections.metadata_uri_template, collections.facet_exclude, collections.enabled) \
+                collections.metadata_uri_template, collections.facet_exclude, collections.enabled, \
+                collections.program) \
                IS DISTINCT FROM \
                (EXCLUDED.name, EXCLUDED.standard, EXCLUDED.address, EXCLUDED.verified_creator, \
                 EXCLUDED.update_authority, EXCLUDED.symbol, EXCLUDED.image_url, \
-                EXCLUDED.metadata_uri_template, EXCLUDED.facet_exclude, EXCLUDED.enabled) \
+                EXCLUDED.metadata_uri_template, EXCLUDED.facet_exclude, EXCLUDED.enabled, \
+                EXCLUDED.program) \
          RETURNING id, (xmax = 0) AS inserted",
     )
     .bind(&c.slug)
@@ -516,6 +528,7 @@ async fn upsert_collection(
     .bind(&c.metadata_uri_template)
     .bind(&c.facet_exclude)
     .bind(c.enabled)
+    .bind(&c.program)
     .fetch_optional(&mut **tx)
     .await?;
     match row {
@@ -630,6 +643,14 @@ mod tests {
             !seed.mints.contains_key("piggy-gang"),
             "core collections carry no mint list"
         );
+        assert!(
+            seed.file
+                .collections
+                .iter()
+                .filter(|c| c.standard == Some(Standard::Core))
+                .all(|c| c.program.is_some()),
+            "a core collection without its program records no Core activity"
+        );
     }
 
     fn parse(toml_text: &str) -> Vec<String> {
@@ -670,6 +691,21 @@ verified_creator = "{}""#,
         assert!(creator_on_core
             .iter()
             .any(|p| p.contains("core collection cannot")));
+
+        let program_on_token_metadata = parse(&format!(
+            r#"version = 1
+[[collections]]
+slug = "x"
+name = "X"
+standard = "token_metadata"
+address = "{}"
+program = "{}""#,
+            synthetic_pk(1),
+            synthetic_pk(2)
+        ));
+        assert!(program_on_token_metadata
+            .iter()
+            .any(|p| p.contains("program is a core collection field")));
 
         let bad_base58 = parse(
             r#"version = 1
