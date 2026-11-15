@@ -261,4 +261,28 @@ async fn health_answers_without_a_pool() {
     let app = app!(None::<receiver::InboxWriter>, None::<&str>);
     let resp = test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
     assert!(resp.status().is_success());
+    let body: Value = test::read_body_json(resp).await;
+    assert_eq!(body["service"], "indexer-ingester");
+    // Explicitly null when nothing configured one, never omitted.
+    assert!(body.as_object().unwrap().contains_key("cluster"));
+    assert!(body["cluster"].is_null());
+}
+
+/// The deploy gate also says which chain: the `SOLANA_CLUSTER` spelling,
+/// verbatim, exactly as `main` registers it.
+#[actix_web::test]
+async fn health_reports_the_configured_cluster() {
+    for cluster in indexer_config::Cluster::ALL {
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(cluster))
+                .configure(indexer_ingester::receiver::configure),
+        )
+        .await;
+        let resp =
+            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
+        assert!(resp.status().is_success());
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body["cluster"], cluster.as_str());
+    }
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# `ws` (Helius Enhanced WebSockets) is the mainnet transport and is ON BY
+# `ws` (Helius Enhanced WebSockets) is the live transport and is ON BY
 # DEFAULT: `cargo clippy --workspace --all-targets` does not enable non-default
 # features, so a gated adapter would only ever be linted as a side effect of
 # some other package depending on it — and `cargo clippy -p indexer-ingest`

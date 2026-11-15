@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
+use indexer_config::Cluster;
 use indexer_das::DasClient;
 use indexer_data_model::{ingest_state, PgPool};
 use indexer_ingest::{IngestEvent, IngestSource, ResumeFrom, StreamStatus, SubscriptionSpec};
@@ -17,7 +18,7 @@ use tokio::sync::watch;
 use crate::pipeline::{Outcome, Pipeline};
 use crate::{reconcile, spec};
 
-/// The durable identity of one transport.
+/// The durable identity of one transport on one cluster.
 ///
 /// `stream` is the `ingest_state.stream` key the migration specifies
 /// (`'<IngestSource::name()>:<label>'`); `source` is the `activity.source` tag
@@ -27,23 +28,50 @@ use crate::{reconcile, spec};
 /// One `Copy` struct rather than two fields, because the two must never
 /// disagree: a consumer that checkpoints one lane and tags its rows with
 /// another is the bug this shape forecloses.
+///
+/// **The cluster is in the key, and slots are why.** A cursor is a slot
+/// number, and slot numbers are only comparable on the chain that produced
+/// them — devnet's run tens of millions ahead of mainnet's. Checkpoints are
+/// written with `GREATEST`, so a cursor that once took the other cluster's
+/// slot would sit above this cluster's tip for years, and on a transport with
+/// no replay everything below the cursor is dropped. Each cluster has its own
+/// Postgres, so the keys never meet in practice; a key that names its cluster
+/// is what keeps that true of the data rather than only of the deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lane {
     pub stream: &'static str,
     pub source: &'static str,
 }
 
-/// Helius Enhanced WebSockets. No replay — `ResumeFrom::Slot` is a floor.
-pub const WS: Lane = Lane {
-    stream: "helius-ws:mainnet",
-    source: "live",
-};
+impl Lane {
+    /// Helius Enhanced WebSockets. No replay — `ResumeFrom::Slot` is a floor.
+    ///
+    /// `mainnet`, not `mainnet-beta`: these are the keys production has
+    /// checkpointed under since ALG-623, and the label is not cosmetic. A
+    /// renamed key is a cursor nobody reads — the consumer would re-seed from
+    /// the DAS backfill's slot and re-walk everything since.
+    pub const fn ws(cluster: Cluster) -> Self {
+        Self {
+            stream: match cluster {
+                Cluster::MainnetBeta => "helius-ws:mainnet",
+                Cluster::Devnet => "helius-ws:devnet",
+            },
+            source: "live",
+        }
+    }
 
-/// Helius webhooks, received by this service and drained from `webhook_inbox`.
-pub const WEBHOOK: Lane = Lane {
-    stream: "helius-webhook:mainnet",
-    source: "webhook",
-};
+    /// Helius webhooks, received by this service and drained from
+    /// `webhook_inbox`.
+    pub const fn webhook(cluster: Cluster) -> Self {
+        Self {
+            stream: match cluster {
+                Cluster::MainnetBeta => "helius-webhook:mainnet",
+                Cluster::Devnet => "helius-webhook:devnet",
+            },
+            source: "webhook",
+        }
+    }
+}
 
 /// Checkpoints are coalesced: roots arrive ~2.5/s and each is an upsert.
 /// `GREATEST` makes throttling safe, and the contract only requires that a
@@ -320,4 +348,53 @@ pub fn shutdown_signal() -> watch::Receiver<bool> {
 /// Builds the spec once, for callers that want it without a consumer.
 pub async fn current_spec(pool: &PgPool) -> anyhow::Result<SubscriptionSpec> {
     spec::build(pool).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Production's two cursors live under exactly these keys. Changing either
+    /// string orphans a cursor: the consumer finds no row, re-seeds from the
+    /// backfill's slot, and the first sweep replays weeks of activity.
+    #[test]
+    fn the_mainnet_keys_are_the_ones_production_checkpoints_under() {
+        assert_eq!(Lane::ws(Cluster::MainnetBeta).stream, "helius-ws:mainnet");
+        assert_eq!(
+            Lane::webhook(Cluster::MainnetBeta).stream,
+            "helius-webhook:mainnet"
+        );
+    }
+
+    /// `'<IngestSource::name()>:<label>'`, as the migration specifies — and no
+    /// two lanes on any cluster may share a key, because a shared key is one
+    /// cursor making a claim about two orderings.
+    #[test]
+    fn every_lane_has_its_own_key_and_the_cluster_never_changes_the_source_tag() {
+        let mut keys = BTreeSet::new();
+        for cluster in Cluster::ALL {
+            let (ws, webhook) = (Lane::ws(cluster), Lane::webhook(cluster));
+            assert!(ws.stream.starts_with("helius-ws:"), "{}", ws.stream);
+            assert!(
+                webhook
+                    .stream
+                    .starts_with(&format!("{}:", crate::inbox::NAME)),
+                "{}",
+                webhook.stream
+            );
+            assert!(keys.insert(ws.stream), "duplicate key {}", ws.stream);
+            assert!(
+                keys.insert(webhook.stream),
+                "duplicate key {}",
+                webhook.stream
+            );
+            // `activity.source` is a CHECK-constrained column and says which
+            // transport wrote a row, not which chain: the database is the
+            // cluster, so the tag stays the same on every one.
+            assert_eq!(ws.source, "live");
+            assert_eq!(webhook.source, "webhook");
+        }
+        assert_eq!(keys.len(), 2 * Cluster::ALL.len());
+    }
 }

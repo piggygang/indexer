@@ -15,8 +15,10 @@
 //! * **The base host is genuinely uncertain.** Helius's docs say
 //!   `mainnet.helius-rpc.com`, their own SDK uses `api-mainnet.helius-rpc.com`,
 //!   and a legacy `api.helius.xyz` is still in circulation. It is therefore
-//!   configurable, and [`WebhookClient::list`] — a free `GET` — is the first
-//!   call any caller makes, so a wrong host fails cheaply and by name.
+//!   configuration (`HELIUS_WEBHOOK_API`) with no default — a webhook is
+//!   registered per cluster, so the host is part of saying which one — and
+//!   [`WebhookClient::list`], a free `GET`, is the first call any caller
+//!   makes, so a wrong host fails cheaply and by name.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -25,7 +27,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::client::DasError;
+use crate::client::{transport, DasError};
 
 /// Helius's cap on one webhook's `accountAddresses`. Our ~17 000 fit in one.
 pub const MAX_ADDRESSES: usize = 100_000;
@@ -103,7 +105,7 @@ impl WebhookClient {
             .connect_timeout(Duration::from_secs(10))
             .user_agent(concat!("indexer-das/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|e| DasError::Transport(e.to_string()))?;
+            .map_err(transport)?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_string(),
@@ -124,7 +126,7 @@ impl WebhookClient {
             .get(self.url(""))
             .send()
             .await
-            .map_err(|e| DasError::Transport(e.to_string()))?;
+            .map_err(transport)?;
         Self::decode(response, "listWebhooks").await
     }
 
@@ -141,7 +143,7 @@ impl WebhookClient {
             .json(&Self::body(url, addresses, auth_header))
             .send()
             .await
-            .map_err(|e| DasError::Transport(e.to_string()))?;
+            .map_err(transport)?;
         Self::decode(response, "createWebhook").await
     }
 
@@ -160,7 +162,7 @@ impl WebhookClient {
             .json(&Self::body(url, addresses, auth_header))
             .send()
             .await
-            .map_err(|e| DasError::Transport(e.to_string()))?;
+            .map_err(transport)?;
         Self::decode(response, "updateWebhook").await
     }
 
@@ -171,7 +173,7 @@ impl WebhookClient {
             .delete(self.url(&format!("/{webhook_id}")))
             .send()
             .await
-            .map_err(|e| DasError::Transport(e.to_string()))?;
+            .map_err(transport)?;
         let status = response.status();
         if !status.is_success() {
             return Err(DasError::Status {
@@ -206,10 +208,7 @@ impl WebhookClient {
         method: &str,
     ) -> Result<T, DasError> {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| DasError::Transport(e.to_string()))?;
+        let body = response.text().await.map_err(transport)?;
         if !status.is_success() {
             // The body often names the real problem (a bad host answers with
             // HTML, a bad key with JSON), and losing it would make a wrong
@@ -276,6 +275,17 @@ mod tests {
         assert!(diff.url_changed);
         assert_eq!(diff.kept, 1);
         assert!(!diff.is_noop());
+    }
+
+    /// The management URL carries the key exactly as the RPC one does, and a
+    /// wrong `HELIUS_WEBHOOK_API` host is the commonest way to see a transport
+    /// error here — printed, chain and all, on the operator's terminal.
+    #[tokio::test]
+    async fn a_transport_error_never_carries_the_api_key() {
+        let client = WebhookClient::new("http://127.0.0.1:1", "s3cr3t-key").unwrap();
+        let error = client.list().await.unwrap_err();
+        let rendered = format!("{error} / {error:?}");
+        assert!(!rendered.contains("s3cr3t-key"), "leaked: {rendered}");
     }
 
     /// A moved endpoint alone must still be worth the write — otherwise a

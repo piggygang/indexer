@@ -1,5 +1,5 @@
-//! Helius Enhanced WebSockets — the mainnet transport (ALG-618's decision,
-//! Developer plan).
+//! Helius Enhanced WebSockets — the live transport (ALG-618's decision,
+//! Developer plan), on whichever cluster the endpoint it is handed serves.
 //!
 //! The adapter owns reconnection and keepalive; the consumer owns the durable
 //! cursor. Three properties of *this* transport shape the implementation:
@@ -61,14 +61,22 @@ pub struct HeliusWs {
 }
 
 impl HeliusWs {
-    /// `api_key` is appended as a query parameter; it is never logged — see
-    /// [`redact`].
-    pub fn new(api_key: &str) -> Self {
-        Self::with_endpoint(&format!("wss://mainnet.helius-rpc.com/?api-key={api_key}"))
+    /// `endpoint` is the bare WebSocket endpoint (`SOLANA_WS_URL`, e.g.
+    /// `wss://mainnet.helius-rpc.com`) — this crate knows no host of its own,
+    /// so which cluster the adapter streams is the caller's configuration and
+    /// nothing else. `api_key` is appended as a query parameter, the same way
+    /// the DAS client does it, and is never logged — see [`redact`].
+    pub fn new(endpoint: &str, api_key: &str) -> Self {
+        let endpoint = endpoint.trim_end_matches('/');
+        if api_key.is_empty() {
+            Self::with_endpoint(endpoint)
+        } else {
+            Self::with_endpoint(&format!("{endpoint}/?api-key={api_key}"))
+        }
     }
 
-    /// Points the adapter at an arbitrary endpoint, so tests can drive a
-    /// loopback `ws://` server with no key and no TLS.
+    /// The whole URL, verbatim, so tests can drive a loopback `ws://` server
+    /// with no key and no TLS.
     pub fn with_endpoint(url: &str) -> Self {
         Self {
             url: url.to_string(),
@@ -420,8 +428,8 @@ pub fn redact(url: &str) -> String {
 }
 
 /// Convenience for a consumer that wants one shared source.
-pub fn shared(api_key: &str) -> Arc<dyn IngestSource> {
-    Arc::new(HeliusWs::new(api_key))
+pub fn shared(endpoint: &str, api_key: &str) -> Arc<dyn IngestSource> {
+    Arc::new(HeliusWs::new(endpoint, api_key))
 }
 
 #[cfg(test)]
@@ -439,9 +447,29 @@ mod tests {
 
     #[test]
     fn the_endpoint_carries_the_key_as_a_query_parameter() {
-        let source = HeliusWs::new("k");
+        let source = HeliusWs::new("wss://mainnet.helius-rpc.com", "k");
         assert_eq!(source.url, "wss://mainnet.helius-rpc.com/?api-key=k");
         assert_eq!(source.name(), "helius-ws");
+        // A trailing slash on the endpoint does not double up.
+        assert_eq!(
+            HeliusWs::new("wss://devnet.helius-rpc.com/", "k").url,
+            "wss://devnet.helius-rpc.com/?api-key=k"
+        );
+        // No key, no query: what a local validator's pubsub port wants.
+        assert_eq!(
+            HeliusWs::new("ws://127.0.0.1:8900", "").url,
+            "ws://127.0.0.1:8900"
+        );
+    }
+
+    /// The adapter dials what it is handed and nothing else: the cluster is
+    /// the caller's configuration, so no constructor may know a host.
+    #[test]
+    fn the_adapter_streams_whichever_cluster_its_endpoint_serves() {
+        let mainnet = HeliusWs::new("wss://mainnet.helius-rpc.com", "k");
+        let devnet = HeliusWs::new("wss://devnet.helius-rpc.com", "k");
+        assert_ne!(mainnet.url, devnet.url);
+        assert!(devnet.url.starts_with("wss://devnet.helius-rpc.com/"));
     }
 
     #[test]

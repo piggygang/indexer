@@ -15,6 +15,7 @@
 pub mod asset;
 pub mod backfill;
 pub mod client;
+pub mod cluster;
 pub mod webhooks;
 
 pub use asset::Asset;
@@ -22,3 +23,4 @@ pub use backfill::{BackfillOptions, BackfillReport, BatchProgress, CollectionRep
 pub use client::{
     ArchivedTx, DasClient, DasError, Reachability, SearchFilter, SearchPage, SignatureInfo, TxPage,
 };
+pub use cluster::ClusterError;

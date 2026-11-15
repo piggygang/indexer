@@ -18,8 +18,6 @@ use crate::asset::Asset;
 /// DAS caps `getAssetBatch` at 1 000 ids.
 pub const MAX_BATCH: usize = 1000;
 
-const DEFAULT_ENDPOINT: &str = "https://mainnet.helius-rpc.com";
-
 #[derive(Debug, thiserror::Error)]
 pub enum DasError {
     #[error("http transport: {0}")]
@@ -209,20 +207,21 @@ pub struct DasClient {
 }
 
 impl DasClient {
-    pub fn new(api_key: &str) -> Result<Self, DasError> {
-        Self::with_endpoint(DEFAULT_ENDPOINT, api_key)
-    }
-
-    /// Points the client at an arbitrary endpoint — the integration test
-    /// serves a fake Helius from loopback, so no key and no network are
-    /// needed to exercise the whole pipeline.
+    /// The only constructor, and it takes the endpoint: this crate knows no
+    /// host of its own. Which cluster a client talks to is the caller's
+    /// configuration (`SOLANA_RPC_URL`), passed as a `&str` exactly as the key
+    /// is — a hardcoded default here is how a devnet deployment would have
+    /// kept reading mainnet without anyone having chosen that.
+    ///
+    /// `api_key` is appended as `?api-key=`; empty means "send none", which is
+    /// what the integration tests' loopback fake Helius wants.
     pub fn with_endpoint(endpoint: &str, api_key: &str) -> Result<Self, DasError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .user_agent(concat!("indexer-das/", env!("CARGO_PKG_VERSION")))
             .build()
-            .map_err(|e| DasError::Transport(e.to_string()))?;
+            .map_err(transport)?;
         Ok(Self {
             http,
             endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -255,6 +254,21 @@ impl DasClient {
         } else {
             format!("{}/?api-key={}", self.endpoint, self.api_key)
         }
+    }
+
+    /// The genesis hash of the cluster this endpoint serves.
+    ///
+    /// The cluster's identity as the node itself states it — the one thing an
+    /// endpoint cannot be wrong about by accident. See [`crate::cluster`].
+    pub async fn get_genesis_hash(&self) -> Result<String, DasError> {
+        let result = self.rpc("getGenesisHash", json!([])).await?;
+        result
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| DasError::Rpc {
+                method: "getGenesisHash".into(),
+                message: format!("expected a string, got {result}"),
+            })
     }
 
     /// Current slot. Read **before** each data call, so the value stamped on
@@ -549,7 +563,7 @@ impl DasClient {
                             Ok(RpcResponse { result, .. }) => {
                                 return Ok(result.unwrap_or(Value::Null))
                             }
-                            Err(e) => Err(DasError::Transport(e.to_string())),
+                            Err(e) => Err(transport(e)),
                         }
                     } else {
                         Err(DasError::Status {
@@ -558,7 +572,7 @@ impl DasClient {
                         })
                     }
                 }
-                Err(e) => Err(DasError::Transport(e.to_string())),
+                Err(e) => Err(transport(e)),
             };
 
             let error = outcome.unwrap_err();
@@ -729,6 +743,61 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250u64.saturating_mul(1 << attempt.min(5)))
 }
 
+/// A transport failure, with the request URL removed and the cause kept.
+///
+/// reqwest's `Display` is "error sending request for url (…)": the whole URL,
+/// query string included, and the query string is where `api-key=` travels.
+/// Every caller logs these errors — the retry loop at `debug`, the ingester's
+/// boot check at `warn`, the admin CLI straight to the terminal — so the URL
+/// has to go *here*, at the one place a `reqwest::Error` becomes a string,
+/// rather than at each of them. That it was not is how a single refused
+/// connection used to put the key in the logs.
+///
+/// Nothing useful is lost, and something is gained: the method is in the
+/// surrounding message, the endpoint is logged alongside (see [`redact`]), and
+/// reqwest's own text never said *why* — "error sending request" is the same
+/// for a refused connection, a DNS failure and a TLS fault. The cause chain is
+/// appended instead. [`scrub`] then masks any `api-key=` that a cause might
+/// still spell out; none does today, and a secret is not where to rely on
+/// that staying true.
+///
+/// For the RPC and webhook-management paths only — the two whose URLs carry
+/// the key. `fetch_document` keeps reqwest's message, because there the URL is
+/// a public metadata document and naming it is the whole diagnostic.
+pub(crate) fn transport(error: reqwest::Error) -> DasError {
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut cause = std::error::Error::source(&error);
+    while let Some(inner) = cause {
+        message.push_str(": ");
+        message.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    DasError::Transport(scrub(&message))
+}
+
+/// Masks the value of every `api-key=` in free text, leaving the rest intact.
+///
+/// Unlike [`redact`], which takes a URL and can simply drop everything after
+/// the marker, this takes a sentence: the text after the key matters too.
+fn scrub(message: &str) -> String {
+    const MARKER: &str = "api-key=";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(index) = rest.find(MARKER) {
+        let (before, after) = rest.split_at(index + MARKER.len());
+        out.push_str(before);
+        out.push_str("***");
+        // The value runs to the end of the query parameter, or of the URL.
+        let end = after
+            .find(|c: char| c == '&' || c == ')' || c == '"' || c == '\'' || c.is_whitespace())
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Strips the API key so a URL can be logged. The key is a secret and this
 /// crate logs request failures by default.
 pub fn redact(url: &str) -> String {
@@ -752,6 +821,21 @@ mod tests {
             redact("https://example.invalid/1.json"),
             "https://example.invalid/1.json"
         );
+    }
+
+    #[test]
+    fn scrubbing_masks_the_key_and_keeps_the_sentence() {
+        assert_eq!(
+            scrub("error for url (https://rpc.example.test/?api-key=s3cr3t): refused"),
+            "error for url (https://rpc.example.test/?api-key=***): refused"
+        );
+        // Every occurrence, and only the value: a following parameter stays.
+        assert_eq!(
+            scrub("a ?api-key=one&commitment=confirmed then b ?api-key=two"),
+            "a ?api-key=***&commitment=confirmed then b ?api-key=***"
+        );
+        assert_eq!(scrub("connection refused"), "connection refused");
+        assert_eq!(scrub(""), "");
     }
 
     #[test]
@@ -808,6 +892,29 @@ mod tests {
         .unwrap();
         assert!(failed.failed());
         assert_eq!(failed.block_time_utc(), None);
+    }
+
+    /// reqwest's `Display` ends " for url (…)", query string and all, and the
+    /// query string is where the key travels. These errors are logged by every
+    /// caller — at `warn` by the ingester's boot check, on the terminal by the
+    /// admin CLI — so one transport fault used to be enough to put the key in
+    /// Railway's logs.
+    #[tokio::test]
+    async fn a_transport_error_never_carries_the_api_key() {
+        // Nothing listens on port 1, so the connect is refused at once.
+        let client = DasClient::with_endpoint("http://127.0.0.1:1", "s3cr3t-key")
+            .unwrap()
+            .with_max_attempts(1);
+        let error = client.get_slot().await.unwrap_err();
+        assert!(matches!(error, DasError::Transport(_)), "{error:?}");
+        let rendered = format!("{error} / {error:?}");
+        assert!(!rendered.contains("s3cr3t-key"), "leaked: {rendered}");
+        // The cause survives, which the bare reqwest message never carried:
+        // "error sending request" alone says nothing about why.
+        assert!(
+            rendered.to_lowercase().contains("connect"),
+            "the cause should be named: {rendered}"
+        );
     }
 
     #[tokio::test]

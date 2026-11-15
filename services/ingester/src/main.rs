@@ -15,6 +15,14 @@
 //! background task here on one thread. The server is spawned independently of
 //! the consumer supervisors, so a consumer restart never stops accepting
 //! deliveries.
+//!
+//! **Nothing is ingested until the cluster is verified** (PIG-113). The
+//! cluster and its endpoints are independent variables, so before any consumer
+//! or sweep starts, `SOLANA_RPC_URL` has to state — by its own genesis hash —
+//! that it serves `SOLANA_CLUSTER`. The check is the first thing the process
+//! does with the network, ahead of the database: a deployment pointed at the
+//! wrong chain exits without having opened a connection to Postgres. See
+//! [`indexer_ingester::cluster`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +31,8 @@ use actix_web::{web, App, HttpServer};
 use indexer_config::{Config, Transport};
 use indexer_das::DasClient;
 use indexer_ingest::ws::HeliusWs;
-use indexer_ingester::consumer::{self, Consumer};
+use indexer_ingester::cluster::{self, Verdict};
+use indexer_ingester::consumer::{self, Consumer, Lane};
 use indexer_ingester::inbox::WebhookInbox;
 use indexer_ingester::receiver::{self, WebhookSecret};
 use indexer_ingester::schedule;
@@ -33,12 +42,54 @@ use indexer_ingester::schedule;
 /// retries is a better answer than an unbounded queue.
 const WRITE_QUEUE: usize = 64;
 
+/// How long the cluster check runs before anything else happens.
+///
+/// The webhook receiver's `/health` is the deploy gate, so the order matters.
+/// An endpoint on the wrong cluster must fail the *deploy* — exit before the
+/// port is bound, so Railway keeps the previous deployment — rather than pass
+/// the healthcheck and then crash-loop with nothing left to fall back to. But
+/// an endpoint that simply is not answering must not hold the receiver back
+/// for the length of an outage: filing a delivery needs no RPC, and Helius
+/// drops what it cannot deliver after about three tries.
+///
+/// So the check gets this long alone, first. One answer takes well under a
+/// second and the client's own four attempts span about 3.5 s, so this covers
+/// a slow answer and a retry round, and still leaves the database its 60 s
+/// inside the 120 s healthcheck window. If it has not answered by then, boot
+/// carries on to the receiver and the check resumes — unbounded — before
+/// anything that writes is started.
+const CLUSTER_CHECK_HEAD_START: Duration = Duration::from_secs(15);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
 
     let config = Config::try_from_env()?;
+    // Resolved before the database is dialled: a missing endpoint is a
+    // configuration error, and it should not take a 60 s connect budget to be
+    // told so. No endpoint is derived from the cluster, so each one this
+    // process will dial has to be present by name.
+    let solana = &config.solana;
+    let cluster = solana.cluster;
+    let rpc_url = solana.required_rpc_url()?;
+    let ws_url = if config.ingest.runs(Transport::Ws) {
+        Some(solana.required_ws_url()?)
+    } else {
+        None
+    };
+    let api_key = config.helius.required_api_key()?;
+    log::info!("cluster: {}", solana.describe());
+
+    // Every client in this process is built here and nowhere else, so there is
+    // one place that decides which endpoint a `DasClient` dials.
+    let das = || DasClient::with_endpoint(rpc_url, api_key);
+
+    // The cluster check, first and alone — see CLUSTER_CHECK_HEAD_START. A
+    // mismatch returns from here: no database connection, no bound port.
+    let verifier = das()?;
+    let verified = cluster::verify_within(&verifier, solana, CLUSTER_CHECK_HEAD_START).await?;
+
     let db = &config.database;
     let pool = indexer_data_model::connect_with_retry(
         db.required_url()?,
@@ -51,13 +102,12 @@ async fn main() -> anyhow::Result<()> {
     indexer_data_model::migrate(&pool).await?;
     log::info!("database migrated");
 
-    let api_key = config.helius.required_api_key()?;
     // One throttled client for everything that reconciles. There is exactly
     // one reconciling task in this process now — the schedule — so this is the
     // whole reconcile budget rather than one share of it. Helius meters DAS at
     // 10 req/s on the Developer plan; two independent limiters set to that
     // value would ask for 20.
-    let reconcile_das = DasClient::new(api_key)?.with_rate_limit(config.reconcile.rps);
+    let reconcile_das = das()?.with_rate_limit(config.reconcile.rps);
     let shutdown = consumer::shutdown_signal();
 
     // Every consumer signals this on `Connected`; the schedule decides what to
@@ -84,6 +134,24 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // No answer inside the head start: the receiver is up and filing, and the
+    // check resumes here for as long as it takes. Still nothing is ingested
+    // until it passes — the schedule and the consumers below are what write.
+    let verdict = if verified {
+        Verdict::Verified
+    } else {
+        cluster::verify(&verifier, solana, shutdown.clone()).await?
+    };
+    if verdict == Verdict::Interrupted {
+        if let Some(http) = http {
+            if let Err(error) = http.await {
+                log::warn!("the webhook receiver ended abnormally: {error}");
+            }
+        }
+        log::info!("ingester stopped before the cluster was verified; nothing was ingested");
+        return Ok(());
+    }
+
     // Spawned once, outside the supervisors: the schedule is not part of any
     // consumer's lifecycle, and re-spawning it on every restart would let a
     // flapping stream either starve reconciliation or run it constantly.
@@ -92,8 +160,8 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         reconcile_das.clone(),
         match reconciler {
-            Some(Transport::Webhook) => consumer::WEBHOOK,
-            _ => consumer::WS,
+            Some(Transport::Webhook) => Lane::webhook(cluster),
+            _ => Lane::ws(cluster),
         },
         config.reconcile.clone(),
         config.rarity.clone(),
@@ -107,29 +175,29 @@ async fn main() -> anyhow::Result<()> {
     // the minimum of both would pin the WebSocket's cursor during a webhook
     // outage — destroying the very diagnostic a dual run exists to produce.
     let mut lanes = Vec::new();
-    if config.ingest.runs(Transport::Ws) {
+    if let Some(ws_url) = ws_url {
         lanes.push(Consumer {
             pool: pool.clone(),
-            das: DasClient::new(api_key)?,
+            das: das()?,
             nudge: nudge.clone(),
-            source: Arc::new(HeliusWs::new(api_key)),
-            lane: consumer::WS,
+            source: Arc::new(HeliusWs::new(ws_url, api_key)),
+            lane: Lane::ws(cluster),
         });
     }
     if config.ingest.runs(Transport::Webhook) {
         lanes.push(Consumer {
             pool: pool.clone(),
-            das: DasClient::new(api_key)?,
+            das: das()?,
             nudge: nudge.clone(),
             source: Arc::new(WebhookInbox::new(
                 pool.clone(),
                 // Its own budget: a burst of deliveries must not consume the
                 // reconcile's rate limit. `getTransaction` is on the 50/s RPC
                 // bucket, not DAS's 10/s.
-                DasClient::new(api_key)?.with_rate_limit(config.reconcile.rps * 2),
+                das()?.with_rate_limit(config.reconcile.rps * 2),
                 config.ingest.clone(),
             )),
-            lane: consumer::WEBHOOK,
+            lane: Lane::webhook(cluster),
         });
     }
 
@@ -173,10 +241,13 @@ fn serve(
 
     let secret = web::Data::new(secret);
     let writer = web::Data::new(writer);
+    // What `/health` reports, so the deploy gate also says which chain.
+    let cluster = web::Data::new(config.solana.cluster);
     let server = HttpServer::new(move || {
         App::new()
             .app_data(secret.clone())
             .app_data(writer.clone())
+            .app_data(cluster.clone())
             .configure(receiver::configure)
     })
     // Two, not one-per-core: this endpoint serves a few hundred requests a day

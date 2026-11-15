@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use actix_web::{get, http::header, post, web, HttpRequest, HttpResponse};
+use indexer_config::Cluster;
 use indexer_data_model::webhook_inbox::{self, Delivery};
 use indexer_data_model::PgPool;
 use serde_json::Value;
@@ -136,8 +137,14 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
 ///
 /// The Railway healthcheck gates the deploy, and gating it on Postgres would
 /// let a database blip block a cutover. Same rule the api follows.
+///
+/// `cluster` is the configured `SOLANA_CLUSTER`, so the first thing anyone
+/// curls says which chain this deployment believes it is on — two
+/// environments differ by one hostname, and that is easy to get wrong at a
+/// terminal. `null` only for a route table built without one, which the binary
+/// never does.
 #[get("/health")]
-pub async fn health() -> HttpResponse {
+pub async fn health(cluster: Option<web::Data<Cluster>>) -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "service": env!("CARGO_PKG_NAME"),
@@ -146,6 +153,7 @@ pub async fn health() -> HttpResponse {
             Some(sha) if !sha.is_empty() => sha,
             _ => "unknown",
         },
+        "cluster": cluster.map(|cluster| cluster.as_str()),
     }))
 }
 

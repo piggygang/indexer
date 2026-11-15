@@ -22,6 +22,36 @@ const REGION = "ams";
 /** Build inputs shared by every service: a change here rebuilds all of them. */
 const COMMON = ["crates/**", "Cargo.toml", "Cargo.lock", "Dockerfile"];
 
+// Which chain this environment indexes, and the endpoints that reach it
+// (PIG-113). Literals, not preserve(): none of them is a secret — the Helius
+// key is appended by the binaries from HELIUS_API_KEY — and writing them here
+// is the point. `SOLANA_CLUSTER` is REQUIRED by every binary and has no
+// default, and no endpoint is ever derived from it, so each service declares
+// exactly the ones it dials:
+//
+//   api       SOLANA_CLUSTER                      (dials nothing; /health reports it)
+//   admin     + SOLANA_RPC_URL, HELIUS_WEBHOOK_API  (backfills; `webhook`)
+//   ingester  + SOLANA_RPC_URL, SOLANA_WS_URL
+//
+// A required variable inverts the usual order: **apply before the merge that
+// needs it**, because a merge never applies this file. Setting a variable
+// redeploys the binary that is already running, which ignores a name it does
+// not know; the new binary then finds it on its first boot. The other way
+// round, the new image fails its healthcheck and Railway keeps the old
+// deployment — safe, but nothing ships until the variable exists.
+//
+// A hostname that names another cluster is refused at parse time, so pasting
+// the devnet environment's values here fails the deploy rather than indexing
+// devnet into this Postgres.
+/** `devnet` | `mainnet-beta` — the SOLANA_CLUSTER spelling, exactly. */
+const CLUSTER = "mainnet-beta";
+/** JSON-RPC + DAS. Bare endpoint: no query string, no key. */
+const RPC_URL = "https://mainnet.helius-rpc.com";
+/** Enhanced WebSockets. Its own variable — never the RPC URL with the scheme swapped. */
+const WS_URL = "wss://mainnet.helius-rpc.com";
+/** Webhook management API. What the binary used to default to. */
+const WEBHOOK_API = "https://api-mainnet.helius-rpc.com";
+
 // Deliberately NOT set here: deploy.restartPolicyType / restartPolicyMaxRetries
 // and deploy.sleepApplication. The SDK accepts them and `config plan` reports
 // them as pending, but `config apply` silently drops them — a read-back with
@@ -59,6 +89,7 @@ export default defineRailway(() => {
       HELIUS_API_KEY: preserve(),
       HOST: preserve(),
       RUST_LOG: preserve(),
+      SOLANA_CLUSTER: CLUSTER, // required; the api dials no endpoint, so it has none
     },
   });
 
@@ -93,6 +124,13 @@ export default defineRailway(() => {
       HELIUS_API_KEY: preserve(),
       RUST_LOG: "info",
       DATABASE_MAX_CONNECTIONS: "2", // interactive, one-off; leave headroom for api
+      SOLANA_CLUSTER: CLUSTER,
+      // `backfill` and `backfill-activity` verify this endpoint's genesis hash
+      // against the cluster before they write.
+      SOLANA_RPC_URL: RPC_URL,
+      // `webhook` only. It used to be a default inside the binary; declared so
+      // `webhook --dry-run` keeps working from `railway ssh` as it did.
+      HELIUS_WEBHOOK_API: WEBHOOK_API,
     },
   });
 
@@ -181,6 +219,13 @@ export default defineRailway(() => {
       // task on the main runtime rather than touching the pool from an actix
       // worker, whose runtime can be dropped out from under a connection.
       DATABASE_MAX_CONNECTIONS: "7",
+      SOLANA_CLUSTER: CLUSTER,
+      // The ingester asks this endpoint for its genesis hash before it opens a
+      // database connection or binds the port, and exits on a mismatch — so a
+      // wrong value here fails the deploy instead of running a sweep that
+      // marks a whole Core collection `removed`.
+      SOLANA_RPC_URL: RPC_URL,
+      SOLANA_WS_URL: WS_URL,
     },
   });
 
