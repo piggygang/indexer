@@ -840,10 +840,6 @@ pub(crate) fn scrub(message: &str) -> String {
     out
 }
 
-/// Anything shorter is not a secret worth mangling a message for — and a
-/// one-letter test key must not turn every `k` in an error into `***`.
-const MIN_SECRET_LEN: usize = 8;
-
 /// Masks secrets in text that came from the other side of a connection.
 ///
 /// [`scrub`] handles the shape *we* send (`api-key=…`). This also removes, by
@@ -851,12 +847,24 @@ const MIN_SECRET_LEN: usize = 8;
 /// validation error that echoes the request back echoes them in whatever shape
 /// the server likes — a bare key in a sentence, `"authHeader":"…"` in JSON —
 /// and these messages are logged and stored like any other.
+///
+/// **Every non-empty secret, in both spellings it can be echoed in.** There is
+/// no length floor: configuration accepts any non-empty secret, and which ones
+/// deserve to stay secret is not this function's call. And a secret sent
+/// inside a JSON string comes back JSON-escaped — a quote or a backslash in it
+/// changes the bytes — so the escaped spelling is masked as well as the raw
+/// one. Only an empty value is skipped: there is nothing to find.
 pub(crate) fn mask(text: &str, secrets: &[&str]) -> String {
     let mut out = scrub(text);
-    for secret in secrets
-        .iter()
-        .filter(|secret| secret.len() >= MIN_SECRET_LEN)
-    {
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        // What `serde_json` writes between the quotes of a string. Cannot
+        // fail for a `&str`, and is always at least the two quotes.
+        let quoted = serde_json::to_string(secret).unwrap_or_default();
+        if let Some(escaped) = quoted.get(1..quoted.len().saturating_sub(1)) {
+            if escaped != *secret && !escaped.is_empty() {
+                out = out.replace(escaped, "***");
+            }
+        }
         out = out.replace(secret, "***");
     }
     out
@@ -1156,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn masking_removes_held_secrets_by_value_and_leaves_short_ones_alone() {
+    fn masking_removes_every_held_secret_by_value_in_either_encoding() {
         assert_eq!(
             mask(
                 r#"bad request: {"authHeader":"wh-s3cr3t-value"} at /v0/webhooks?api-key=k3y-k3y-k3y"#,
@@ -1164,9 +1172,39 @@ mod tests {
             ),
             r#"bad request: {"authHeader":"***"} at /v0/webhooks?api-key=***"#
         );
-        // A one-letter test key is not a secret, and masking it would turn
-        // every `k` in the message into `***`.
-        assert_eq!(mask("block not known", &["k", ""]), "block not known");
+        // Every non-empty secret, however short: configuration accepts any
+        // non-empty `HELIUS_WEBHOOK_SECRET`, so a length floor would be a rule
+        // about which secrets deserve to stay secret.
+        assert_eq!(
+            mask(r#"rejected {"authHeader":"hook123"}"#, &["hook123"]),
+            r#"rejected {"authHeader":"***"}"#
+        );
+        // Only an empty one is skipped — there is nothing to find, and
+        // replacing "" would mask between every character.
+        assert_eq!(mask("block not known", &[""]), "block not known");
+
+        // The secret travels inside a JSON string, so an echo of the request
+        // carries it JSON-escaped: a quote or a backslash in it changes the
+        // bytes. Both spellings are the same secret.
+        let secret = r#"wh-"quoted\value"#;
+        let echoed = format!(
+            "rejected {}",
+            json!({ "authHeader": secret, "webhookType": "raw" })
+        );
+        assert!(
+            echoed.contains(r#"wh-\"quoted\\value"#),
+            "the fixture must hold the escaped spelling: {echoed}"
+        );
+        let masked = mask(&echoed, &[secret]);
+        assert_eq!(
+            masked,
+            r#"rejected {"authHeader":"***","webhookType":"raw"}"#
+        );
+        // And the raw spelling, as a server that decoded the body would print it.
+        assert_eq!(
+            mask(&format!("bad header {secret} given"), &[secret]),
+            "bad header *** given"
+        );
     }
 
     /// Metadata is the other kind of request: a public document the chain

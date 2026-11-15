@@ -328,6 +328,30 @@ mod tests {
             "both were echoed, so both must show as masked: {error}"
         );
         assert!(!error.contains("s3cr3t"), "leaked: {error}");
+
+        // A short secret with a quote and a backslash in it: it goes out
+        // JSON-escaped, so the echo does not contain its raw bytes — and it is
+        // still the secret, in a spelling anyone can unescape.
+        let base = answering_with("400 Bad Request", |request| {
+            let body = request.split_once("\r\n\r\n").map_or("", |(_, body)| body);
+            format!("invalid payload {body}")
+        })
+        .await;
+        let client = WebhookClient::new(&base, "s3cr3t-key-value").unwrap();
+        let secret = r#"h"k\1"#;
+        let error = client
+            .create("https://example.test/hook", &["a".to_string()], secret)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(r#""authHeader":"***""#),
+            "the echoed secret must show as masked: {error}"
+        );
+        assert!(
+            !error.contains(secret) && !error.contains(r#"h\"k\\1"#),
+            "leaked, raw or escaped: {error}"
+        );
     }
 
     /// Every request here carries the key in its query, and `create` and
