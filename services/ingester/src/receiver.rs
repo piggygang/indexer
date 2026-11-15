@@ -33,6 +33,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::cluster::ClusterGate;
+
 /// Generous on purpose: a raw transaction with full `meta` and logs runs to
 /// tens of KB and Helius batches them into one array. Going over answers 413,
 /// which costs three retries and then the delivery — so the failure mode of
@@ -132,21 +134,51 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     );
 }
 
-/// Liveness only — no database.
+/// Liveness — no database — plus the one fact a deploy must not go live
+/// without: the RPC endpoint has proved it serves the configured cluster.
 ///
 /// The Railway healthcheck gates the deploy, and gating it on Postgres would
-/// let a database blip block a cutover. Same rule the api follows.
+/// let a database blip block a cutover; same rule the api follows. The cluster
+/// is a different kind of thing. It is not pinged here — [`ClusterGate`] is a
+/// latch `main` opens once, at boot, and nothing can shut it again — so a
+/// Helius incident cannot fail a probe on a deployment that is already live.
+/// What it does is keep a *new* deployment from going green while it is on
+/// the wrong chain or cannot find out: 503 until the check passes, and the
+/// previous deployment keeps serving.
+///
+/// `cluster` is `SOLANA_CLUSTER`, on both answers, so the first thing anyone
+/// curls says which chain this deployment is on — two environments differ by
+/// one hostname. On a 200 it is a verified statement, which the api's cannot
+/// be.
+///
+/// No gate at all is a 503, like `/ready` without a pool: a route table that
+/// forgot to register one must fail its deploy, not pass it.
 #[get("/health")]
-pub async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "ok",
+pub async fn health(gate: Option<web::Data<ClusterGate>>) -> HttpResponse {
+    let Some(gate) = gate else {
+        return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "status": "unavailable",
+            "reason": "no cluster gate configured",
+        }));
+    };
+    let cluster = gate.cluster();
+    let mut body = serde_json::json!({
         "service": env!("CARGO_PKG_NAME"),
         "version": env!("CARGO_PKG_VERSION"),
         "commit": match option_env!("GIT_SHA") {
             Some(sha) if !sha.is_empty() => sha,
             _ => "unknown",
         },
-    }))
+        "cluster": cluster.as_str(),
+    });
+    if gate.is_open() {
+        body["status"] = "ok".into();
+        HttpResponse::Ok().json(body)
+    } else {
+        body["status"] = "starting".into();
+        body["reason"] = format!("the RPC endpoint has not yet proved it serves {cluster}").into();
+        HttpResponse::ServiceUnavailable().json(body)
+    }
 }
 
 /// Status codes are chosen for how Helius reacts to each:

@@ -1,14 +1,24 @@
 use std::time::Duration;
 
 use actix_web::{get, web, HttpResponse};
+use indexer_config::Cluster;
 use indexer_data_model::PgPool;
 
 /// Liveness only — no dependency checks, so the Railway healthcheck (deploy
 /// gate) never depends on Postgres. Readiness is `/ready`.
 /// GIT_SHA is a compile-time env set by the Dockerfile from Railway's
 /// RAILWAY_GIT_COMMIT_SHA build arg; local builds report "unknown".
+///
+/// `cluster` is the configured `SOLANA_CLUSTER` (PIG-113). The `/v1` contract
+/// is frozen and says nothing about which chain a deployment serves, so this
+/// is the one place a client — or a person holding two near-identical
+/// hostnames — can ask. It is what the deployment was *configured* as: the api
+/// dials no RPC, so it has nothing to check the claim against, and the
+/// ingester is the one that verifies it on the wire. The handler takes it as
+/// optional app data, like `/ready` takes the pool, so a route table built
+/// without one (tests) answers `null` rather than failing to extract.
 #[get("/health")]
-pub async fn health() -> HttpResponse {
+pub async fn health(cluster: Option<web::Data<Cluster>>) -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "service": env!("CARGO_PKG_NAME"),
@@ -17,6 +27,7 @@ pub async fn health() -> HttpResponse {
             Some(sha) if !sha.is_empty() => sha,
             _ => "unknown",
         },
+        "cluster": cluster.map(|cluster| cluster.as_str()),
     }))
 }
 
@@ -54,6 +65,30 @@ mod tests {
         let body: serde_json::Value = test::read_body_json(resp).await;
         assert_eq!(body["status"], "ok");
         assert_eq!(body["service"], "indexer-api");
+        // Present and explicitly null, never omitted, when nothing configured
+        // one — the binary always does.
+        assert!(body.as_object().unwrap().contains_key("cluster"));
+        assert!(body["cluster"].is_null());
+    }
+
+    /// The value is the `SOLANA_CLUSTER` spelling, verbatim, for every cluster
+    /// — it is what an operator compares against the variable they set.
+    #[actix_web::test]
+    async fn health_reports_the_configured_cluster() {
+        for cluster in indexer_config::Cluster::ALL {
+            let app = test::init_service(
+                App::new()
+                    .app_data(web::Data::new(cluster))
+                    .configure(crate::handlers::configure),
+            )
+            .await;
+            let resp =
+                test::call_service(&app, test::TestRequest::get().uri("/health").to_request())
+                    .await;
+            assert_eq!(resp.status(), 200);
+            let body: serde_json::Value = test::read_body_json(resp).await;
+            assert_eq!(body["cluster"], cluster.as_str());
+        }
     }
 
     #[actix_web::test]

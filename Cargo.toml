@@ -68,3 +68,7 @@ thiserror = "2.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 toml = "0.8"
+# Validates SOLANA_RPC_URL / SOLANA_WS_URL / HELIUS_WEBHOOK_API in crates/config
+# (PIG-113). Already in Cargo.lock through reqwest, sqlx and actix-web, so
+# declaring it adds no new subtree.
+url = "2.5"

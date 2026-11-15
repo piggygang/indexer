@@ -28,11 +28,15 @@ async fn main() -> anyhow::Result<()> {
     log::info!("database migrated");
 
     log::info!(
-        "indexer-api listening on [{}]:{}",
+        "indexer-api listening on [{}]:{} (cluster: {})",
         config.server.host,
-        config.server.port
+        config.server.port,
+        config.solana.cluster
     );
     let pool = web::Data::new(pool);
+    // What `/health` reports. The api dials no RPC and needs no endpoint: the
+    // cluster is all of `SolanaConfig` it reads.
+    let cluster = web::Data::new(config.solana.cluster);
     // One cache for the whole process, not one per worker thread: the point is
     // that a burst of identical requests costs one query, and per-worker caches
     // would multiply that by the worker count.
@@ -41,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         App::new()
             .app_data(pool.clone())
             .app_data(cache.clone())
+            .app_data(cluster.clone())
             .wrap(Logger::default())
             // Public, unauthenticated, read-only: there are no credentials or
             // cookies to protect, and the Explorer's preview deployments get a

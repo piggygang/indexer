@@ -431,3 +431,45 @@ async fn a_spec_change_resubscribes_without_reconnecting() {
         "make before break: subscribing after unsubscribing would open a gap"
     );
 }
+
+/// `HeliusWs::new` is what the binary calls, and every other test here goes
+/// through `with_endpoint`, which takes a finished URL. This one closes the
+/// loop: the adapter dials the endpoint it was handed — it knows no host of
+/// its own, so which cluster it streams is the caller's configuration — and
+/// the key travels as `?api-key=`, on a request target that does not double
+/// the endpoint's trailing slash.
+#[tokio::test]
+async fn it_dials_the_endpoint_it_is_handed_with_the_key_in_the_query() {
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}/", listener.local_addr().unwrap());
+    let (target_tx, target_rx) = tokio::sync::oneshot::channel();
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let socket = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |request: &Request, response: Response| {
+                let _ = target_tx.send(request.uri().to_string());
+                Ok(response)
+            },
+        )
+        .await
+        .unwrap();
+        // Hold the socket open; the test ends by dropping the stream.
+        let (_sink, mut source) = socket.split();
+        while source.next().await.is_some() {}
+    });
+
+    let source = HeliusWs::new(&endpoint, "test-key").with_max_attempts(1);
+    let (_spec_tx, spec_rx) = watch::channel(spec(&[pk(1)]));
+    let _stream = source.subscribe(spec_rx, ResumeFrom::Latest);
+
+    let target = tokio::time::timeout(Duration::from_secs(5), target_rx)
+        .await
+        .expect("the adapter never dialled the endpoint it was given")
+        .unwrap();
+    assert_eq!(target, "/?api-key=test-key");
+    server.abort();
+}

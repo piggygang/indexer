@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use indexer_activity::{self as activity_backfill, Venues};
-use indexer_config::Config;
+use indexer_config::{Cluster, Config};
 use indexer_das::backfill::{self, BackfillOptions};
-use indexer_das::DasClient;
+use indexer_das::{ClusterError, DasClient};
 use indexer_data_model::activity;
 use indexer_data_model::assets as data_model_assets;
 use indexer_data_model::browse;
@@ -37,10 +37,13 @@ struct Cli {
 enum Cmd {
     /// Apply pending migrations (the same embedded migrator indexer-api runs at boot).
     Migrate,
-    /// Apply config/collections.toml (+ mint lists) idempotently. Never deletes.
+    /// Apply the collections registry (+ mint lists) idempotently. Never deletes.
     Seed {
-        #[arg(long, default_value = "config/collections.toml")]
-        config: PathBuf,
+        /// The registry to apply. Defaults to the configured cluster's own
+        /// (mainnet-beta: config/collections.toml); a cluster that ships no
+        /// registry yet has to be given one.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Validate and report, then roll back.
         #[arg(long)]
         dry_run: bool,
@@ -242,6 +245,9 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     let config = Config::try_from_env()?;
+    // Said once, up front, for every command: an operator holds two sets of
+    // credentials now, and the cheapest guard is seeing which one is loaded.
+    log::info!("cluster: {}", config.solana.describe());
     let db = &config.database;
     let pool = indexer_data_model::connect(
         db.required_url()?,
@@ -256,14 +262,19 @@ async fn main() -> anyhow::Result<()> {
             println!("migrations up to date");
         }
         Cmd::Seed {
-            config,
+            config: registry,
             dry_run,
             expect_unchanged,
             allow_identity_change,
         } => {
+            // Resolved before anything is written, migrations included.
+            let registry = match registry {
+                Some(path) => path,
+                None => registry_for(config.solana.cluster)?,
+            };
             // A seed against an unmigrated database is a footgun.
             indexer_data_model::migrate(&pool).await?;
-            let seed = seed::load(&config)?;
+            let seed = seed::load(&registry)?;
             let options = seed::ApplyOptions {
                 dry_run,
                 allow_identity_change,
@@ -309,7 +320,7 @@ async fn main() -> anyhow::Result<()> {
         } => {
             // Resolved here, not at boot: `migrate` and `seed` must keep
             // working on a machine with no Helius key.
-            let das = DasClient::new(config.helius.required_api_key()?)?;
+            let das = rpc(&config).await?;
             let options = BackfillOptions {
                 slug,
                 resume,
@@ -365,7 +376,7 @@ async fn main() -> anyhow::Result<()> {
             let das = if reprice_only {
                 DasClient::with_endpoint("http://127.0.0.1:1", "")?
             } else {
-                DasClient::new(config.helius.required_api_key()?)?.with_rate_limit(rps)
+                rpc(&config).await?.with_rate_limit(rps)
             };
             let options = activity_backfill::Options {
                 slug,
@@ -599,6 +610,65 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The registry `seed` applies when `--config` is not given.
+///
+/// One arm per cluster and no fallback, because the fallback is the bug:
+/// `config/collections.toml` holds mainnet addresses, and seeding it into a
+/// devnet database would have the ingester subscribe to — and the webhook
+/// register — seventeen thousand mints that do not exist on that chain, in a
+/// registry `seed` never deletes from. The devnet registry arrives with
+/// PIG-134, which is also what turns this into `config/<cluster>/…`; until
+/// then a devnet seed has to name its file.
+fn registry_for(cluster: Cluster) -> anyhow::Result<PathBuf> {
+    match cluster {
+        Cluster::MainnetBeta => Ok(PathBuf::from("config/collections.toml")),
+        Cluster::Devnet => bail!(
+            "no registry ships for {cluster} yet: config/collections.toml is the \
+             mainnet-beta registry and must not be seeded into a {cluster} database — \
+             pass --config <file> to apply one explicitly"
+        ),
+    }
+}
+
+/// The RPC client for a command that reads the chain, already proven to be on
+/// the configured cluster.
+///
+/// Both come from the environment and neither is derived from the other, so
+/// they can disagree — and a backfill against the wrong chain does not fail,
+/// it *succeeds*: DAS answers for mints it has never seen with a list of
+/// nulls and for a Core collection with an empty page, so the run ends
+/// cleanly and records what it found, which is nothing true. So every such
+/// command asks the endpoint for its genesis hash first. One credit, and
+/// nothing is written before it passes.
+///
+/// A one-shot command gives up on an unreachable endpoint as readily as on a
+/// wrong one: it could not have done its work anyway, and unlike the ingester
+/// it has no reason to wait.
+async fn rpc(config: &Config) -> anyhow::Result<DasClient> {
+    let solana = &config.solana;
+    let endpoint = solana.required_rpc_url()?;
+    let das = DasClient::with_endpoint(endpoint, config.helius.required_api_key()?)?;
+    match indexer_das::cluster::verify(&das, solana.cluster.genesis_hash()).await {
+        Ok(()) => Ok(das),
+        Err(error @ ClusterError::Mismatch { .. }) => Err(error).with_context(|| {
+            format!(
+                "SOLANA_CLUSTER is {}, but SOLANA_RPC_URL ({}) does not serve it — \
+                 fix whichever of the two is wrong; nothing was written",
+                solana.cluster,
+                indexer_config::origin(endpoint)
+            )
+        }),
+        Err(error @ ClusterError::Unverified(_)) => Err(error).with_context(|| {
+            format!(
+                "could not confirm that SOLANA_RPC_URL ({}) serves {} — \
+                 check the endpoint and HELIUS_API_KEY; nothing was written",
+                indexer_config::origin(endpoint),
+                solana.cluster
+            )
+        }),
+    }
 }
 
 fn outcome(o: Outcome) -> &'static str {
@@ -1071,12 +1141,22 @@ async fn webhook(
         Some(url) => url,
         None => config.helius.required_webhook_url()?.to_string(),
     };
-    let client = WebhookClient::new(&config.helius.webhook_api, api_key)?;
+    // No default host: a webhook is registered per cluster, and inheriting the
+    // mainnet one on devnet would spend 100 credits registering devnet
+    // addresses there. The config crate has already refused a host that names
+    // another cluster.
+    let api = config.helius.required_webhook_api()?;
+    let client = WebhookClient::new(api, api_key)?;
+    println!(
+        "cluster {} — webhook API {}",
+        config.solana.cluster,
+        indexer_config::origin(api)
+    );
 
     let registered = client.list().await.with_context(|| {
         format!(
             "listing webhooks at {} — check HELIUS_WEBHOOK_API and HELIUS_API_KEY",
-            config.helius.webhook_api
+            indexer_config::origin(api)
         )
     })?;
     // Matched by URL rather than by id: the id is Helius's, the URL is ours,
@@ -1194,4 +1274,46 @@ async fn webhook(
         wanted.len()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `seed` with no `--config` must mean the same thing it always has on
+    /// mainnet — CI's "migrate + seed twice" and the Railway runbook both rely
+    /// on the bare command — and must mean *nothing* anywhere else, rather
+    /// than quietly applying mainnet's registry to another chain's database.
+    #[test]
+    fn the_default_registry_is_mainnets_and_only_on_mainnet() {
+        assert_eq!(
+            registry_for(Cluster::MainnetBeta).unwrap(),
+            PathBuf::from("config/collections.toml")
+        );
+        let error = registry_for(Cluster::Devnet).unwrap_err().to_string();
+        assert!(
+            error.contains("devnet") && error.contains("--config"),
+            "the refusal must name the cluster and the way out: {error}"
+        );
+    }
+
+    /// The flag is optional so that the default can depend on the cluster; a
+    /// clap `default_value` would have decided it before the cluster was read.
+    #[test]
+    fn seed_takes_its_registry_from_the_flag_or_from_the_cluster() {
+        let Cmd::Seed { config, .. } = Cli::try_parse_from(["indexer-admin", "seed"]).unwrap().cmd
+        else {
+            panic!("not a seed command");
+        };
+        assert_eq!(config, None);
+
+        let Cmd::Seed { config, .. } =
+            Cli::try_parse_from(["indexer-admin", "seed", "--config", "fixtures/devnet.toml"])
+                .unwrap()
+                .cmd
+        else {
+            panic!("not a seed command");
+        };
+        assert_eq!(config, Some(PathBuf::from("fixtures/devnet.toml")));
+    }
 }

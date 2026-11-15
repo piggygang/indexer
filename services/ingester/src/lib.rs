@@ -7,6 +7,7 @@
 //! exists so the integration test drives this code rather than a copy of it.
 
 pub mod blocktime;
+pub mod cluster;
 pub mod consumer;
 pub mod inbox;
 pub mod pipeline;

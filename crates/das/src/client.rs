@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, TimeZone, Utc};
+use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,8 +18,6 @@ use crate::asset::Asset;
 
 /// DAS caps `getAssetBatch` at 1 000 ids.
 pub const MAX_BATCH: usize = 1000;
-
-const DEFAULT_ENDPOINT: &str = "https://mainnet.helius-rpc.com";
 
 #[derive(Debug, thiserror::Error)]
 pub enum DasError {
@@ -199,7 +198,13 @@ pub enum Reachability {
 
 #[derive(Clone)]
 pub struct DasClient {
+    /// RPC and DAS: the requests that carry the key. Never follows a
+    /// redirect — see [`http_client`].
     http: Client,
+    /// Metadata documents and image probes: public URLs the chain points at,
+    /// on hosts that redirect as a matter of course. Carries no credential,
+    /// and is never handed the endpoint.
+    web: Client,
     endpoint: String,
     api_key: String,
     max_attempts: u32,
@@ -209,22 +214,18 @@ pub struct DasClient {
 }
 
 impl DasClient {
-    pub fn new(api_key: &str) -> Result<Self, DasError> {
-        Self::with_endpoint(DEFAULT_ENDPOINT, api_key)
-    }
-
-    /// Points the client at an arbitrary endpoint — the integration test
-    /// serves a fake Helius from loopback, so no key and no network are
-    /// needed to exercise the whole pipeline.
+    /// The only constructor, and it takes the endpoint: this crate knows no
+    /// host of its own. Which cluster a client talks to is the caller's
+    /// configuration (`SOLANA_RPC_URL`), passed as a `&str` exactly as the key
+    /// is — a hardcoded default here is how a devnet deployment would have
+    /// kept reading mainnet without anyone having chosen that.
+    ///
+    /// `api_key` is appended as `?api-key=`; empty means "send none", which is
+    /// what the integration tests' loopback fake Helius wants.
     pub fn with_endpoint(endpoint: &str, api_key: &str) -> Result<Self, DasError> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("indexer-das/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| DasError::Transport(e.to_string()))?;
         Ok(Self {
-            http,
+            http: http_client(Duration::from_secs(30), Redirects::Refuse)?,
+            web: http_client(Duration::from_secs(30), Redirects::Follow)?,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             max_attempts: 4,
@@ -255,6 +256,21 @@ impl DasClient {
         } else {
             format!("{}/?api-key={}", self.endpoint, self.api_key)
         }
+    }
+
+    /// The genesis hash of the cluster this endpoint serves.
+    ///
+    /// The cluster's identity as the node itself states it — the one thing an
+    /// endpoint cannot be wrong about by accident. See [`crate::cluster`].
+    pub async fn get_genesis_hash(&self) -> Result<String, DasError> {
+        let result = self.rpc("getGenesisHash", json!([])).await?;
+        result
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| DasError::Rpc {
+                method: "getGenesisHash".into(),
+                message: format!("expected a string, got {result}"),
+            })
     }
 
     /// Current slot. Read **before** each data call, so the value stamped on
@@ -543,13 +559,15 @@ impl DasClient {
                                 // not a transport fault: never retried.
                                 return Err(DasError::Rpc {
                                     method: method.into(),
-                                    message: error.message,
+                                    // The server's words, and these errors are
+                                    // logged and stored: see [`mask`].
+                                    message: mask(&error.message, &[&self.api_key]),
                                 });
                             }
                             Ok(RpcResponse { result, .. }) => {
                                 return Ok(result.unwrap_or(Value::Null))
                             }
-                            Err(e) => Err(DasError::Transport(e.to_string())),
+                            Err(e) => Err(transport(e)),
                         }
                     } else {
                         Err(DasError::Status {
@@ -558,7 +576,7 @@ impl DasClient {
                         })
                     }
                 }
-                Err(e) => Err(DasError::Transport(e.to_string())),
+                Err(e) => Err(transport(e)),
             };
 
             let error = outcome.unwrap_err();
@@ -581,7 +599,7 @@ impl DasClient {
     pub async fn fetch_document(&self, url: &str) -> Result<Option<Value>, DasError> {
         let mut attempt = 1;
         loop {
-            let error = match self.http.get(url).send().await {
+            let error = match self.web.get(url).send().await {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
@@ -625,7 +643,7 @@ impl DasClient {
     /// Probes an image URL. `HEAD` first, falling back to a one-byte ranged
     /// `GET` for hosts that reject `HEAD` (common on IPFS/Arweave gateways).
     pub async fn probe_image(&self, url: &str) -> Reachability {
-        match self.http.head(url).send().await {
+        match self.web.head(url).send().await {
             Ok(response) if response.status().is_success() => return Reachability::Ok,
             Ok(response) if head_unsupported(response.status()) => {}
             Ok(response) if is_gone(response.status()) => return Reachability::Dead,
@@ -639,7 +657,7 @@ impl DasClient {
         }
 
         match self
-            .http
+            .web
             .get(url)
             .header(reqwest::header::RANGE, "bytes=0-0")
             .send()
@@ -729,12 +747,251 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250u64.saturating_mul(1 << attempt.min(5)))
 }
 
-/// Strips the API key so a URL can be logged. The key is a secret and this
-/// crate logs request failures by default.
+/// What a client built by [`http_client`] does when it is told to go elsewhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Redirects {
+    /// For every request that carries a credential: RPC, DAS and the webhook
+    /// management API. The endpoint is configuration — explicit, never
+    /// derived — and a `Location` header is a host nobody wrote down. Following
+    /// one would repeat the request there: the key if the redirect kept the
+    /// query, in the clear if it also dropped to `http://`, and for a
+    /// `307`/`308` the body too, which on `create`/`update` is the webhook
+    /// secret. So the redirect is returned as the answer it is — an HTTP 3xx
+    /// error naming the method — and fixing the endpoint is the operator's.
+    Refuse,
+    /// For public documents the chain points at: metadata and images, on
+    /// gateways that redirect as a matter of course. reqwest's own default.
+    Follow,
+}
+
+/// The one place an HTTP client is built in this workspace.
+///
+/// **No `Referer`, for either kind.** reqwest tells the next host where it
+/// came from when it follows a redirect: the previous URL, path and query
+/// included. A credentialed client no longer follows one at all, so for it
+/// this is the second lock on the same door; for the metadata client the
+/// previous URL is public, and announcing it is merely pointless.
+pub(crate) fn http_client(timeout: Duration, redirects: Redirects) -> Result<Client, DasError> {
+    Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(concat!("indexer-das/", env!("CARGO_PKG_VERSION")))
+        .redirect(match redirects {
+            Redirects::Refuse => Policy::none(),
+            Redirects::Follow => Policy::limited(10),
+        })
+        .referer(false)
+        .build()
+        .map_err(transport)
+}
+
+/// A transport failure, with the request URL removed and the cause kept.
+///
+/// reqwest's `Display` is "error sending request for url (…)": the whole URL,
+/// query string included, and the query string is where `api-key=` travels.
+/// Every caller logs these errors — the retry loop at `debug`, the ingester's
+/// boot check at `warn`, the admin CLI straight to the terminal — so the URL
+/// has to go *here*, at the one place a `reqwest::Error` becomes a string,
+/// rather than at each of them. That it was not is how a single refused
+/// connection used to put the key in the logs.
+///
+/// Nothing useful is lost, and something is gained: the method is in the
+/// surrounding message, the endpoint is logged alongside (see [`redact`]), and
+/// reqwest's own text never said *why* — "error sending request" is the same
+/// for a refused connection, a DNS failure and a TLS fault. The cause chain is
+/// appended instead. [`scrub`] then masks any `api-key=` that a cause might
+/// still spell out; none does today, and a secret is not where to rely on
+/// that staying true.
+///
+/// For the RPC and webhook-management paths only — the two whose URLs carry
+/// the key. `fetch_document` keeps reqwest's message, because there the URL is
+/// a public metadata document and naming it is the whole diagnostic.
+pub(crate) fn transport(error: reqwest::Error) -> DasError {
+    let error = error.without_url();
+    let mut message = error.to_string();
+    let mut cause = std::error::Error::source(&error);
+    while let Some(inner) = cause {
+        message.push_str(": ");
+        message.push_str(&inner.to_string());
+        cause = inner.source();
+    }
+    DasError::Transport(scrub(&message))
+}
+
+/// Masks the value of every `api-key=` in free text, leaving the rest intact.
+///
+/// Unlike [`redact`], which takes a URL and can simply keep its origin, this
+/// takes a sentence: the text around the key matters too.
+pub(crate) fn scrub(message: &str) -> String {
+    const MARKER: &str = "api-key=";
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(index) = rest.find(MARKER) {
+        let (before, after) = rest.split_at(index + MARKER.len());
+        out.push_str(before);
+        out.push_str("***");
+        // The value runs to the end of the query parameter, or of the URL.
+        let end = after
+            .find(|c: char| c == '&' || c == ')' || c == '"' || c == '\'' || c.is_whitespace())
+            .unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Masks secrets in text that came from the other side of a connection.
+///
+/// [`scrub`] handles the shape *we* send (`api-key=…`). This also removes, by
+/// value, the secrets the calling client itself holds: an error page or a
+/// validation error that echoes the request back echoes them in whatever shape
+/// the server likes — a bare key in a sentence, `"authHeader":"…"` in JSON —
+/// and these messages are logged and stored like any other.
+///
+/// **Every non-empty secret, in both spellings it can be echoed in.** There is
+/// no length floor: configuration accepts any non-empty secret, and which ones
+/// deserve to stay secret is not this function's call. And a secret sent
+/// inside a JSON string comes back JSON-escaped — a quote or a backslash in it
+/// changes the bytes — so the escaped spelling is masked as well as the raw
+/// one. Only an empty value is skipped: there is nothing to find.
+pub(crate) fn mask(text: &str, secrets: &[&str]) -> String {
+    let mut out = scrub(text);
+    for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+        // What `serde_json` writes between the quotes of a string. Cannot
+        // fail for a `&str`, and is always at least the two quotes.
+        let quoted = serde_json::to_string(secret).unwrap_or_default();
+        if let Some(escaped) = quoted.get(1..quoted.len().saturating_sub(1)) {
+            if escaped != *secret && !escaped.is_empty() {
+                out = out.replace(escaped, "***");
+            }
+        }
+        out = out.replace(secret, "***");
+    }
+    out
+}
+
+/// Reduces a URL to its origin — `scheme://host[:port]` — so it can appear in
+/// a log line.
+///
+/// Everything after the origin can be a credential: the query carries
+/// `api-key=`, a dedicated node's access token is usually the path, and
+/// userinfo is a password by definition. Masking only the query was enough
+/// while the host was a constant in this crate; it stopped being enough when
+/// the endpoint became configuration, because the config crate accepts a path
+/// and hides it from the boot log for exactly this reason.
+///
+/// Text that is not a URL at all says nothing about itself: there is no part
+/// of an unparseable value that is known to be safe.
 pub fn redact(url: &str) -> String {
-    match url.find("api-key=") {
-        Some(index) => format!("{}api-key=***", &url[..index]),
-        None => url.to_string(),
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<redacted>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    format!("{scheme}://{host}")
+}
+
+/// Loopback fakes shared by this crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    /// Reads one whole HTTP request — head, and body if it declares one.
+    /// Answering before the body has been read can reset the connection under
+    /// the client.
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(index) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break index + 4;
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break buffer.len(),
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+        let declared = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while buffer.len() < head_end + declared {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+        String::from_utf8_lossy(&buffer).into_owned()
+    }
+
+    async fn respond(stream: &mut TcpStream, status: &str, extra_headers: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// A loopback server that answers its one request with `status` and a body
+    /// built from the request it received — `reply(request)` — the way an
+    /// error page or a validation error repeats what it was sent.
+    pub(crate) async fn answering_with(
+        status: &'static str,
+        reply: impl FnOnce(&str) -> String + Send + 'static,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let request = read_request(&mut stream).await;
+                respond(&mut stream, status, "", &reply(&request)).await;
+            }
+        });
+        endpoint
+    }
+
+    /// Two loopback servers. The first — returned as the endpoint — answers
+    /// its one request with a `307` to the second; the second hands back the
+    /// whole request it received and then answers with `body`. That request is
+    /// everything a redirect target learns about the client.
+    ///
+    /// It is handed over *before* the answer goes out, so by the time a client
+    /// call has returned, `try_recv` on the receiver is a definite statement:
+    /// a value means the redirect was followed, empty means the second origin
+    /// never heard from us.
+    pub(crate) async fn redirect_to_another_origin(
+        body: &'static str,
+    ) -> (String, oneshot::Receiver<String>) {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/elsewhere", target.local_addr().unwrap());
+        let (seen_tx, seen_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = target.accept().await {
+                let request = read_request(&mut stream).await;
+                let _ = seen_tx.send(request);
+                respond(&mut stream, "200 OK", "", body).await;
+            }
+        });
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", origin.local_addr().unwrap());
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = origin.accept().await {
+                read_request(&mut stream).await;
+                let header = format!("Location: {location}\r\n");
+                respond(&mut stream, "307 Temporary Redirect", &header, "").await;
+            }
+        });
+        (endpoint, seen_rx)
     }
 }
 
@@ -743,15 +1000,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_api_key_never_reaches_a_log_line() {
+    fn a_logged_url_is_its_origin_and_nothing_else() {
         assert_eq!(
             redact("https://mainnet.helius-rpc.com/?api-key=secret-value"),
-            "https://mainnet.helius-rpc.com/?api-key=***"
+            "https://mainnet.helius-rpc.com"
+        );
+        // A dedicated node keeps its token in the path, and the config crate
+        // accepts one — so the path goes too, not just the query.
+        assert_eq!(
+            redact("https://rpc.example.test/t0k3n/?api-key=secret-value"),
+            "https://rpc.example.test"
         );
         assert_eq!(
-            redact("https://example.invalid/1.json"),
-            "https://example.invalid/1.json"
+            redact("https://user:t0k3n@rpc.example.test:8443/x#frag"),
+            "https://rpc.example.test:8443"
         );
+        assert_eq!(redact("http://[::1]:8899/"), "http://[::1]:8899");
+        // Not a URL: no part of it is known to be safe to print.
+        assert_eq!(redact("t0k3n:x@rpc.example.test"), "<redacted>");
+    }
+
+    #[test]
+    fn scrubbing_masks_the_key_and_keeps_the_sentence() {
+        assert_eq!(
+            scrub("error for url (https://rpc.example.test/?api-key=s3cr3t): refused"),
+            "error for url (https://rpc.example.test/?api-key=***): refused"
+        );
+        // Every occurrence, and only the value: a following parameter stays.
+        assert_eq!(
+            scrub("a ?api-key=one&commitment=confirmed then b ?api-key=two"),
+            "a ?api-key=***&commitment=confirmed then b ?api-key=***"
+        );
+        assert_eq!(scrub("connection refused"), "connection refused");
+        assert_eq!(scrub(""), "");
     }
 
     #[test]
@@ -808,6 +1089,146 @@ mod tests {
         .unwrap();
         assert!(failed.failed());
         assert_eq!(failed.block_time_utc(), None);
+    }
+
+    /// reqwest's `Display` ends " for url (…)", query string and all, and the
+    /// query string is where the key travels. These errors are logged by every
+    /// caller — at `warn` by the ingester's boot check, on the terminal by the
+    /// admin CLI — so one transport fault used to be enough to put the key in
+    /// Railway's logs.
+    #[tokio::test]
+    async fn a_transport_error_never_carries_the_api_key() {
+        // Nothing listens on port 1, so the connect is refused at once.
+        let client = DasClient::with_endpoint("http://127.0.0.1:1", "s3cr3t-key")
+            .unwrap()
+            .with_max_attempts(1);
+        let error = client.get_slot().await.unwrap_err();
+        assert!(matches!(error, DasError::Transport(_)), "{error:?}");
+        let rendered = format!("{error} / {error:?}");
+        assert!(!rendered.contains("s3cr3t-key"), "leaked: {rendered}");
+        // The cause survives, which the bare reqwest message never carried:
+        // "error sending request" alone says nothing about why.
+        assert!(
+            rendered.to_lowercase().contains("connect"),
+            "the cause should be named: {rendered}"
+        );
+    }
+
+    /// A request that carries the key never follows a redirect. The endpoint
+    /// is configuration — explicit, never derived — and a `Location` header is
+    /// a host nobody wrote down: following it would send the request, and with
+    /// reqwest's defaults a `Referer` naming the URL the key is in, wherever a
+    /// mistyped host, a parked domain or a proxy chose to point.
+    #[tokio::test]
+    async fn an_rpc_redirect_is_refused_and_the_next_host_hears_nothing() {
+        let (endpoint, mut seen) = test_support::redirect_to_another_origin(
+            r#"{"jsonrpc":"2.0","id":"indexer","result":123}"#,
+        )
+        .await;
+        let client = DasClient::with_endpoint(&endpoint, "s3cr3t-key").unwrap();
+
+        // The redirect itself is the answer, and the operator's to act on.
+        let error = client.get_slot().await.unwrap_err();
+        assert!(
+            matches!(&error, DasError::Status { status, .. }
+                if *status == StatusCode::TEMPORARY_REDIRECT),
+            "unexpected error: {error:?}"
+        );
+        // Asking again would get the same `Location`, so it is not retried —
+        // which `with_endpoint`'s four attempts would otherwise have shown.
+        assert!(!is_retryable(&error));
+        assert!(!format!("{error} {error:?}").contains("s3cr3t-key"));
+        // No request reached the second origin: no key, no `Referer`, no body.
+        assert!(seen.try_recv().is_err(), "the redirect was followed");
+    }
+
+    /// A JSON-RPC error is the server's own sentence, and it ends up in logs
+    /// and in `last_error` columns. A node or a proxy that quotes the key back
+    /// — bare, not as `api-key=` — must not get it stored that way.
+    #[tokio::test]
+    async fn an_rpc_error_that_quotes_the_key_back_is_masked() {
+        let endpoint = test_support::answering_with("200 OK", |_request| {
+            json!({"jsonrpc": "2.0", "id": "indexer",
+                   "error": {"code": -32401, "message": "key s3cr3t-key-value is not allowed"}})
+            .to_string()
+        })
+        .await;
+        let client = DasClient::with_endpoint(&endpoint, "s3cr3t-key-value").unwrap();
+
+        let error = client.get_slot().await.unwrap_err().to_string();
+        assert!(
+            error.contains("is not allowed"),
+            "the message survives: {error}"
+        );
+        assert!(!error.contains("s3cr3t"), "leaked: {error}");
+    }
+
+    #[test]
+    fn masking_removes_every_held_secret_by_value_in_either_encoding() {
+        assert_eq!(
+            mask(
+                r#"bad request: {"authHeader":"wh-s3cr3t-value"} at /v0/webhooks?api-key=k3y-k3y-k3y"#,
+                &["k3y-k3y-k3y", "wh-s3cr3t-value"],
+            ),
+            r#"bad request: {"authHeader":"***"} at /v0/webhooks?api-key=***"#
+        );
+        // Every non-empty secret, however short: configuration accepts any
+        // non-empty `HELIUS_WEBHOOK_SECRET`, so a length floor would be a rule
+        // about which secrets deserve to stay secret.
+        assert_eq!(
+            mask(r#"rejected {"authHeader":"hook123"}"#, &["hook123"]),
+            r#"rejected {"authHeader":"***"}"#
+        );
+        // Only an empty one is skipped — there is nothing to find, and
+        // replacing "" would mask between every character.
+        assert_eq!(mask("block not known", &[""]), "block not known");
+
+        // The secret travels inside a JSON string, so an echo of the request
+        // carries it JSON-escaped: a quote or a backslash in it changes the
+        // bytes. Both spellings are the same secret.
+        let secret = r#"wh-"quoted\value"#;
+        let echoed = format!(
+            "rejected {}",
+            json!({ "authHeader": secret, "webhookType": "raw" })
+        );
+        assert!(
+            echoed.contains(r#"wh-\"quoted\\value"#),
+            "the fixture must hold the escaped spelling: {echoed}"
+        );
+        let masked = mask(&echoed, &[secret]);
+        assert_eq!(
+            masked,
+            r#"rejected {"authHeader":"***","webhookType":"raw"}"#
+        );
+        // And the raw spelling, as a server that decoded the body would print it.
+        assert_eq!(
+            mask(&format!("bad header {secret} given"), &[secret]),
+            "bad header *** given"
+        );
+    }
+
+    /// Metadata is the other kind of request: a public document the chain
+    /// points at, fetched from hosts that redirect as a matter of course
+    /// (gateways do), and carrying nothing of ours. It still follows — and it
+    /// still does not announce where it came from.
+    #[tokio::test]
+    async fn a_metadata_fetch_still_follows_redirects_and_carries_no_credential() {
+        let (host, seen) = test_support::redirect_to_another_origin(r##"{"name":"#1"}"##).await;
+        // Its RPC endpoint is irrelevant here; the key must not travel anyway.
+        let client = DasClient::with_endpoint("http://127.0.0.1:1", "s3cr3t-key").unwrap();
+
+        let document = client
+            .fetch_document(&format!("{host}/1.json"))
+            .await
+            .unwrap();
+        assert_eq!(document, Some(json!({"name": "#1"})));
+
+        let request = seen.await.unwrap();
+        assert!(
+            !request.to_lowercase().contains("referer:"),
+            "a Referer was sent to the redirect target:\n{request}"
+        );
+        assert!(!request.contains("s3cr3t-key"), "leaked:\n{request}");
     }
 
     #[tokio::test]

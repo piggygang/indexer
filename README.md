@@ -139,7 +139,7 @@ Prereqs: Rust via rustup (the pinned 1.90 toolchain auto-installs), Docker.
 
 ```sh
 docker compose up -d                        # Postgres 17.6 on localhost:5433
-cp .env.example .env                        # DATABASE_URL points at it; fill HELIUS_API_KEY when needed
+cp .env.example .env                        # DATABASE_URL points at it, SOLANA_CLUSTER=mainnet-beta; fill HELIUS_API_KEY when needed
 cargo run -p indexer-admin -- migrate       # apply migrations (the API also does this at boot)
 cargo run -p indexer-admin -- seed          # registry from config/collections.toml (idempotent)
 cargo run -p indexer-admin -- backfill      # DAS backfill (needs HELIUS_API_KEY; idempotent)
@@ -164,7 +164,10 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 |---|---|---|---|
 | `PORT` | no | `8080` | injected by Railway |
 | `HOST` | no | `::` | dual-stack bind; Railway private networking needs the IPv6 bind |
-| `RUST_LOG` | no | `info` | |
+| `RUST_LOG` | no | `info` | never `trace` with a real key: tungstenite logs the WebSocket upgrade request, `?api-key=` included |
+| `SOLANA_CLUSTER` | **every binary** | — (none) | `devnet` \| `mainnet-beta`, spelled exactly. The one variable with no default: see **Clusters** below. `/health` reports it |
+| `SOLANA_RPC_URL` | ingester, `admin backfill` / `backfill-activity` | — | JSON-RPC + DAS, e.g. `https://mainnet.helius-rpc.com`. The bare endpoint — the key is appended from `HELIUS_API_KEY`. Never derived from the cluster; a hostname that names another cluster is a parse error, and its `getGenesisHash` is compared with the cluster's before anything is written |
+| `SOLANA_WS_URL` | ingester (with `ws`) | — | Enhanced WebSockets, e.g. `wss://mainnet.helius-rpc.com`. Its own variable, same rules as `SOLANA_RPC_URL` |
 | `HELIUS_API_KEY` | `admin backfill`, `ingester` | — | Helius Developer key. The admin CLI reads it only in the subcommand that needs it, so `migrate`/`seed` still run without one; the ingester requires it at boot |
 | `DATABASE_URL` | api, admin | — | on Railway set to `${{Postgres.DATABASE_URL}}` (private network). The seed runs on the `admin` service; `DATABASE_PUBLIC_URL` is only for a workstation run |
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
@@ -172,7 +175,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `INGEST_TRANSPORTS` | no | `ws` | ingester only: which transports run — `ws`, `webhook`, or `ws,webhook` for a dual run. Retirement is this one value becoming `webhook`. An unknown member is a hard error, never a silently unrun transport |
 | `HELIUS_WEBHOOK_SECRET` | ingester (with `webhook`) | — | the **whole** `Authorization` header value Helius echoes on every delivery, set as the webhook's `authHeader` and compared verbatim. Helius offers no HMAC or signature scheme, so this is the entire authenticity check |
 | `WEBHOOK_URL` | `admin webhook` | — | the public HTTPS endpoint to register. Registration only — the receiver never reads it |
-| `HELIUS_WEBHOOK_API` | no | `https://api-mainnet.helius-rpc.com` | the management API host. Configurable because Helius's docs and their own SDK disagree on it |
+| `HELIUS_WEBHOOK_API` | `admin webhook` | — | the management API host, e.g. `https://api-mainnet.helius-rpc.com` (devnet: `api-devnet`). It was a default until PIG-113; a webhook is registered per cluster, so the host is now part of saying which one. Helius's docs and their own SDK disagree on it — this is the SDK's |
 | `WEBHOOK_POLL_MS` / `WEBHOOK_BATCH` / `WEBHOOK_LEASE_SECS` / `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_GRACE_SECS` / `WEBHOOK_RETAIN_DAYS` | no | `1000` / `50` / `60` / `5` / `120` / `30` | drain pacing. `RETAIN_DAYS` must outlast a dual-run evaluation window — `coverage()` reads those rows |
 | `RECONCILE_TIP_INTERVAL_SECS` | no | `30` | ingester only: the tip probe — one `searchAssets` per collection filter, newest-acted-on first. This is the freshness knob; `0` disables it and leaves the hourly sweep as the only correction |
 | `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). A connect lowers it to `RECONNECT_FLOOR` (600 s) for one run rather than bypassing it. `0` disables the sweep **and** the deep pass outright — there is no longer a separate on-`Connected` reconcile for it to leave behind |
@@ -180,10 +183,215 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `RECONCILE_RPS` | no | `10` | ingester only: RPC ceiling for everything the schedule runs — the probe, the sweep and the deep pass share one limiter, because Helius meters DAS at 10 req/s on the Developer plan and two limiters set to 10 would ask for 20. The live writer is deliberately outside it |
 | `RARITY_INTERVAL_SECS` | no | `86400` | ingester only: backstop for the rarity drain (ALG-627). The dirty flag is the real trigger, so this only bounds how long a missed flag can sit; `0` disables the drain |
 
+## Clusters (PIG-113)
+
+The indexer used to be mainnet by construction: the Helius hosts were string
+literals in `crates/das` and `crates/ingest`, `HELIUS_WEBHOOK_API` defaulted to
+the mainnet host, and the stream cursors were named `…:mainnet`. A cluster is
+now **config, not code** — nothing in the pipeline branches on it — and one
+deployment is one cluster for its whole life: its own Railway environment, its
+own Postgres, its own variables. PIG-116 adds the `devnet` environment; this is
+what lets it exist.
+
+Three rules, each there because of what the alternative does quietly:
+
+- **`SOLANA_CLUSTER` is required** — `devnet` or `mainnet-beta`, spelled
+  exactly, and the one variable in `crates/config` with no default. Every other
+  knob is merely suboptimal when it falls back; a defaulted cluster is a second
+  mainnet indexer writing into the devnet database, healthy by every signal it
+  emits. `mainnet` (the Wallet Standard's name for it) is refused like any
+  other typo.
+- **Endpoints are explicit, never derived.** There is no
+  `https://{cluster}.helius-rpc.com` anywhere in the workspace:
+  `SOLANA_RPC_URL`, `SOLANA_WS_URL` and `HELIUS_WEBHOOK_API` are each their own
+  variable, so a provider swap — or one deployment on a dedicated node — is a
+  config change. A missing one is an error in the binary that needs it, naming
+  the variable. `SOLANA_WS_URL` is not the RPC URL with the scheme swapped;
+  that would be a derived URL. Each is the *bare* endpoint: `HELIUS_API_KEY` is
+  appended as `?api-key=` by the client, and a value carrying a query string or
+  credentials is rejected, in an error that never repeats it. A redirect is not
+  followed either — a `Location` header is an endpoint nobody wrote down, and
+  the key would travel with the request — so an endpoint that redirects shows
+  up as an HTTP 3xx error to fix in the variable.
+- **Agreement is checked, because independent variables can disagree.**
+
+  | check | when | covers | what it catches |
+  |---|---|---|---|
+  | the hostname names another cluster | parse time, offline | all three endpoints | `SOLANA_CLUSTER=devnet` with `https://mainnet.helius-rpc.com` — the copy-paste between two environments |
+  | `getGenesisHash` is not the cluster's | before the first write | `SOLANA_RPC_URL` | a host with no cluster in its name: a dedicated node, a proxy |
+
+  The second is not paranoia. DAS on the wrong chain does not fail:
+  `searchAssets` for a collection it has never heard of is an empty page, and
+  the sweep reads an empty page for a `core_collection` as *every stored asset
+  left* — the whole population flips to `removed` and the API serves an empty
+  collection until a sweep against the right chain brings it back.
+
+What each binary needs:
+
+| binary | `SOLANA_CLUSTER` | `SOLANA_RPC_URL` | `SOLANA_WS_URL` | `HELIUS_WEBHOOK_API` |
+|---|---|---|---|---|
+| `indexer-api` | required | — | — | — |
+| `indexer-ingester` | required | required; genesis-checked at boot | with the `ws` transport | — |
+| `indexer-admin` | required | `backfill`, `backfill-activity`; genesis-checked first | — | `webhook` |
+
+And what the cluster changes, which is all of it:
+
+- **The endpoints dialled** — nothing else chooses a host.
+- **The cursor keys.** `ingest_state.stream` is `helius-ws:mainnet` /
+  `helius-webhook:mainnet` on mainnet-beta — unchanged, because a renamed key
+  is a cursor nobody reads — and `…:devnet` on devnet. A cursor is a slot
+  number, and slots are only comparable on the chain that produced them
+  (devnet ran about 53 million ahead of mainnet on 2026-11-15); checkpoints are
+  written with `GREATEST`, so one that ever took the other chain's slot would
+  sit above this chain's tip for years.
+- **`/health`**, on the api and the ingester: `"cluster":"mainnet-beta"`. On
+  the api it is what the deployment was *configured* as — it dials no RPC and
+  has nothing to check the claim against. On the ingester a 200 is a verified
+  statement: the answer is 503 until the RPC has proved it.
+- **`seed`'s default registry.** `config/collections.toml` is mainnet's, so
+  the bare command applies it on mainnet-beta only; on devnet it refuses and
+  asks for `--config`, rather than seeding seventeen thousand mints that do not
+  exist there into a registry `seed` never deletes from. PIG-134 turns this
+  into `config/<cluster>/…`.
+
+### How the ingester boots
+
+The webhook receiver comes up first, as it always has — filing a delivery needs
+no RPC — but its `/health`, the deploy gate, answers **503 until the cluster is
+verified**. Then the ingester asks `SOLANA_RPC_URL` for its genesis hash, and
+nothing that writes ownership or activity — the schedule, either consumer —
+starts before the answer:
+
+| the endpoint… | the ingester… | a deploy… |
+|---|---|---|
+| states this cluster's hash | opens the gate (`/health` → 200) and starts ingesting | goes live |
+| states another cluster's | exits non-zero, having ingested nothing | fails: `/health` never answered 200, Railway keeps the previous one |
+| does not answer | waits, with a capped backoff, for as long as it takes | fails at the 120 s healthcheck, same outcome |
+
+Not answering is never a pass, and never an exit either: Railway's `ON_FAILURE`
+gives up after ten restarts, so exiting would turn a Helius incident into an
+ingester still down after Helius is back. The gate is what stops waiting from
+being a way to go live unverified: a mistyped host or a dead key looks exactly
+like an outage from the inside, and neither can replace a working deployment.
+A deployment that is *already* live and restarts into an incident is gated by
+nothing — the healthcheck only gates deploys — so it waits, receiver up and
+filing, and resumes when the endpoint answers.
+
+The cost is one case: **a deploy that coincides with a Helius outage longer
+than the healthcheck window fails and has to be redeployed afterwards.** The
+gate cannot tell an outage from a misconfiguration, and it sides with the
+deployment that is already working.
+
+`/health` is still a liveness check. The gate is a latch — opened once at boot,
+never shut again, never re-asked on a probe — the same kind of fact as "it
+connected to Postgres and migrated".
+
+SIGTERM ends the wait at once, including while a request to an endpoint that
+accepted the connection and then went silent is still open.
+
+`indexer-admin` is a one-shot, so it gives up on an unreachable endpoint as
+readily as on a wrong one.
+
+### A devnet configuration
+
+```sh
+SOLANA_CLUSTER=devnet
+SOLANA_RPC_URL=https://devnet.helius-rpc.com
+SOLANA_WS_URL=wss://devnet.helius-rpc.com
+HELIUS_WEBHOOK_API=https://api-devnet.helius-rpc.com   # `indexer-admin webhook` only
+HELIUS_API_KEY=…                                       # the same key serves both clusters
+DATABASE_URL=…                                         # a database of its own, never the mainnet one
+```
+
+Locally, against the compose Postgres:
+
+```sh
+docker compose exec postgres createdb -U postgres piggygang_indexer_devnet
+export DATABASE_URL=postgres://postgres:password@localhost:5433/piggygang_indexer_devnet
+export SOLANA_CLUSTER=devnet SOLANA_RPC_URL=https://devnet.helius-rpc.com SOLANA_WS_URL=wss://devnet.helius-rpc.com
+cargo run -p indexer-admin -- migrate
+PORT=8081 cargo run -p indexer-ingester
+```
+
+The first two lines it logs are the ones to look for:
+
+```
+cluster: devnet (rpc https://devnet.helius-rpc.com, ws wss://devnet.helius-rpc.com)
+cluster verified: the RPC endpoint's genesis hash is devnet's
+```
+
+The log names origins only, never a path — a dedicated node's token usually
+*is* the path. With an empty registry the ingester then subscribes to roots and
+idles; there is nothing to track until a devnet registry is seeded (PIG-134,
+PIG-139).
+
+### Rolling it out
+
+`SOLANA_CLUSTER` is the first variable a binary cannot boot without, and a
+merge never applies `railway.ts`. So the order is the reverse of the usual one
+— **apply, then merge**:
+
+1. `railway config plan`. Expect seven additions and nothing else:
+   `SOLANA_CLUSTER` on `api`, `admin` and `ingester`; `SOLANA_RPC_URL` on
+   `admin` and `ingester`; `SOLANA_WS_URL` on `ingester`; `HELIUS_WEBHOOK_API`
+   on `admin`.
+2. `railway config apply`. Each service redeploys the image it is already
+   running, which ignores a name it does not know.
+3. Merge. The new image finds its variables on first boot.
+
+Merged first instead, nothing breaks and nothing ships: `api` and `ingester`
+fail their healthcheck and Railway keeps the previous deployment, until the
+variables exist and a redeploy picks them up. Afterwards:
+
+```sh
+curl -s https://api.indexer.piggygang.net/health        # "cluster":"mainnet-beta"
+curl -s https://ingester.indexer.piggygang.net/health   # likewise
+railway logs --service ingester -d -n 50                # cluster: … / cluster verified: … / resuming helius-ws:mainnet from <the same cursor>
+```
+
+### What it does not check
+
+- **The WebSocket endpoint gets the offline check only.** Pubsub does not
+  answer `getGenesisHash`, so a `SOLANA_WS_URL` on a host that names no cluster
+  is taken at its word. Both Helius hosts name theirs.
+- **Nothing ties a database to a cluster.** A devnet-configured
+  `indexer-admin backfill` pointed at the mainnet `DATABASE_URL` passes both
+  checks — its cluster and its endpoint agree with each other — and then runs a
+  devnet backfill over the mainnet registry. On Railway it cannot happen
+  (`${{Postgres.DATABASE_URL}}` resolves inside the environment); from a
+  workstation holding both sets of credentials it can. `indexer-admin` logs
+  the cluster and the database target on consecutive lines for exactly that
+  reason, and a stamp in the database itself is the real fix — not built here.
+- **Which Helius features exist on devnet** — `getTransactionsForAddress` in
+  particular, which the activity backfill depends on — is not established by
+  this change. PIG-139 runs the backfills there.
+
+### Checked (2026-11-15)
+
+The two genesis hashes were read back from `api.mainnet-beta.solana.com` and
+`api.devnet.solana.com`, and the comparison was run for real against both: a
+devnet configuration verified against devnet, a mainnet-beta one against
+mainnet, and a loopback forwarder — a hostname that names nothing — in front of
+devnet under `SOLANA_CLUSTER=mainnet-beta` was refused with both hashes in the
+error.
+
+Running it is also what found a leak older than this change. reqwest prints the
+request URL in its errors, the URL carries `api-key=`, and callers both logged
+those errors and stored them, in `webhook_inbox.last_error` and
+`backfill_state.last_error`. The DAS and webhook clients now strip the URL where
+the error becomes a string, and a logged endpoint is its origin only — no path,
+because a dedicated node's token usually is the path. **Rows and log lines
+written before that may still hold the key.** `RUST_LOG=trace` still would:
+tungstenite logs the WebSocket upgrade request, query string included.
+
+Still to do on the first real devnet boot (PIG-116): the same run against
+Helius's devnet endpoints with a key, and `transactionSubscribe` there.
+
 ## Endpoints
 
 - `GET /health` — liveness (no dependency checks; the Railway deploy gate):
-  `{"status":"ok","service":"indexer-api","version":"0.1.0","commit":"<git sha>"}`
+  `{"status":"ok","service":"indexer-api","version":"0.1.0","commit":"<git sha>","cluster":"mainnet-beta"}`
+  — `cluster` is the configured `SOLANA_CLUSTER`
 - `GET /ready` — readiness: `SELECT 1` with a 2 s bound → `200 {"status":"ready"}`
   or `503 {"status":"unavailable","reason":…}`. Outside `/v1` and outside the API contract.
 - `/v1/**` — the whole frozen contract, eleven paths: the browse half
@@ -434,6 +642,11 @@ which is also dockerignored and in no service's watch patterns. So merging to
 whose watch patterns match. Treat `plan` exiting 0 as the standing drift check;
 if it does not, the committed file and production have diverged.
 
+One consequence worth stating on its own: **a variable a binary cannot boot
+without has to be applied before the merge that needs it**, not after.
+`SOLANA_CLUSTER` is the first such variable — see *Rolling it out* under
+**Clusters**.
+
 **Always author `railway.ts` from `railway config pull`, never by hand and
 never from `railway config migrate`.** IaC treats omission as deletion, so a
 file that does not mention the Postgres service invites the reconciler to delete
@@ -577,7 +790,8 @@ purpose. Reading the log:
 5. `railway add --repo piggygang/indexer`; in the dashboard: rename the
    service `api`, branch `main`, enable **Wait for CI**, set Watch Paths,
    confirm region.
-6. Variables on `api`: `HELIUS_API_KEY`, `DATABASE_URL=${{Postgres.DATABASE_URL}}`,
+6. Variables on `api`: `SOLANA_CLUSTER` (required — the api does not boot
+   without it), `HELIUS_API_KEY`, `DATABASE_URL=${{Postgres.DATABASE_URL}}`,
    `RUST_LOG=info`.
 7. Push → CI green → build → healthcheck → ACTIVE. `railway domain --service
    api`, then `curl https://<domain>/health`.
@@ -888,7 +1102,7 @@ ownership changes, Core mints, metadata refreshes and the `activity` timeline.
 It is the first writer of `activity` and `ownership_history` in this repo.
 
 ```sh
-cargo run -p indexer-ingester                       # needs HELIUS_API_KEY
+cargo run -p indexer-ingester                       # needs HELIUS_API_KEY, SOLANA_RPC_URL, SOLANA_WS_URL
 cargo run -p indexer-admin -- rebuild-ownership     # repair flagged assets
 ```
 
@@ -1316,6 +1530,10 @@ delivery is already a no-op — which is what makes the WebSocket's loss rate
 | `ws` | `transactionSubscribe` | `helius-ws:mainnet` | included in the plan |
 | `webhook` | `POST /webhooks/helius` → `webhook_inbox` → drain | `helius-webhook:mainnet` | 1 credit/event + 1 `getTransaction` |
 
+The cursor keys carry the cluster: `…:devnet` on a devnet deployment (see
+**Clusters**). A webhook is registered per cluster too — against that
+cluster's `HELIUS_WEBHOOK_API`, pointing at that environment's `WEBHOOK_URL`.
+
 ### Be honest about what this buys
 
 Helius's own product table marks webhooks **Replay ❌** and scopes them to
@@ -1409,6 +1627,10 @@ API, which means the subcommand:
 indexer-admin webhook --dry-run     # lists, diffs, calls nothing, costs nothing
 indexer-admin webhook               # creates or updates (100 credits)
 ```
+
+It needs `HELIUS_WEBHOOK_API` — no longer defaulted, since PIG-113 — alongside
+`HELIUS_API_KEY`, `WEBHOOK_URL` and `HELIUS_WEBHOOK_SECRET`, and prints the
+cluster and the API host before it lists anything.
 
 Every Helius webhook mutation costs 100 credits **and rewrites the whole address
 list**, so it lists first, diffs, and writes nothing when nothing changed.
@@ -2002,3 +2224,5 @@ map leaves out, which have no art id to fetch (PIG-183).
 - ALG-626 — public REST API: detail, activity, portfolio — done (`/v1` complete)
 - ALG-627 — rarity scoring & ranks — done
 - ALG-628 — prod monitoring/alerting · ALG-629 — external collections
+- PIG-113 — cluster-aware config: `SOLANA_CLUSTER`, explicit endpoints, cluster on `/health` — done
+- PIG-134 — per-cluster registry + raffles program config · PIG-116 — the `devnet` Railway environment

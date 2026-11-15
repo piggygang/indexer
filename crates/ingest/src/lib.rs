@@ -6,7 +6,7 @@
 //!
 //! - `mock` (this crate, always compiled): scripted events for tests.
 //! - [`ws`] (feature `ws`, on by default): Helius Enhanced WebSockets, the
-//!   mainnet transport. Note this transport has **no replay** — `fromSlot` is
+//!   live transport. Note this transport has **no replay** — `fromSlot` is
 //!   a LaserStream gRPC feature — so [`ResumeFrom::Slot`] is a floor, and the
 //!   consumer closes a gap by reconciling against DAS on
 //!   [`StreamStatus::Connected`].

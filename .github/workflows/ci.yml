@@ -26,6 +26,11 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgres://postgres:password@localhost:5433/piggygang_indexer
+      # Every binary requires it and none defaults it (PIG-113). mainnet-beta
+      # because config/collections.toml, which `seed` applies below, is that
+      # cluster's registry. No endpoint is set: nothing in this job dials one,
+      # and none is ever derived from the cluster.
+      SOLANA_CLUSTER: mainnet-beta
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -152,6 +157,10 @@ jobs:
             curl -sf http://127.0.0.1:8080/health >/dev/null && break
             sleep 1
           done
+          # /health is outside the contract, so Prism never sees it: asserted
+          # directly. It must report the cluster the job configured, spelled
+          # as SOLANA_CLUSTER spells it.
+          curl -sf http://127.0.0.1:8080/health | grep -q "\"cluster\":\"$SOLANA_CLUSTER\""
           npx --yes @stoplight/prism-cli@5.15.10 proxy \
             -h 127.0.0.1 -p 4011 --errors openapi/v1.yaml http://127.0.0.1:8080 &
           for _ in $(seq 1 60); do
