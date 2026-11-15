@@ -1,0 +1,158 @@
+{
+  "issue": "PIG-217",
+  "generated_at": "2026-11-15T12:06:52Z",
+  "layout": "{set}/{key}.{ext}, relative to the backup root; one sha256sum-format manifest per set",
+  "inputs": {
+    "mints": {
+      "file": "piggy-sol-gang.mints.json",
+      "sha256": "a02e1e62ff3d328fb5ab32f90d4f043dc37e48e003240704a238b1730f894b90",
+      "count": 10000
+    },
+    "mint_map": {
+      "file": "mint-map.json",
+      "sha256": "d79284290404c890cc4c92308251862e1a732606682667cb0bc83147fa4c374b",
+      "count": 9921
+    }
+  },
+  "totals": {
+    "files": 49763,
+    "bytes": 20904317216,
+    "absent": 0
+  },
+  "sets": {
+    "piggy-sol-gang/json": {
+      "source": "https://pub-b1a45763f0a64d8fa271f66f5514a561.r2.dev/old/metadata/{key}.json",
+      "keys": 10000,
+      "files": 10000,
+      "absent": 0,
+      "bytes": 12024221,
+      "smallest_bytes": 1183,
+      "largest_bytes": 1234,
+      "md5_equals_origin_etag": 10000,
+      "origin_last_modified": [
+        "2025-09-18T21:28:22Z",
+        "2025-09-19T08:17:55Z"
+      ],
+      "fetched": [
+        "2026-11-15T11:14:04Z",
+        "2026-11-15T11:30:49Z"
+      ],
+      "manifest": "piggy-sol-gang.json.sha256",
+      "manifest_sha256": "1a4c1e3bc6b293cf623432fa2b4bc16d80d73490080bec3e9d2c59178f90f5e5",
+      "content_problems": 0,
+      "image_field_is_not_its_own_image": 0,
+      "references_outside_the_backup_by_host": {}
+    },
+    "piggy-gang/json": {
+      "source": "https://pub-b1a45763f0a64d8fa271f66f5514a561.r2.dev/metadata/{key}.json",
+      "keys": 9921,
+      "files": 9921,
+      "absent": 0,
+      "bytes": 13849210,
+      "smallest_bytes": 1204,
+      "largest_bytes": 1457,
+      "md5_equals_origin_etag": 9921,
+      "origin_last_modified": [
+        "2025-09-20T21:34:32Z",
+        "2025-09-20T22:14:10Z"
+      ],
+      "fetched": [
+        "2026-11-15T11:30:48Z",
+        "2026-11-15T11:47:21Z"
+      ],
+      "manifest": "piggy-gang.json.sha256",
+      "manifest_sha256": "4a70d4461a93c4610ba7c45f564bee45ec49563f088adf81469939ad77f9a4a7",
+      "content_problems": 0,
+      "image_field_is_not_its_own_image": 0,
+      "references_outside_the_backup_by_host": {},
+      "old_image_vs_mint_map": {
+        "agree": 9921,
+        "disagree": 0
+      }
+    },
+    "piggy-sol-gang/images": {
+      "source": "https://pub-b1a45763f0a64d8fa271f66f5514a561.r2.dev/old/images/{key}.png",
+      "keys": 10000,
+      "files": 10000,
+      "absent": 0,
+      "bytes": 1871794599,
+      "smallest_bytes": 89438,
+      "largest_bytes": 361368,
+      "md5_equals_origin_etag": 10000,
+      "origin_last_modified": [
+        "2025-09-18T18:36:57Z",
+        "2025-09-18T21:26:44Z"
+      ],
+      "fetched": [
+        "2026-11-15T11:47:21Z",
+        "2026-11-15T12:04:01Z"
+      ],
+      "manifest": "piggy-sol-gang.images.sha256",
+      "manifest_sha256": "8928923c9f62f617d9ef5b6b6b8a88acca881392f7bc1ba50e1b4b8c387dc089",
+      "content_problems": 0,
+      "dimensions": {
+        "1080x1080": 10000
+      }
+    },
+    "piggy-gang/images": {
+      "source": "https://piggysolgang.s3.amazonaws.com/metadata/{key}.png",
+      "keys": 9921,
+      "files": 9921,
+      "absent": 0,
+      "bytes": 18992916758,
+      "smallest_bytes": 822851,
+      "largest_bytes": 3599569,
+      "md5_equals_origin_etag": 9921,
+      "origin_last_modified": [
+        "2024-10-12T21:34:38Z",
+        "2024-10-14T01:55:43Z"
+      ],
+      "fetched": [
+        "2026-11-15T11:14:05Z",
+        "2026-11-15T11:20:42Z"
+      ],
+      "manifest": "piggy-gang.images.sha256",
+      "manifest_sha256": "ce065e0987cf4f40fa09853ad5c9a26d0221550680032af583e224f3b3cee919",
+      "content_problems": 0,
+      "dimensions": {
+        "2800x2800": 9921
+      }
+    },
+    "piggy-gang/json-s3": {
+      "source": "https://piggysolgang.s3.amazonaws.com/metadata/{key}.json",
+      "keys": 9921,
+      "files": 9921,
+      "absent": 0,
+      "bytes": 13732428,
+      "smallest_bytes": 1186,
+      "largest_bytes": 1446,
+      "md5_equals_origin_etag": 9921,
+      "origin_last_modified": [
+        "2024-10-12T21:34:39Z",
+        "2024-10-14T01:55:44Z"
+      ],
+      "fetched": [
+        "2026-11-15T11:51:58Z",
+        "2026-11-15T11:58:34Z"
+      ],
+      "manifest": "piggy-gang.json-s3.sha256",
+      "manifest_sha256": "900736901ee19c661402f5a720fe02cdd5b30ce957483e3df52732eecae9e9ea",
+      "content_problems": 0,
+      "image_field_is_not_its_own_image": 0,
+      "references_outside_the_backup_by_host": {
+        "shdw-drive.genesysgo.net": 9921
+      },
+      "old_image_vs_mint_map": {
+        "agree": 0,
+        "disagree": 0
+      },
+      "examples": [
+        "piggy-gang/json-s3/000816fbf7d5fb7d2ddb.json: points at https://shdw-drive.genesysgo.net/7v46jLVr7QSsTjBNmHvNYBgiW9uqtS8AbbjMh8RptBo4/2003.jpg, which is not in the backup",
+        "piggy-gang/json-s3/000d873aaf96dfa21819.json: points at https://shdw-drive.genesysgo.net/7v46jLVr7QSsTjBNmHvNYBgiW9uqtS8AbbjMh8RptBo4/8906.jpg, which is not in the backup",
+        "piggy-gang/json-s3/00133c6315e47176d807.json: points at https://shdw-drive.genesysgo.net/7v46jLVr7QSsTjBNmHvNYBgiW9uqtS8AbbjMh8RptBo4/6691.jpg, which is not in the backup"
+      ]
+    }
+  },
+  "absent": [],
+  "problems": []
+}
