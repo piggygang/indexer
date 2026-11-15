@@ -27,7 +27,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::client::{scrub, transport, DasError};
+use crate::client::{http_client, scrub, transport, DasError};
 
 /// Helius's cap on one webhook's `accountAddresses`. Our ~17 000 fit in one.
 pub const MAX_ADDRESSES: usize = 100_000;
@@ -100,14 +100,10 @@ pub struct WebhookClient {
 impl WebhookClient {
     /// `base` is the API host — see the module doc on why it is a parameter.
     pub fn new(base: &str, api_key: &str) -> Result<Self, DasError> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(60))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("indexer-das/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(transport)?;
         Ok(Self {
-            http,
+            // The shared builder: same user agent, and — the part that matters
+            // here, because this URL carries the key too — no `Referer`.
+            http: http_client(Duration::from_secs(60))?,
             base: base.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
         })
@@ -286,6 +282,23 @@ mod tests {
         let error = client.list().await.unwrap_err();
         let rendered = format!("{error} / {error:?}");
         assert!(!rendered.contains("s3cr3t-key"), "leaked: {rendered}");
+    }
+
+    /// The management URL carries the key in its query exactly as the RPC one
+    /// does, so a redirect must not announce it in a `Referer` here either.
+    #[tokio::test]
+    async fn a_redirect_does_not_hand_the_key_to_the_next_host() {
+        let (base, seen) = crate::client::test_support::redirect_to_another_origin("[]").await;
+        let client = WebhookClient::new(&base, "s3cr3t-key").unwrap();
+
+        // The redirect is followed — otherwise this would prove nothing.
+        assert!(client.list().await.unwrap().is_empty());
+        let request = seen.await.unwrap();
+        assert!(
+            !request.to_lowercase().contains("referer:"),
+            "a Referer was sent to the redirect target:\n{request}"
+        );
+        assert!(!request.contains("s3cr3t-key"), "leaked:\n{request}");
     }
 
     /// A moved endpoint alone must still be worth the write — otherwise a

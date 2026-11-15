@@ -216,14 +216,8 @@ impl DasClient {
     /// `api_key` is appended as `?api-key=`; empty means "send none", which is
     /// what the integration tests' loopback fake Helius wants.
     pub fn with_endpoint(endpoint: &str, api_key: &str) -> Result<Self, DasError> {
-        let http = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(concat!("indexer-das/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(transport)?;
         Ok(Self {
-            http,
+            http: http_client(Duration::from_secs(30))?,
             endpoint: endpoint.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             max_attempts: 4,
@@ -743,6 +737,30 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250u64.saturating_mul(1 << attempt.min(5)))
 }
 
+/// The HTTP client every request in this crate goes out on — the RPC and DAS
+/// calls, the webhook management API, and the metadata fetches.
+///
+/// **No `Referer`.** reqwest follows redirects, and by default tells the next
+/// host where it came from: the previous URL, path and query included. For the
+/// two clients here that URL *is* the credential — `?api-key=` on the query, a
+/// dedicated node's token on the path — so a redirect from a mistyped host, a
+/// parked domain or a proxy would hand the key to whoever it pointed at. A
+/// JSON-RPC client has nothing to gain from the header, so it is off for
+/// everything built here rather than only where the key travels today.
+///
+/// Redirects themselves are still followed: the metadata fetches need them
+/// (gateways redirect), and without the header a redirect carries nothing of
+/// ours but the request the first host asked us to repeat.
+pub(crate) fn http_client(timeout: Duration) -> Result<Client, DasError> {
+    Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent(concat!("indexer-das/", env!("CARGO_PKG_VERSION")))
+        .referer(false)
+        .build()
+        .map_err(transport)
+}
+
 /// A transport failure, with the request URL removed and the cause kept.
 ///
 /// reqwest's `Display` is "error sending request for url (…)": the whole URL,
@@ -817,6 +835,87 @@ pub fn redact(url: &str) -> String {
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     let host = authority.rsplit('@').next().unwrap_or_default();
     format!("{scheme}://{host}")
+}
+
+/// Loopback fakes shared by this crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    /// Reads one HTTP request — head, and body if it declares one — and
+    /// returns the head. Answering before the body has been read can reset
+    /// the connection under the client.
+    async fn read_request(stream: &mut TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            if let Some(index) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                break index + 4;
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break buffer.len(),
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        };
+        let head = String::from_utf8_lossy(&buffer[..head_end]).into_owned();
+        let declared = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        while buffer.len() < head_end + declared {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+        head
+    }
+
+    async fn respond(stream: &mut TcpStream, status: &str, extra_headers: &str, body: &str) {
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra_headers}\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+    }
+
+    /// Two loopback servers. The first — returned as the endpoint — answers
+    /// its one request with a `307` to the second; the second answers with
+    /// `body` and hands back the head of the request it received. That head
+    /// is everything a redirect target learns about the client.
+    pub(crate) async fn redirect_to_another_origin(
+        body: &'static str,
+    ) -> (String, oneshot::Receiver<String>) {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/elsewhere", target.local_addr().unwrap());
+        let (seen_tx, seen_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = target.accept().await {
+                let head = read_request(&mut stream).await;
+                respond(&mut stream, "200 OK", "", body).await;
+                let _ = seen_tx.send(head);
+            }
+        });
+
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", origin.local_addr().unwrap());
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = origin.accept().await {
+                read_request(&mut stream).await;
+                let header = format!("Location: {location}\r\n");
+                respond(&mut stream, "307 Temporary Redirect", &header, "").await;
+            }
+        });
+        (endpoint, seen_rx)
+    }
 }
 
 #[cfg(test)]
@@ -936,6 +1035,31 @@ mod tests {
             rendered.to_lowercase().contains("connect"),
             "the cause should be named: {rendered}"
         );
+    }
+
+    /// reqwest follows redirects, and by default tells the next host where it
+    /// came from: `Referer: <the previous URL>`, path and query included. The
+    /// previous URL is the RPC endpoint with `?api-key=` on it, so a redirect —
+    /// from a mistyped host, a parked domain, a proxy in front of the node —
+    /// would hand the key to whoever it pointed at.
+    #[tokio::test]
+    async fn a_redirect_does_not_hand_the_key_to_the_next_host() {
+        let (endpoint, seen) = test_support::redirect_to_another_origin(
+            r#"{"jsonrpc":"2.0","id":"indexer","result":123}"#,
+        )
+        .await;
+        let client = DasClient::with_endpoint(&endpoint, "s3cr3t-key")
+            .unwrap()
+            .with_max_attempts(1);
+
+        // The redirect is followed — otherwise this would prove nothing.
+        assert_eq!(client.get_slot().await.unwrap(), 123);
+        let request = seen.await.unwrap();
+        assert!(
+            !request.to_lowercase().contains("referer:"),
+            "a Referer was sent to the redirect target:\n{request}"
+        );
+        assert!(!request.contains("s3cr3t-key"), "leaked:\n{request}");
     }
 
     #[tokio::test]
