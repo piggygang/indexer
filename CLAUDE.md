@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `cargo run -p indexer-api` — API on `[::]:8080` (`PORT`/`HOST` env); needs `DATABASE_URL`, migrates at boot
 - `cargo test --workspace` — DB tests are `#[ignore]`d (green without Postgres); `cargo test --workspace -- --include-ignored` runs them against `DATABASE_URL` (what CI does)
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all --check` — CI gates (rustfmt defaults, no clippy config)
-- `python3 -I asset-backup/backup.py verify --root <dir>` — check a copy of the PIG-217 asset backup against `asset-backup/manifests/` (plain `sha256sum -c` works too); `upload --check-only --credentials <file>` reads the whole bucket back instead. `download | manifest | upload` are the one-off run itself. Standard library only, except `upload` (boto3)
+- `python3 -I asset-backup/backup.py verify --root <dir>` — check a copy of the PIG-217 asset backup against `asset-backup/manifests/` (plain `sha256sum -c` checks the hashes alone and misses extra files); `upload --check-only --credentials <file>` reads every listed file back from the bucket instead, skipping the stored `_manifests/` and `_journal/`. `download | manifest | upload` are the one-off run itself. Standard library only, except `upload` (boto3)
 
 Toolchain is pinned by `rust-toolchain.toml` (1.90). Keep it in lockstep with the Dockerfile's `cargo-chef` tag and CI's toolchain when bumping.
 

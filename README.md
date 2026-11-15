@@ -1928,16 +1928,23 @@ $0.30 a month.
    CRC, `IEND` as the last byte, the pixel stream inflating to exactly the size the
    header implies — because an ETag match proves the copy equals the origin's object, not
    that the object is a whole image: an upload cut short at the origin has a perfectly
-   good ETag. And it parses every document and resolves each URL it names back to a file
-   in the backup.
+   good ETag. And it parses every document and looks up each URL it names in the backup,
+   recording any that is not there. One kind is not: each of the 9 921 original S3
+   documents also names an old image on shdw-drive, which answers 404. Those files are
+   not in the backup and cannot be recovered from it.
 3. **In the bucket.** Every put carries a `Content-MD5` the bucket enforces, and then
-   every object is read back and hashed: 49 763 of 49 763 identical, 20.904 GB in 208 s.
+   every file is read back and hashed: 49 763 of 49 763 identical, 20.904 GB in 208 s.
 
 ```bash
 python3 -I asset-backup/backup.py verify --root <dir>      # a copy on disk: same files, same bytes, nothing extra
-(cd <dir> && sha256sum -c --quiet <repo>/asset-backup/manifests/*.sha256)       # the same, with coreutils alone
-python3 -I asset-backup/backup.py upload --check-only --credentials <file>     # the bucket: reads all of it back
+(cd <dir> && sha256sum -c --quiet <repo>/asset-backup/manifests/*.sha256)       # hashes only, with coreutils alone: extra files go unnoticed
+python3 -I asset-backup/backup.py upload --check-only --credentials <file>     # the bucket: reads back every file the manifests list
 ```
+
+`upload` is the one command that needs more than the standard library: `boto3`
+(`pip install boto3`, or the distribution's `python3-boto3`). Its read-back covers the
+files the manifests list; the copies of the manifests and journals under
+`backup/_manifests/` and `backup/_journal/` are skipped, not checked.
 
 `<file>` is the output of `railway bucket credentials --bucket piggy-assets-backup --json`,
 run from a directory linked to the `Backups` project; it prints the secret key, so

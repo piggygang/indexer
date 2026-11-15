@@ -23,7 +23,7 @@ cannot be found, let alone backed up.
     download   fetch whatever is not already in --dest (resumable, throttled)
     manifest   re-hash every file from disk, check it, write manifests/
     verify     check any copy of the backup against the committed manifests
-    upload     copy --dest to an S3-compatible bucket and read every object back
+    upload     copy --dest to an S3-compatible bucket and read every file back
 
 Standard library only, except `upload`, which needs boto3. Run it with
 `python3 -I` so Python imports nothing out of the working directory.
@@ -164,7 +164,16 @@ class Journal:
                         log(f"{path.name}: ignoring unparseable line {number}")
                         continue
                     self.latest[record["key"]] = record
+        torn = False
+        if path.exists() and path.stat().st_size:
+            with open(path, "rb") as handle:
+                handle.seek(-1, os.SEEK_END)
+                torn = handle.read(1) != b"\n"
         self._handle = open(path, "a", buffering=1) if writable else None
+        if torn and self._handle:
+            # A torn line has no newline, and append mode would glue the next
+            # record onto the fragment and lose that one too. End the fragment.
+            self._handle.write("\n")
 
     def record(self, record: dict) -> None:
         line = json.dumps(record, separators=(",", ":"), sort_keys=True)
@@ -197,23 +206,36 @@ class Throttle:
         self.interval = self.base
         self.penalties = 0
         self._next = time.monotonic()
+        self._paused_until = 0.0
         self._streak = 0
         self._lock = threading.Lock()
 
+    def _reserve(self) -> float:
+        slot = max(self._next, time.monotonic())
+        self._next = slot + self.interval
+        return slot
+
     def wait(self) -> None:
         with self._lock:
-            current = time.monotonic()
-            slot = max(self._next, current)
-            self._next = slot + self.interval
-        if slot > current:
-            time.sleep(slot - current)
+            slot = self._reserve()
+        while True:
+            delay = slot - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            with self._lock:
+                # A back-off imposed while this worker slept outranks the slot
+                # it had already reserved: queue again, behind the pause.
+                if self._paused_until <= slot:
+                    return
+                slot = self._reserve()
 
     def penalize(self, pause: float) -> None:
         with self._lock:
             self.penalties += 1
             self._streak = 0
             self.interval = min(self.interval * 2, 2.0)
-            self._next = max(self._next, time.monotonic() + pause)
+            self._paused_until = max(self._paused_until, time.monotonic() + pause)
+            self._next = max(self._next, self._paused_until)
 
     def ok(self) -> None:
         with self._lock:
@@ -283,14 +305,19 @@ def fetch(file_set: FileSet, key: str, dest: Path, throttle: Throttle, attempts:
                 encoding = (response.getheader("Content-Encoding") or "identity").lower()
                 if encoding != "identity":
                     raise Retry(f"Content-Encoding {encoding}: not the stored bytes")
-                # http.client returns a short body without complaint, so the
-                # length has to be compared by hand.
-                declared = response.getheader("Content-Length")
-                if declared is not None and int(declared) != size:
+                # Both proofs or the file is not kept: a response that cannot be
+                # checked proves nothing, whatever it contains. http.client
+                # returns a short body without complaint, so the length has to
+                # be compared by hand.
+                declared = response.getheader("Content-Length") or ""
+                if not declared.isdigit():
+                    raise Retry("the origin sent no Content-Length")
+                if int(declared) != size:
                     raise Retry(f"got {size} of {declared} bytes")
                 etag = (response.getheader("ETag") or "").removeprefix("W/").strip('"')
-                etag_is_md5 = bool(MD5_HEX.match(etag))
-                if etag_is_md5 and etag != md5.hexdigest():
+                if not MD5_HEX.match(etag):
+                    raise Retry(f"the origin's ETag {etag!r} is not an MD5")
+                if etag != md5.hexdigest():
                     raise Retry(f"MD5 {md5.hexdigest()} is not the origin's ETag {etag}")
                 if size == 0:
                     raise Retry("empty body")
@@ -301,11 +328,11 @@ def fetch(file_set: FileSet, key: str, dest: Path, throttle: Throttle, attempts:
                     size=size,
                     sha256=sha256.hexdigest(),
                     md5=md5.hexdigest(),
-                    etag=etag or None,
-                    # True: proven byte-identical to the origin's object. None:
-                    # the origin published no MD5 (a multipart ETag), length only.
-                    etag_md5_match=True if etag_is_md5 else None,
-                    length_checked=declared is not None,
+                    etag=etag,
+                    # The two proofs above, on the record: `manifest` refuses a
+                    # line whose journal entry does not carry both.
+                    etag_md5_match=True,
+                    length_checked=True,
                     last_modified=response.getheader("Last-Modified"),
                     content_type=response.getheader("Content-Type"),
                     version_id=response.getheader("x-amz-version-id"),
@@ -437,6 +464,22 @@ def download(args: argparse.Namespace) -> int:
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+# Each Adam7 pass of an interlaced PNG: x offset, y offset, x step, y step.
+ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+
+
+def png_pixel_bytes(width: int, height: int, bits_per_pixel: int, interlaced: bool) -> int:
+    """What a PNG's pixel stream inflates to: per scanline, a filter byte and the packed pixels.
+
+    An interlaced image is seven smaller images, and a pass that has no column
+    or no row at this size is simply absent.
+    """
+    total = 0
+    for x0, y0, dx, dy in ADAM7 if interlaced else ((0, 0, 1, 1),):
+        columns, rows = -(-(width - x0) // dx), -(-(height - y0) // dy)
+        if columns > 0 and rows > 0:
+            total += rows * (1 + (columns * bits_per_pixel + 7) // 8)
+    return total
 
 
 def check_png(path: Path) -> tuple[str | None, dict]:
@@ -452,7 +495,7 @@ def check_png(path: Path) -> tuple[str | None, dict]:
         if handle.read(8) != PNG_SIGNATURE:
             return "not a PNG (bad signature)", facts
         inflater = zlib.decompressobj()
-        pixels, ended, interlaced, scanline = 0, False, False, 0
+        pixels, ended, expected = 0, False, 0
         while head := handle.read(8):
             if ended:
                 return "data after IEND", facts
@@ -468,11 +511,10 @@ def check_png(path: Path) -> tuple[str | None, dict]:
                 if kind != b"IHDR" or length != 13:
                     return "first chunk is not IHDR", facts
                 width, height, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
-                if color not in PNG_CHANNELS or not width or not height:
+                if color not in PNG_CHANNELS or interlace not in (0, 1) or not width or not height:
                     return "invalid IHDR", facts
                 facts = {"width": width, "height": height, "bit_depth": depth, "color_type": color}
-                interlaced = interlace != 0
-                scanline = 1 + (width * PNG_CHANNELS[color] * depth + 7) // 8
+                expected = png_pixel_bytes(width, height, PNG_CHANNELS[color] * depth, interlace == 1)
             elif kind == b"IDAT":
                 try:
                     pixels += len(inflater.decompress(body))
@@ -484,8 +526,8 @@ def check_png(path: Path) -> tuple[str | None, dict]:
         return "no IEND chunk", facts
     if not inflater.eof:
         return "pixel data ends early", facts
-    if not interlaced and pixels != facts["height"] * scanline:
-        return f"pixel data is {pixels} bytes, the header implies {facts['height'] * scanline}", facts
+    if pixels != expected:
+        return f"pixel data is {pixels} bytes, the header implies {expected}", facts
     return None, facts
 
 
@@ -598,6 +640,9 @@ def manifest(args: argparse.Namespace) -> int:
             if (size, digest) != (record["size"], record["sha256"]):
                 problems.append(f"{relpath}: on disk {size} B {digest}, downloaded as {record['size']} B {record['sha256']}")
                 continue
+            if record.get("etag_md5_match") is not True or record.get("length_checked") is not True:
+                problems.append(f"{relpath}: downloaded without both origin proofs (Content-Length and an MD5 ETag)")
+                continue
             lines.append(f"{digest}  {relpath}\n")
             sizes.append(size)
             md5_proven += record["etag_md5_match"] is True
@@ -605,8 +650,10 @@ def manifest(args: argparse.Namespace) -> int:
             if record.get("last_modified"):
                 modified.append(parsedate_to_datetime(record["last_modified"]).strftime("%Y-%m-%dT%H:%M:%SZ"))
             if problem:
+                # It stays in the manifest, being a faithful copy of what the
+                # origin serves, but a broken file is never a clean run.
                 content_bad += 1
-                samples.append(f"{relpath}: {problem}")
+                problems.append(f"{relpath}: {problem}")
                 continue
             if file_set.ext == "png":
                 shape = f"{facts['width']}x{facts['height']}"
@@ -800,7 +847,10 @@ def is_metadata(key: str) -> bool:
 
 
 def check_bucket(bucket: Bucket, entries: dict[str, str]) -> int:
-    """Read every object back and compare it with the manifests: the only check that counts."""
+    """Read every file the manifests list back from the bucket: the only check that counts.
+
+    The manifests and journals stored beside them are skipped, not checked.
+    """
     listed = {key: value for key, value in bucket.listing().items() if not is_metadata(key)}
     lost = sorted(set(entries) - set(listed))
     extra = sorted(set(listed) - set(entries))
@@ -826,7 +876,7 @@ def check_bucket(bucket: Bucket, entries: dict[str, str]) -> int:
 
 
 def upload(args: argparse.Namespace) -> int:
-    """Copy the local backup into the bucket, then read all of it back."""
+    """Copy the local backup into the bucket, then read every file back."""
     entries = read_manifests(args.manifests)
     bucket = Bucket(args.credentials, args.prefix, args.workers)
     if args.check_only:
@@ -899,7 +949,7 @@ def main() -> int:
     sub.add_argument("--manifests", type=Path, default=MANIFESTS)
     sub.set_defaults(run=verify)
 
-    sub = commands.add_parser("upload", help="copy --dest to an S3-compatible bucket and read every object back")
+    sub = commands.add_parser("upload", help="copy --dest to an S3-compatible bucket and read every file back")
     sub.add_argument("--dest", type=Path, help="local staging directory (files/ and state/)")
     sub.add_argument("--manifests", type=Path, default=MANIFESTS)
     sub.add_argument("--credentials", type=Path, required=True, help="JSON from `railway bucket credentials --json`")
