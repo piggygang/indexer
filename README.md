@@ -1941,10 +1941,13 @@ python3 -I asset-backup/backup.py verify --root <dir>      # a copy on disk: sam
 python3 -I asset-backup/backup.py upload --check-only --credentials <file>     # the bucket: reads back every file the manifests list
 ```
 
-`upload` is the one command that needs more than the standard library: `boto3`
-(`pip install boto3`, or the distribution's `python3-boto3`). Its read-back covers the
-files the manifests list; the copies of the manifests and journals under
-`backup/_manifests/` and `backup/_journal/` are skipped, not checked.
+`upload` is the one command that needs more than the standard library: `boto3`,
+installed where `-I` can find it. That is the distribution's `python3-boto3`, or a
+virtual environment (`python3 -m venv <venv> && <venv>/bin/pip install boto3`) whose
+`<venv>/bin/python3` then runs the command. A bare `pip install boto3` can land in the
+user site, which `-I` leaves out. The read-back covers the files the manifests list; the
+copies of the manifests and journals under `backup/_manifests/` and `backup/_journal/`
+are skipped, not checked.
 
 `<file>` is the output of `railway bucket credentials --bucket piggy-assets-backup --json`,
 run from a directory linked to the `Backups` project; it prints the secret key, so

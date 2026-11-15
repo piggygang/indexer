@@ -192,6 +192,15 @@ def journal_path(dest: Path, file_set: FileSet) -> Path:
     return dest / "state" / (file_set.name.replace("/", ".") + ".jsonl")
 
 
+def proven(record: dict) -> bool:
+    """Whether a journal record carries both origin proofs: the length and the MD5.
+
+    One definition for `download` and `manifest`: an entry the second refuses
+    has to be one the first fetches again.
+    """
+    return record.get("etag_md5_match") is True and record.get("length_checked") is True
+
+
 class Throttle:
     """Evenly spaced requests to one host, backing off when the host says so.
 
@@ -393,7 +402,9 @@ def download(args: argparse.Namespace) -> int:
             previous = journals[file_set.name].latest.get(key)
             if previous and previous["status"] == "ok":
                 path = dest / "files" / file_set.relpath(key)
-                if path.exists() and path.stat().st_size == previous["size"]:
+                # Without both proofs the file is fetched again: `manifest`
+                # refuses it, and skipping it here would leave no way to repair it.
+                if proven(previous) and path.exists() and path.stat().st_size == previous["size"]:
                     counts["have"] += 1
                     continue
             elif previous and previous["status"] == "missing" and not args.retry_missing:
@@ -640,8 +651,11 @@ def manifest(args: argparse.Namespace) -> int:
             if (size, digest) != (record["size"], record["sha256"]):
                 problems.append(f"{relpath}: on disk {size} B {digest}, downloaded as {record['size']} B {record['sha256']}")
                 continue
-            if record.get("etag_md5_match") is not True or record.get("length_checked") is not True:
-                problems.append(f"{relpath}: downloaded without both origin proofs (Content-Length and an MD5 ETag)")
+            if not proven(record):
+                problems.append(
+                    f"{relpath}: downloaded without both origin proofs (Content-Length and an MD5 ETag); "
+                    "`download` fetches it again"
+                )
                 continue
             lines.append(f"{digest}  {relpath}\n")
             sizes.append(size)
