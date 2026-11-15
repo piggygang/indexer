@@ -98,6 +98,9 @@ crates/
 services/
   admin/       indexer-admin — migrate | seed | bench
   api/         indexer-api — REST API (today: /health, /ready)
+asset-backup/
+  backup.py    PIG-217 — the one-off copy of the PSG and Piggy Gang files off third-party hosts
+  manifests/   sha256 of every file in that backup; no binary reads them
 ```
 
 `services/ingester` (ALG-623) is the third binary. The `api` service deliberately does not watch `config/**` or
@@ -1871,6 +1874,121 @@ are now stale (the two `Reserved — always null…` descriptions, the `Sort` no
 nothing machine-checked reads them — so they belong in a doc-only follow-up under `/v1`'s
 freeze rules. `Attribute.rarityPct` also stays `null`: the issue names score and rank,
 and a value's own frequency is a separate change.
+
+## Asset backup (PIG-217)
+
+Not part of the indexer; it lives here because the mint list it is keyed by does. Piggy
+SOL Gang's only working copy and all of Piggy Gang's art sat on two hosts nobody on the
+team controls — an `r2.dev` development URL and a third-party S3 bucket.
+`asset-backup/backup.py` copied every file once into a bucket the team owns, and
+`asset-backup/manifests/` records what was copied: one `sha256sum`-format manifest per
+set, plus `summary.json`.
+
+### The run (2026-11-15)
+
+| set | origin | files | size | absent |
+|---|---|---|---|---|
+| `piggy-sol-gang/json` | r2.dev `old/metadata/{mint}.json` | 10 000 | 12.0 MB | 0 |
+| `piggy-sol-gang/images` | r2.dev `old/images/{mint}.png` | 10 000 | 1.872 GB | 0 |
+| `piggy-gang/json` | r2.dev `metadata/{id}.json` | 9 921 | 13.8 MB | 0 |
+| `piggy-gang/images` | S3 `piggysolgang`, `metadata/{id}.png` | 9 921 | 18.993 GB | 0 |
+| `piggy-gang/json-s3` | S3 `piggysolgang`, `metadata/{id}.json` | 9 921 | 13.7 MB | 0 |
+| | | **49 763** | **20.904 GB** | **0** |
+
+`{mint}` is every mint in `config/seeds/piggy-sol-gang.mints.json`; `{id}` is every art
+id in the migration app's mint map (`lib/mint-map.json` in `piggygang/migrate`, the old
+`mint_map_prod.json`). Every PSG image is 1080×1080 and every Piggy Gang image
+2800×2800; no two keys in a set share a file.
+
+The copy is in the Railway project `Backups` (workspace PiggyGang), bucket
+`piggy-assets-backup`, region `ams`, private:
+
+```
+backup/{set}/{key}.{ext}      the files, under the keys PIG-198 and PIG-199 will rehost them as
+backup/_manifests/            the manifests and summary.json, byte for byte as committed here
+backup/_journal/*.jsonl.gz    what the origin said about each key: ETag, Last-Modified, S3 version id
+```
+
+A project of its own, deliberately: the Indexer project is reconciled from
+`.railway/railway.ts`, where omission is deletion, and a backup must not be one `apply`
+away from that. There was no team Blob store to put it under `/backup/` in — PIG-184 has
+not created one yet — so this is the issue's other option, a team bucket, at about
+$0.30 a month.
+
+### Why a line in a manifest can be believed
+
+1. **Off the wire.** A file is kept only when its length equals the origin's
+   `Content-Length` *and* its MD5 equals the origin's `ETag` — both hosts publish the MD5
+   of a single-part object as its ETag, and the request says `Accept-Encoding: identity`
+   so the bytes on the wire are the stored bytes. `http.client` returns a short body
+   without complaint, so the length is compared by hand. All 49 763 passed on the first
+   attempt.
+2. **From disk.** `manifest` re-hashes every file and refuses to write a line that
+   disagrees with what was hashed off the wire. It also walks every PNG — each chunk's
+   CRC, `IEND` as the last byte, the pixel stream inflating to exactly the size the
+   header implies — because an ETag match proves the copy equals the origin's object, not
+   that the object is a whole image: an upload cut short at the origin has a perfectly
+   good ETag. And it parses every document and looks up each URL it names in the backup,
+   recording any that is not there. One kind is not: each of the 9 921 original S3
+   documents also names an old image on shdw-drive, which answers 404. Those files are
+   not in the backup and cannot be recovered from it.
+3. **In the bucket.** Every put carries a `Content-MD5` the bucket enforces, and then
+   every file is read back and hashed: 49 763 of 49 763 identical, 20.904 GB in 208 s.
+
+```bash
+python3 -I asset-backup/backup.py verify --root <dir>      # a copy on disk: same files, same bytes, nothing extra
+(cd <dir> && sha256sum -c --quiet <repo>/asset-backup/manifests/*.sha256)       # hashes only, with coreutils alone: extra files go unnoticed
+python3 -I asset-backup/backup.py upload --check-only --credentials <file>     # the bucket: reads back every file the manifests list
+```
+
+`upload` is the one command that needs more than the standard library: `boto3`,
+installed where `-I` can find it. That is the distribution's `python3-boto3`, or a
+virtual environment (`python3 -m venv <venv> && <venv>/bin/pip install boto3`) whose
+`<venv>/bin/python3` then runs the command. A bare `pip install boto3` can land in the
+user site, which `-I` leaves out. The read-back covers the files the manifests list; the
+copies of the manifests and journals under `backup/_manifests/` and `backup/_journal/`
+are skipped, not checked.
+
+`<file>` is the output of `railway bucket credentials --bucket piggy-assets-backup --json`,
+run from a directory linked to the `Backups` project; it prints the secret key, so
+redirect it rather than read it. Bucket egress is free, which is what makes a full
+read-back the routine check rather than a sample. `download` is resumable — the journal
+records a verdict per key, so a re-run asks only for what is missing — and `-I` keeps
+Python from importing anything out of the working directory, which matters for a tool
+whose job is to write other people's files to disk.
+
+### What the run taught us
+
+- **The issue listed four sets; there are five.** The S3 bucket holds the original
+  October 2024 Piggy Gang documents beside the images, and the Core collection
+  account's own on-chain URI points at one of them
+  (`metadata/03dd82c0e9889c567422.json`). They spell attributes `traitType`/`traitVal`
+  instead of `trait_type`/`value` and name each pig's old image on shdw-drive, which now
+  answers 404. The r2.dev documents every live asset uses are the corrected copies:
+  across all 9 921 pairs every other field is identical. Worth knowing before PIG-209
+  rewrites the collection URI.
+- **"Every file" means every file a key is known for.** Neither host can be listed — S3
+  answers 403 to a list request and r2.dev 404 — so the claim is checked from the other
+  side: every on-chain URI, source URI and image of all 747 Core assets, and the image of
+  all 10 000 PSG, resolves to a file in the backup. r2.dev does serve zero-byte folder
+  markers, and the only ones found are `old/`, `old/images/`, `old/metadata/` and
+  `metadata/`; 29 other plausible names answer 404. A key that does not exist on S3 also
+  answers **403, not 404**, which is why the journal keeps `denied` apart from `missing`
+  and retries it on the next run.
+- **The mint map and the hosted documents agree.** All 9 921 r2.dev Piggy Gang documents
+  name, as the image they replace, exactly the mint the migration app's map pairs with
+  that art id: two independent records of one pairing, zero disagreements.
+- **r2.dev took 10 requests a second without one 429** — 29 921 requests in 50 minutes.
+  The throttle spaces requests evenly with no burst, halves its rate on a 429 or 5xx,
+  and was never asked to.
+- **The bucket checks `Content-MD5` and nothing newer.** A put with a wrong
+  `x-amz-checksum-sha256` is stored without complaint, so the SDK's newer checksum
+  headers are switched off rather than trusted, and the read-back is the check that
+  counts.
+
+Not covered, on purpose: Piggy Girl Gang, which already sits on Vercel Blob (whose
+account that store is in is PIG-184's question, not this one's), and the 79 PSG mints the
+map leaves out, which have no art id to fetch (PIG-183).
 
 ## Roadmap
 

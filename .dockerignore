@@ -26,3 +26,7 @@ package-lock.json
 # lints them from the checkout. Nothing in either image reads them, and leaving
 # them in the context would bust the builder's `COPY . .` on every spec edit.
 openapi/
+# The PIG-217 asset backup: a Python script and the sha256 manifests of files
+# that live in a bucket. No image reads either, and megabytes of manifests in
+# the context would bust the same `COPY . .` for nothing.
+asset-backup/
