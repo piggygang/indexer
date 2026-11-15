@@ -1,0 +1,56 @@
+# Collections registry seed (ALG-619) — devnet (PIG-134).
+#
+# Apply with:  SOLANA_CLUSTER=devnet cargo run -p indexer-admin -- seed
+# — into a database of its own, never the mainnet one. `seed` picks the
+# registry by SOLANA_CLUSTER; the format and the semantics are those of
+# config/mainnet-beta/collections.toml.
+#
+# These are the devnet stand-ins for the Piggy collections: the fixture set
+# that `scripts/fixtures` in piggygang/raffles-program builds (PIG-115), with
+# mainnet's on-chain structure.
+#
+# PLACEHOLDERS — names only, no addresses yet. Every fixture address derives
+# from the team's devnet fixtures seed, which is a secret, and the tool's
+# devnet output (`scripts/fixtures/devnet/` there) had not been committed when
+# this file was written (2026-11-15). The localnet output that *is* committed
+# comes from another seed: its addresses exist on no cluster, and seeding them
+# here would have the ingester subscribe to accounts that are not there, in a
+# registry `seed` never deletes from. A disabled row with no standard is how
+# the registry says "announced": the API answers 404 for it and the pipelines
+# skip it.
+#
+# To fill it in (PIG-139):
+#   1. In raffles-program, `cd scripts/fixtures && cargo run -- --cluster devnet plan`.
+#      No network, but it needs the seed. It writes `devnet/collections.toml`
+#      and `devnet/seeds/*.mints.json` in this format.
+#   2. Copy `seeds/` beside this file and replace the four entries below with
+#      the generated ones. The slugs are the same, so a database already seeded
+#      from the placeholders is updated in place.
+#   3. Keep `cluster = "devnet"` if the generated file does not carry it, and
+#      give test-piggy-gang its `program` (`programs.mpl_core` in the tool's
+#      manifest.json) if it has none: a Core collection without it records no
+#      transfer, burn or mint from the instruction. `cargo test` checks both.
+version = 1
+# The cluster these addresses are on. `seed` applies a registry only to the
+# cluster it names.
+cluster = "devnet"
+
+[[collections]]
+slug = "test-sol-gang"
+name = "Test SOL Gang"
+enabled = false
+
+[[collections]]
+slug = "test-girl-gang"
+name = "Test Girl Gang"
+enabled = false
+
+[[collections]]
+slug = "test-piggy-gang"
+name = "Test Piggy Gang"
+enabled = false
+
+[[collections]]
+slug = "test-pig-mud"
+name = "Test Pig Mud"
+enabled = false

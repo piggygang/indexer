@@ -1,15 +1,22 @@
-# Collections / tokens registry seed (ALG-619).
+# Collections / tokens registry seed (ALG-619) — mainnet-beta.
 #
 # Apply with:  cargo run -p indexer-admin -- seed
+# `seed` picks the registry by SOLANA_CLUSTER (PIG-134): this file on
+# mainnet-beta, config/devnet/collections.toml on devnet.
 # Semantics: upsert by slug (config is the source of truth for every scalar
 # column, including `enabled`); mint lists are insert-only; nothing is ever
 # deleted — disable a collection instead. Re-running is a no-op.
 #
-# On-chain addresses live ONLY here and in config/seeds/ — never in Rust or
-# in migrations. Adding a collection = one [[collections]] entry (+ a mint
-# list for a token_metadata collection without a certified collection), then
-# `seed`, then the backfill (ALG-621). No code changes.
+# On-chain addresses live ONLY in config/ — here, in seeds/ beside this file
+# and in config/marketplaces.toml — never in Rust or in migrations. Adding a
+# collection = one [[collections]] entry (+ a mint list for a token_metadata
+# collection without a certified collection), then `seed`, then the backfill
+# (ALG-621). No code changes.
 version = 1
+# The cluster these addresses are on. `seed` applies a registry only to the
+# cluster it names, whichever way the file was chosen: nothing in here exists
+# on another chain, and a seeded row is never deleted.
+cluster = "mainnet-beta"
 
 [[collections]]
 slug = "piggy-sol-gang"

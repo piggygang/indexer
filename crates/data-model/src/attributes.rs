@@ -82,7 +82,7 @@ pub async fn sync_trait_facets_and_flag(
 /// count approaches the collection's asset count is per-asset-unique (Girl
 /// Gang's `Name`), which bloats `/facets` and pushes the real values out of
 /// the planner's MCV list. The fix is one `facet_exclude` entry in
-/// `config/collections.toml` plus `seed` — never code.
+/// `config/<cluster>/collections.toml` plus `seed` — never code.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct TraitCardinality {
     pub name: String,

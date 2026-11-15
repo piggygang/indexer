@@ -1,9 +1,15 @@
-//! `config/collections.toml` → registry. Everything is validated before the
-//! first write; the apply step is one transaction: upsert collections by
-//! slug (config is the source of truth for every scalar column, including
-//! `enabled`), insert allowlist mints (never delete), upsert tokens, re-sync
-//! `trait_types.is_facet`. Re-running with the same file is a no-op — the
-//! upserts skip unchanged rows, so `updated_at` does not move either.
+//! `config/<cluster>/collections.toml` → registry. Everything is validated
+//! before the first write; the apply step is one transaction: upsert
+//! collections by slug (config is the source of truth for every scalar column,
+//! including `enabled`), insert allowlist mints (never delete), upsert tokens,
+//! re-sync `trait_types.is_facet`. Re-running with the same file is a no-op —
+//! the upserts skip unchanged rows, so `updated_at` does not move either.
+//!
+//! One registry per cluster (PIG-134), and each names its own: [`load`] takes
+//! the cluster being seeded and refuses a file that says another. Which file a
+//! cluster gets by default is the caller's business (`indexer-admin seed`
+//! picks `config/<cluster>/`); that a registry is never applied to the wrong
+//! chain is decided here, so it holds for an explicit `--config` too.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -19,6 +25,11 @@ use crate::types::Standard;
 #[serde(deny_unknown_fields)]
 pub struct SeedFile {
     pub version: u32,
+    /// The cluster these addresses are on, in the `SOLANA_CLUSTER` spelling
+    /// (`devnet` | `mainnet-beta`). Required, like the variable it is compared
+    /// with: a registry that does not say which chain it describes would be
+    /// applied to whichever one happened to be configured.
+    pub cluster: String,
     #[serde(default)]
     pub collections: Vec<CollectionSeed>,
     #[serde(default)]
@@ -96,11 +107,18 @@ pub struct Seed {
 /// Parses the TOML, reads every referenced mint list (relative to the TOML's
 /// directory) and validates the whole thing. Every problem is reported at
 /// once.
-pub fn load(path: &Path) -> anyhow::Result<Seed> {
+///
+/// `cluster` is the one being seeded — `SOLANA_CLUSTER`, as a string because
+/// this crate does not depend on `indexer-config`. A registry that names
+/// another is refused before anything else is read: its addresses do not exist
+/// on this chain, the ingester would subscribe to every one of them, and the
+/// seed never deletes a row.
+pub fn load(path: &Path, cluster: &str) -> anyhow::Result<Seed> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let file: SeedFile =
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    ensure_cluster(path, "registry", &file.cluster, cluster)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
 
     let mut mints = BTreeMap::new();
@@ -136,6 +154,26 @@ pub fn load(path: &Path) -> anyhow::Result<Seed> {
         );
     }
     Ok(Seed { file, mints })
+}
+
+/// Refuses a per-cluster config file that names another cluster than the one
+/// in use. Shared by the two files a cluster directory holds — this registry
+/// and [`crate::raffles_program`] — so they cannot drift into two rules.
+pub(crate) fn ensure_cluster(
+    path: &Path,
+    what: &str,
+    declared: &str,
+    cluster: &str,
+) -> anyhow::Result<()> {
+    if declared != cluster {
+        bail!(
+            "{} is the {what} for cluster `{declared}`, and the cluster in use \
+             (SOLANA_CLUSTER) is `{cluster}` — every cluster has its own under \
+             config/<cluster>/, and one is never read for another",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn read_mint_list(path: &Path) -> anyhow::Result<Vec<String>> {
@@ -607,23 +645,29 @@ async fn upsert_token(
 mod tests {
     use super::*;
 
-    fn committed_config() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/collections.toml")
+    /// The registry committed for `cluster`: `config/<cluster>/collections.toml`.
+    fn committed_config(cluster: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config")
+            .join(cluster)
+            .join("collections.toml")
+    }
+
+    fn slugs(seed: &Seed) -> Vec<&str> {
+        seed.file
+            .collections
+            .iter()
+            .map(|c| c.slug.as_str())
+            .collect()
     }
 
     /// A broken committed config must fail plain `cargo test`, no DB needed.
     #[test]
-    fn committed_config_is_valid() {
-        let seed = load(&committed_config()).unwrap();
+    fn the_mainnet_registry_is_valid() {
+        let seed = load(&committed_config("mainnet-beta"), "mainnet-beta").unwrap();
         assert_eq!(seed.file.version, 1);
-        let slugs: Vec<&str> = seed
-            .file
-            .collections
-            .iter()
-            .map(|c| c.slug.as_str())
-            .collect();
         assert_eq!(
-            slugs,
+            slugs(&seed),
             ["piggy-sol-gang", "piggy-girl-gang", "pig-mud", "piggy-gang"]
         );
         assert!(seed.file.collections.iter().all(|c| c.enabled));
@@ -643,14 +687,89 @@ mod tests {
             !seed.mints.contains_key("piggy-gang"),
             "core collections carry no mint list"
         );
-        assert!(
-            seed.file
-                .collections
-                .iter()
-                .filter(|c| c.standard == Some(Standard::Core))
-                .all(|c| c.program.is_some()),
-            "a core collection without its program records no Core activity"
+    }
+
+    /// The devnet stand-ins (PIG-115), under the slugs the fixtures tool in
+    /// `raffles-program` emits — so its output drops in over these rows.
+    ///
+    /// They are placeholders until that output exists. The last assertion is
+    /// the one to replace when it lands: pin the mint counts the way the
+    /// mainnet test does, so that a registry which silently went back to
+    /// placeholders fails here.
+    #[test]
+    fn the_devnet_registry_is_valid() {
+        let seed = load(&committed_config("devnet"), "devnet").unwrap();
+        assert_eq!(seed.file.version, 1);
+        assert_eq!(
+            slugs(&seed),
+            [
+                "test-sol-gang",
+                "test-girl-gang",
+                "test-piggy-gang",
+                "test-pig-mud"
+            ]
         );
+        let placeholders = seed
+            .file
+            .collections
+            .iter()
+            .all(|c| !c.enabled && c.standard.is_none())
+            && seed.mints.is_empty();
+        assert!(
+            placeholders,
+            "the devnet registry carries addresses now: pin its mint counts here instead"
+        );
+    }
+
+    /// Holds for every cluster, and for devnet it is the trap to watch: the
+    /// fixtures tool writes a Core collection with no `program`, and the
+    /// decoder then leaves every Core move to DAS — which records none.
+    #[test]
+    fn every_committed_core_collection_names_its_program() {
+        for cluster in ["mainnet-beta", "devnet"] {
+            let seed = load(&committed_config(cluster), cluster).unwrap();
+            for c in &seed.file.collections {
+                assert!(
+                    c.standard != Some(Standard::Core) || c.program.is_some(),
+                    "{cluster}/{}: a core collection without its program records no Core activity",
+                    c.slug
+                );
+            }
+        }
+    }
+
+    /// The property the per-cluster split exists for: whichever way a file is
+    /// chosen — the default for a cluster, or an explicit `--config` — it is
+    /// applied only to the chain it describes.
+    #[test]
+    fn a_registry_is_loaded_only_for_its_own_cluster() {
+        for (file, cluster) in [("mainnet-beta", "devnet"), ("devnet", "mainnet-beta")] {
+            let error = load(&committed_config(file), cluster)
+                .unwrap_err()
+                .to_string();
+            // CI greps for the first phrase to tell this refusal from any
+            // other way the command can fail; reword them together.
+            assert!(
+                error.contains(&format!("is the registry for cluster `{file}`"))
+                    && error.contains(&format!("`{cluster}`")),
+                "the refusal must name both clusters: {error}"
+            );
+        }
+        // No value is a wildcard, and a near miss is not a match.
+        for cluster in ["", "mainnet", "MAINNET-BETA", "mainnet-beta "] {
+            assert!(
+                load(&committed_config("mainnet-beta"), cluster).is_err(),
+                "{cluster:?} is not mainnet-beta"
+            );
+        }
+    }
+
+    /// Not optional and not defaulted: a registry that does not say which
+    /// cluster it describes would be applied to whichever one is configured.
+    #[test]
+    fn a_registry_must_name_its_cluster() {
+        let err = toml::from_str::<SeedFile>("version = 1\n").unwrap_err();
+        assert!(err.to_string().contains("cluster"), "{err}");
     }
 
     fn parse(toml_text: &str) -> Vec<String> {
@@ -667,6 +786,7 @@ mod tests {
     fn validation_rejects_bad_registry_rows() {
         let enabled_without_rule = parse(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "x"
 name = "X"
@@ -679,6 +799,7 @@ enabled = true"#,
 
         let creator_on_core = parse(&format!(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "x"
 name = "X"
@@ -694,6 +815,7 @@ verified_creator = "{}""#,
 
         let program_on_token_metadata = parse(&format!(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "x"
 name = "X"
@@ -709,6 +831,7 @@ program = "{}""#,
 
         let bad_base58 = parse(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "x"
 name = "X"
@@ -719,6 +842,7 @@ address = "not-base58-0OIl""#,
 
         let allowlist_without_list = parse(&format!(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "x"
 name = "X"
@@ -732,6 +856,7 @@ verified_creator = "{}""#,
 
         let placeholder = parse(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "later"
 name = "Later"
@@ -741,6 +866,7 @@ enabled = false"#,
 
         let bad_template = parse(&format!(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "x"
 name = "X"
@@ -758,6 +884,7 @@ metadata_uri_template = "http://example.com/meta.json""#,
     fn unknown_keys_are_rejected() {
         let err = toml::from_str::<SeedFile>(
             r#"version = 1
+cluster = "devnet"
 [[collections]]
 slug = "x"
 name = "X"

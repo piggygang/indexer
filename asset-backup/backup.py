@@ -10,7 +10,8 @@ will use, so that a rehost is a prefix copy:
     piggy-gang/images/{id}.png         <- S3      metadata/{id}.png
     piggy-gang/json-s3/{id}.json       <- S3      metadata/{id}.json
 
-{mint} is every Piggy SOL Gang mint in config/seeds/piggy-sol-gang.mints.json;
+{mint} is every Piggy SOL Gang mint in
+config/mainnet-beta/seeds/piggy-sol-gang.mints.json;
 {id} is every art id in the migration app's mint map (piggygang/migrate,
 lib/mint-map.json — `mint_map_prod.json` in the old piggy-upgrades code).
 
@@ -70,7 +71,7 @@ ART_ID = re.compile(r"[0-9a-f]{20}\Z")
 MD5_HEX = re.compile(r"[0-9a-f]{32}\Z")
 
 REPO = Path(__file__).resolve().parent.parent
-DEFAULT_MINTS = REPO / "config" / "seeds" / "piggy-sol-gang.mints.json"
+DEFAULT_MINTS = REPO / "config" / "mainnet-beta" / "seeds" / "piggy-sol-gang.mints.json"
 DEFAULT_MINT_MAP = REPO.parent / "migrate" / "lib" / "mint-map.json"
 MANIFESTS = Path(__file__).resolve().parent / "manifests"
 

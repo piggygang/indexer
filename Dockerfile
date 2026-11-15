@@ -44,8 +44,11 @@ COPY --from=builder /app/dist/ /app/
 # Deliberately no ENTRYPOINT: a Railway start command replaces the ENTRYPOINT,
 # and whether an image CMD is then appended as arguments is undocumented.
 ENV APP_BIN=${BIN}
-# `indexer-admin seed` defaults to the relative path config/collections.toml,
-# and resolves each mint list relative to that file — so CWD must be /app.
+# `indexer-admin seed` defaults to the relative path
+# config/<SOLANA_CLUSTER>/collections.toml and resolves each mint list relative
+# to that file — so CWD must be /app. Both cluster directories ship in the one
+# admin image (PIG-134): the same image serves every environment, and the
+# cluster picks its own.
 WORKDIR /app
 USER app
 CMD ["/bin/sh", "-c", "exec \"$APP_BIN\""]
