@@ -6,10 +6,16 @@
 # `activity.details.price_candidate` at crawl time, so teaching it a new venue
 # never re-reads the chain.
 #
-# On-chain addresses live ONLY here and in config/collections.toml and
-# config/seeds/ — never in Rust, SQL or tests. That is the whole reason the
-# decoder captures every invoked program id as *data*: naming a marketplace is
-# a config change, not a code change.
+# On-chain addresses live ONLY here and in the per-cluster directories
+# (config/<cluster>/: collections.toml, seeds/, raffles.toml) — never in Rust,
+# SQL or tests. That is the whole reason the decoder captures every invoked
+# program id as *data*: naming a marketplace is a config change, not a code
+# change.
+#
+# One file for every cluster, unlike the registry (PIG-134). On a public
+# cluster a program can only be deployed at an address by whoever holds that
+# address's key, so an id names the same venue wherever it exists and matches
+# nothing where it does not.
 #
 # `label` is served verbatim as `ActivityEvent.marketplace`, which the frozen
 # v1 contract types as free text precisely so venues can be added without a

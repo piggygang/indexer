@@ -5,9 +5,11 @@
 //!
 //! Conventions that every downstream issue relies on:
 //!
-//! - **Registry rows come only from `config/collections.toml`** via
+//! - **Registry rows come only from `config/<cluster>/collections.toml`** via
 //!   [`seed`]; membership is derived from the columns
-//!   ([`types::MembershipRule`]), never from code.
+//!   ([`types::MembershipRule`]), never from code. Each cluster has its own
+//!   directory, with its [`raffles_program`] config beside the registry, and a
+//!   file is only ever read for the cluster it names.
 //! - **Enums are `text + CHECK`** in Postgres and text-backed Rust enums
 //!   here ([`types`]) — additive changes are one-line migrations.
 //! - **Migrations are forward-only.** Never edit a file once it has been
@@ -23,6 +25,7 @@ pub mod facets;
 pub mod ingest_state;
 pub mod integrity;
 pub mod nft;
+pub mod raffles_program;
 pub mod rarity;
 pub mod registry;
 pub mod search;

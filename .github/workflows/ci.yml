@@ -27,9 +27,11 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:password@localhost:5433/piggygang_indexer
       # Every binary requires it and none defaults it (PIG-113). mainnet-beta
-      # because config/collections.toml, which `seed` applies below, is that
-      # cluster's registry. No endpoint is set: nothing in this job dials one,
-      # and none is ever derived from the cluster.
+      # for the job as a whole: `seed` picks the registry by cluster (PIG-134),
+      # and the fixture, rarity and conformance steps all read piggy-sol-gang
+      # out of this database. The seed step runs devnet as well, in a database
+      # of its own. No endpoint is set: nothing in this job dials one, and none
+      # is ever derived from the cluster.
       SOLANA_CLUSTER: mainnet-beta
     steps:
       - uses: actions/checkout@v5
@@ -61,11 +63,42 @@ jobs:
       # DB tests are #[ignore]d so a laptop without Postgres stays green;
       # here they must run (and a missing DATABASE_URL would fail them).
       - run: cargo test --workspace -- --include-ignored
-      - name: migrate + seed twice (end-to-end idempotency)
+      # One registry per cluster, and one database per cluster (PIG-134): the
+      # bare `seed` picks config/<SOLANA_CLUSTER>/collections.toml. The job's
+      # own database is mainnet-beta's; devnet gets a second one on the same
+      # server, because a registry is never seeded into another cluster's
+      # database — the rule the two Railway environments follow. The `export`
+      # is scoped to this step, so every later step is mainnet-beta again.
+      - name: migrate + seed twice, per cluster (end-to-end idempotency)
         run: |
-          cargo run -p indexer-admin -- migrate
-          cargo run -p indexer-admin -- seed
-          cargo run -p indexer-admin -- seed --expect-unchanged
+          seed_twice() {
+            cargo run -p indexer-admin -- migrate
+            cargo run -p indexer-admin -- seed
+            cargo run -p indexer-admin -- seed --expect-unchanged
+          }
+          seed_twice
+
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'CREATE DATABASE piggygang_indexer_devnet'
+          export SOLANA_CLUSTER=devnet DATABASE_URL="${DATABASE_URL}_devnet"
+          seed_twice
+
+          # A registry names its cluster, so an explicit --config cannot carry
+          # mainnet's into the devnet database either. The command has to fail,
+          # and for that reason — a mistyped path here would fail too, and
+          # prove nothing.
+          if refusal=$(cargo run -p indexer-admin -- seed --config config/mainnet-beta/collections.toml 2>&1); then
+            echo "$refusal"
+            echo "::error::the mainnet-beta registry was applied to the devnet database"
+            exit 1
+          fi
+          grep -qF 'is the registry for cluster `mainnet-beta`' <<<"$refusal" || {
+            echo "$refusal"
+            echo "::error::seed refused the mainnet-beta registry, but not for naming another cluster"
+            exit 1
+          }
+          # What the devnet seed loaded, and all that the refused one left
+          # behind: the four test collections and nothing else.
+          test "$(psql "$DATABASE_URL" -Atc "SELECT count(*) FILTER (WHERE slug LIKE 'test-%'), count(*) FROM collections")" = "4|4"
       # The `openapi` job proves the CONTRACT is servable, by mocking it. This
       # proves the API SERVES the contract, by putting Prism in front of the
       # real binary in proxy mode: it forwards each request upstream and

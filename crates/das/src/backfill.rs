@@ -769,8 +769,8 @@ async fn check_images(
 
 /// Flags a *faceted* trait type whose values are nearly per-asset-unique —
 /// the pathology that bloats `/facets` and pushes real values out of the
-/// planner's MCV list. The fix is a `facet_exclude` entry in
-/// `config/collections.toml` plus `seed`, never code.
+/// planner's MCV list. The fix is a `facet_exclude` entry in the cluster's
+/// `config/<cluster>/collections.toml` plus `seed`, never code.
 async fn facet_cardinality_warnings(
     pool: &PgPool,
     collection: &CollectionRow,
@@ -790,7 +790,7 @@ async fn facet_cardinality_warnings(
         .map(|t| {
             format!(
                 "{}: trait type {:?} has {} distinct values over {} assets — \
-                 consider facet_exclude in config/collections.toml",
+                 consider facet_exclude in config/<cluster>/collections.toml",
                 collection.slug, t.name, t.values, t.assets
             )
         })

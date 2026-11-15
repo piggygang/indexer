@@ -1,0 +1,29 @@
+# Raffles program config (PIG-134) — devnet.
+#
+# Where the PiggyGang Raffles program (piggygang/raffles-program) lives on this
+# cluster: its program id, and the slot it was first deployed in. The id is an
+# on-chain address like any other, so this file is its only home — not an env
+# var, not Rust, not SQL, not a test.
+#
+# Not deployed yet. The address is already decided — `declare_id!` in
+# raffles-program, RAFA9shRkA8Q9h2bSzCHGtaXNTE39yHV8DtxdguSsYM — but no account
+# exists there (asked devnet on 2026-11-15), so there is no deploy slot to
+# record and nothing for the indexer to follow. A cluster without the program
+# says so. `deployed = false` is a statement; a missing file, or one that is
+# half filled in, is an error.
+version = 1
+# The cluster this file describes. It is read only for that one.
+cluster = "devnet"
+deployed = false
+
+# Once `scripts/deploy-devnet.sh` has run there, say `deployed = true` and add
+# both:
+#
+#   program_id = "RAFA9shRkA8Q9h2bSzCHGtaXNTE39yHV8DtxdguSsYM"
+#   deploy_slot = <the slot of its FIRST deployment>
+#
+# The first deployment, not the "Last Deployed In Slot" that
+# `solana program show` prints — that one moves with every upgrade. It is the
+# slot of the oldest transaction in the program address's history: nothing the
+# program did can be older, so a replay that reaches it has everything
+# (`backfill-raffles`, PIG-159).

@@ -86,9 +86,12 @@ runtime image, distroless-ready.
 ## Repository layout
 
 ```
-config/
-  collections.toml   the collections/tokens registry seed — the ONLY home of on-chain addresses
-  seeds/*.mints.json closed mint lists for Token Metadata collections without a certified collection
+config/              the ONLY home of on-chain addresses
+  <cluster>/         one directory per cluster: mainnet-beta/, devnet/ (PIG-134)
+    collections.toml   the collections/tokens registry seed — `seed` picks it by SOLANA_CLUSTER
+    seeds/*.mints.json closed mint lists for Token Metadata collections without a certified collection
+    raffles.toml       the raffles program id and deploy slot, or "not deployed"
+  marketplaces.toml  marketplace program id → label; one file for every cluster
 openapi/
   v1.yaml            the frozen v1 API contract (ALG-620); redocly.yaml lints it
 crates/
@@ -141,7 +144,7 @@ Prereqs: Rust via rustup (the pinned 1.90 toolchain auto-installs), Docker.
 docker compose up -d                        # Postgres 17.6 on localhost:5433
 cp .env.example .env                        # DATABASE_URL points at it, SOLANA_CLUSTER=mainnet-beta; fill HELIUS_API_KEY when needed
 cargo run -p indexer-admin -- migrate       # apply migrations (the API also does this at boot)
-cargo run -p indexer-admin -- seed          # registry from config/collections.toml (idempotent)
+cargo run -p indexer-admin -- seed          # this cluster's registry, config/<SOLANA_CLUSTER>/collections.toml (idempotent)
 cargo run -p indexer-admin -- backfill      # DAS backfill (needs HELIUS_API_KEY; idempotent)
 cargo run -p indexer-api
 curl localhost:8080/health                  # liveness, no DB
@@ -248,11 +251,11 @@ And what the cluster changes, which is all of it:
   the api it is what the deployment was *configured* as — it dials no RPC and
   has nothing to check the claim against. On the ingester a 200 is a verified
   statement: the answer is 503 until the RPC has proved it.
-- **`seed`'s default registry.** `config/collections.toml` is mainnet's, so
-  the bare command applies it on mainnet-beta only; on devnet it refuses and
-  asks for `--config`, rather than seeding seventeen thousand mints that do not
-  exist there into a registry `seed` never deletes from. PIG-134 turns this
-  into `config/<cluster>/…`.
+- **The registry `seed` applies** — `config/<cluster>/collections.toml`, with
+  its mint lists and the cluster's `raffles.toml` beside it. Each file names
+  its cluster and is refused on any other, so mainnet's seventeen thousand
+  mints cannot be seeded into the devnet database, which `seed` never deletes
+  from. See **One registry per cluster** below.
 
 ### How the ingester boots
 
@@ -310,10 +313,11 @@ docker compose exec postgres createdb -U postgres piggygang_indexer_devnet
 export DATABASE_URL=postgres://postgres:password@localhost:5433/piggygang_indexer_devnet
 export SOLANA_CLUSTER=devnet SOLANA_RPC_URL=https://devnet.helius-rpc.com SOLANA_WS_URL=wss://devnet.helius-rpc.com
 cargo run -p indexer-admin -- migrate
+cargo run -p indexer-admin -- seed          # config/devnet/collections.toml
 PORT=8081 cargo run -p indexer-ingester
 ```
 
-The first two lines it logs are the ones to look for:
+The first two lines the ingester logs are the ones to look for:
 
 ```
 cluster: devnet (rpc https://devnet.helius-rpc.com, ws wss://devnet.helius-rpc.com)
@@ -321,9 +325,10 @@ cluster verified: the RPC endpoint's genesis hash is devnet's
 ```
 
 The log names origins only, never a path — a dedicated node's token usually
-*is* the path. With an empty registry the ingester then subscribes to roots and
-idles; there is nothing to track until a devnet registry is seeded (PIG-134,
-PIG-139).
+*is* the path. The devnet registry is four disabled placeholders for now (see
+**One registry per cluster**), so the ingester then subscribes to roots and
+idles: there is nothing to track until the fixture addresses are filled in
+(PIG-139).
 
 ### Rolling it out
 
@@ -359,7 +364,10 @@ railway logs --service ingester -d -n 50                # cluster: … / cluster
   checks — its cluster and its endpoint agree with each other — and then runs a
   devnet backfill over the mainnet registry. On Railway it cannot happen
   (`${{Postgres.DATABASE_URL}}` resolves inside the environment); from a
-  workstation holding both sets of credentials it can. `indexer-admin` logs
+  workstation holding both sets of credentials it can. A devnet-configured
+  `seed` is the same mistake one step earlier, and since PIG-134 it no longer
+  refuses: it applies the devnet registry, and the test collections join the
+  mainnet one for good, because `seed` never deletes. `indexer-admin` logs
   the cluster and the database target on consecutive lines for exactly that
   reason, and a stamp in the database itself is the real fix — not built here.
 - **Which Helius features exist on devnet** — `getTransactionsForAddress` in
@@ -477,11 +485,11 @@ without it — filter *wiring* is only testable against the real API.
 ## Collections registry (ALG-619)
 
 The registry (`collections`, `collection_mints`, `tokens`) is data, seeded
-from `config/collections.toml` + `config/seeds/*.mints.json` by
-`indexer-admin seed` — upsert by slug, mint lists insert-only, nothing is
+from the cluster's `config/<cluster>/collections.toml` + `seeds/*.mints.json`
+by `indexer-admin seed` — upsert by slug, mint lists insert-only, nothing is
 ever deleted, re-running is a no-op. **No on-chain address exists in Rust,
-SQL or tests.** Registered today (all enabled): Piggy SOL Gang (10,000
-mints), Piggy Girl Gang (5,000), Pig Mud (2,073) — all Metaplex Token
+SQL or tests.** Registered on mainnet-beta today (all enabled): Piggy SOL Gang
+(10,000 mints), Piggy Girl Gang (5,000), Pig Mud (2,073) — all Metaplex Token
 Metadata — Piggy Gang (Metaplex Core, dynamic), and the `$PIGGY` fungible
 token (registry only, no balances).
 
@@ -504,6 +512,90 @@ per-asset-unique `Name`). The seed refuses to change a collection's
 `standard`/`address`/`verified_creator` once it has assets unless
 `--allow-identity-change` is given, and refuses a mint already owned by
 another collection.
+
+### One registry per cluster (PIG-134)
+
+```
+config/
+  mainnet-beta/   collections.toml · seeds/*.mints.json · raffles.toml
+  devnet/         collections.toml · raffles.toml
+  marketplaces.toml
+```
+
+`indexer-admin seed` applies `config/<SOLANA_CLUSTER>/collections.toml`. The
+directory is the cluster's own name, so there is no default and no fallback
+file, and `cargo test` fails if a cluster the binaries accept has no directory.
+
+Picking the file is half of it. **Every registry also names its cluster**
+(`cluster = "devnet"`, required), and the loader refuses one that names
+another. So an explicit `--config` cannot carry one cluster's registry into
+another's database either — which matters, because the seed never deletes:
+
+```
+$ SOLANA_CLUSTER=devnet indexer-admin seed --config config/mainnet-beta/collections.toml
+Error: config/mainnet-beta/collections.toml is the registry for cluster `mainnet-beta`, and the
+cluster in use (SOLANA_CLUSTER) is `devnet` — every cluster has its own under config/<cluster>/, …
+```
+
+The file is read before migrations run, so a refusal sends the database
+nothing. CI seeds both clusters twice, each into a database of its own, and
+asserts the refusal.
+
+`config/marketplaces.toml` stays one file. On a public cluster only the holder
+of an address's key can deploy a program there, so a program id names the same
+venue wherever it exists and matches nothing where it does not.
+
+**The devnet registry is placeholders today.** It lists the four stand-ins
+that the fixtures tool in `piggygang/raffles-program` builds (PIG-115) — Test
+SOL Gang, Test Girl Gang, Test Piggy Gang, Test Pig Mud — as disabled rows with
+no addresses. Every fixture address derives from the team's devnet fixtures
+seed, and that tool's devnet output had not been committed when this was
+written (2026-11-15). The localnet output that *is* committed comes from
+another seed: its addresses exist on no cluster. To fill it in (PIG-139):
+
+1. In `raffles-program`, `cd scripts/fixtures && cargo run -- --cluster devnet plan`
+   — no network, but it needs the seed. It writes `devnet/collections.toml`
+   and `devnet/seeds/*.mints.json` in the registry's format.
+2. Copy `seeds/` into `config/devnet/` and replace the four placeholder entries
+   with the generated ones. The slugs are the same, so a database already
+   seeded from the placeholders is updated in place.
+3. Keep `cluster = "devnet"`, and give `test-piggy-gang` its `program`
+   (`programs.mpl_core` in the tool's `manifest.json`) — the generated file had
+   neither on that date. `cargo test` fails on a missing `cluster` and on a
+   Core collection without its `program`, which would otherwise record no Core
+   transfer, burn or mint.
+
+### The raffles program (`raffles.toml`)
+
+Each cluster directory also holds `raffles.toml`: where the PiggyGang Raffles
+program lives on that cluster. The program id is an on-chain address, so it is
+written here and not in an env var. A cluster that has the program will read:
+
+```toml
+version = 1
+cluster = "devnet"
+deployed = true
+program_id = "…"
+deploy_slot = 412345678
+```
+
+| key | |
+|---|---|
+| `cluster` | required; the file is read only for the cluster it names, like the registry |
+| `deployed` | required. `false` is how a cluster says it has no program yet — a statement, where a missing file would be a broken image |
+| `program_id`, `deploy_slot` | both required when deployed and both forbidden when not: a half-described program is an error, never a quiet "off" |
+
+`deploy_slot` is the slot of the program's **first** deployment — the oldest
+transaction in the program address's history — and not the "Last Deployed In
+Slot" that `solana program show` prints, which moves with every upgrade. It is
+the floor a cold-start replay walks back to (PIG-159).
+
+Both files say `deployed = false` today. Mainnet gets its program id at launch
+(PIG-67); devnet's address is already decided, but no account existed there on
+2026-11-15. **Nothing reads the file at run time yet**:
+`data-model::raffles_program` parses and validates it, `cargo test` checks both
+committed files, and its first readers are the raffles schema and the
+ingester's subscription (PIG-78, PIG-149).
 
 ## Data model
 
@@ -611,9 +703,11 @@ needs. It costs roughly $0.15–$0.25/month idle.
 
 `config/` ships in the **admin image only** — the builder stages it behind a
 `${BIN}` check and the runtime overlays `/app/dist` onto `/app`, so the api
-image stays config-free. CI asserts the `${BIN}` literal still matches
-`services/admin/Cargo.toml`, because a package rename would otherwise produce a
-green build whose `seed` fails only at run time.
+image stays config-free. It ships whole, both cluster directories: the same
+image serves every environment and `SOLANA_CLUSTER` picks its own. CI asserts
+the `${BIN}` literal still matches `services/admin/Cargo.toml`, because a
+package rename would otherwise produce a green build whose `seed` fails only at
+run time.
 
 ### Infrastructure-as-Code
 
@@ -719,10 +813,16 @@ down an SSH session mid-command. Railway's build cache is per service, so
 ```sh
 railway ssh keys add --key ~/.ssh/id_ed25519.pub --name "laptop"   # once per account
 railway ssh --service admin -- indexer-admin migrate
-railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml --dry-run
-railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml
-railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml --expect-unchanged
+railway ssh --service admin -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml --dry-run
+railway ssh --service admin -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml
+railway ssh --service admin -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml --expect-unchanged
 ```
+
+That is the production environment; in the devnet one the directory is
+`/app/config/devnet/`. The bare `indexer-admin seed` picks the same file from
+`SOLANA_CLUSTER`, but by a path relative to `/app`. Either way the wrong
+environment's line fails instead of seeding: a registry names its cluster and
+is refused on any other.
 
 Pass `--config` as an **absolute path** so nothing depends on where the SSH
 session lands, and prefer this non-interactive form: `railway ssh --session`
@@ -819,7 +919,7 @@ confirm a recent Postgres backup exists.
    `railway.api.json` and push. A service managed by `railway.json` cannot also
    be managed by `railway.ts`.
 5. Verify: `railway ssh --service admin -- indexer-admin --version`,
-   `-- ls /app/config/seeds`, and that `DATABASE_URL` resolves to
+   `-- ls /app/config/mainnet-beta/seeds`, and that `DATABASE_URL` resolves to
    `postgres.railway.internal` (not `proxy.rlwy.net`, not a literal `${{…}}`).
    Then run `migrate` and `seed` per **Operating the admin service**.
 
@@ -874,8 +974,9 @@ URI we would fetch today differs from the one recorded in
 That last clause is what makes a dead metadata host recoverable with no code
 change. Pig Mud's on-chain URIs point at the defunct shdw-drive host, so its
 assets, names and owners come from DAS while its attributes stay empty and the
-run reports the gap. Adding a `metadata_uri_template` to `config/collections.toml`
-once the files are re-hosted changes the computed URI, and the next run
+run reports the gap. Adding a `metadata_uri_template` to its entry in
+`config/mainnet-beta/collections.toml` once the files are re-hosted changes the
+computed URI, and the next run
 re-fetches and fills in. An asset whose document could not be read is
 deliberately left out of the attribute delete scope, so a failed fetch never
 wipes good data.
@@ -1278,11 +1379,12 @@ with `no bin target named 'indexer-ingester'`.
    `variable set` redeploy recovers it.
 4. `railway config plan --detailed-exit-code` must exit **0**. That zero is the
    acceptance test — committed and live config agree again.
-5. Seed the registry: this release changes `config/collections.toml`, and
-   rebuilding the admin image is not a seed.
+5. Seed the registry: this release changes the registry (now
+   `config/mainnet-beta/collections.toml`), and rebuilding the admin image is
+   not a seed.
 
    ```sh
-   railway ssh --service admin -- indexer-admin seed --config /app/config/collections.toml
+   railway ssh --service admin -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml
    ```
 
    `spec.rs` derives the subscription from the **database**, not from TOML, so a
@@ -2005,7 +2107,8 @@ hidden: **Pig Mud has no facetable trait type at all** — its metadata host ans
 530, so the only trait DAS ever cached is that unique `Name` — and all 2,073 of its
 assets carry `rarityRank: null`. That is the honest answer; ranking them would mean one
 2,073-way tie. `rarity` WARNs about it and points at the `metadata_uri_template` in
-`config/collections.toml` that fixes it with no code change.
+the cluster's registry (`config/mainnet-beta/collections.toml`) that fixes it with no
+code change.
 
 **Summed in `numeric`, stored as `double precision`.** `float8` addition is not
 associative, and the same query returned three different digests under three planner
@@ -2117,7 +2220,7 @@ set, plus `summary.json`.
 | `piggy-gang/json-s3` | S3 `piggysolgang`, `metadata/{id}.json` | 9 921 | 13.7 MB | 0 |
 | | | **49 763** | **20.904 GB** | **0** |
 
-`{mint}` is every mint in `config/seeds/piggy-sol-gang.mints.json`; `{id}` is every art
+`{mint}` is every mint in `config/mainnet-beta/seeds/piggy-sol-gang.mints.json`; `{id}` is every art
 id in the migration app's mint map (`lib/mint-map.json` in `piggygang/migrate`, the old
 `mint_map_prod.json`). Every PSG image is 1080×1080 and every Piggy Gang image
 2800×2800; no two keys in a set share a file.
@@ -2225,4 +2328,5 @@ map leaves out, which have no art id to fetch (PIG-183).
 - ALG-627 — rarity scoring & ranks — done
 - ALG-628 — prod monitoring/alerting · ALG-629 — external collections
 - PIG-113 — cluster-aware config: `SOLANA_CLUSTER`, explicit endpoints, cluster on `/health` — done
-- PIG-134 — per-cluster registry + raffles program config · PIG-116 — the `devnet` Railway environment
+- PIG-134 — per-cluster registry (`config/<cluster>/`) + raffles program config — done; the devnet registry holds placeholders until the fixture addresses land
+- PIG-116 — the `devnet` Railway environment · PIG-139 — seed + backfill the devnet registry

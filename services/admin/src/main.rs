@@ -4,7 +4,7 @@
 //! (`BIN=indexer-admin`).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
@@ -37,11 +37,12 @@ struct Cli {
 enum Cmd {
     /// Apply pending migrations (the same embedded migrator indexer-api runs at boot).
     Migrate,
-    /// Apply the collections registry (+ mint lists) idempotently. Never deletes.
+    /// Apply the cluster's collections registry (+ mint lists) idempotently.
+    /// Never deletes.
     Seed {
-        /// The registry to apply. Defaults to the configured cluster's own
-        /// (mainnet-beta: config/collections.toml); a cluster that ships no
-        /// registry yet has to be given one.
+        /// A registry to apply instead of the configured cluster's own, which
+        /// is config/<SOLANA_CLUSTER>/collections.toml. Either way a registry
+        /// is applied only to the cluster it names.
         #[arg(long)]
         config: Option<PathBuf>,
         /// Validate and report, then roll back.
@@ -267,14 +268,15 @@ async fn main() -> anyhow::Result<()> {
             expect_unchanged,
             allow_identity_change,
         } => {
-            // Resolved before anything is written, migrations included.
-            let registry = match registry {
-                Some(path) => path,
-                None => registry_for(config.solana.cluster)?,
-            };
+            let cluster = config.solana.cluster;
+            // Chosen and read before anything is written, migrations
+            // included: a registry that names another cluster stops here,
+            // with the database exactly as it was.
+            let registry = registry.unwrap_or_else(|| registry_for(cluster));
+            let seed = seed::load(&registry, cluster.as_str())?;
+            println!("registry   {} ({cluster})", registry.display());
             // A seed against an unmigrated database is a footgun.
             indexer_data_model::migrate(&pool).await?;
-            let seed = seed::load(&registry)?;
             let options = seed::ApplyOptions {
                 dry_run,
                 allow_identity_change,
@@ -472,8 +474,9 @@ async fn main() -> anyhow::Result<()> {
                     if members > 0 {
                         log::warn!(
                             "{slug}: {members} asset(s) but no facetable trait type — rarity \
-                             stays null; add a metadata_uri_template in \
-                             config/collections.toml once the metadata is re-hosted"
+                             stays null; add a metadata_uri_template in {} once the \
+                             metadata is re-hosted",
+                            registry_for(config.solana.cluster).display()
                         );
                     } else {
                         println!("{slug:<18} not backfilled yet, nothing to rank");
@@ -612,24 +615,34 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where the per-cluster config lives, relative to the working directory: the
+/// repository root on a workstation, `/app` in the admin image.
+const CONFIG_DIR: &str = "config";
+
+/// One cluster's own directory, `config/<cluster>/` (PIG-134): its registry,
+/// the mint lists that registry names, and its `raffles.toml`.
+///
+/// Named by the `SOLANA_CLUSTER` spelling itself, so there is no table to keep
+/// in step and nothing to fall back to. A cluster without a directory fails at
+/// the first read, and a test walks `Cluster::ALL` so that one cannot be added
+/// without its files.
+fn cluster_dir(cluster: Cluster) -> PathBuf {
+    Path::new(CONFIG_DIR).join(cluster.as_str())
+}
+
 /// The registry `seed` applies when `--config` is not given.
 ///
-/// One arm per cluster and no fallback, because the fallback is the bug:
-/// `config/collections.toml` holds mainnet addresses, and seeding it into a
-/// devnet database would have the ingester subscribe to — and the webhook
-/// register — seventeen thousand mints that do not exist on that chain, in a
-/// registry `seed` never deletes from. The devnet registry arrives with
-/// PIG-134, which is also what turns this into `config/<cluster>/…`; until
-/// then a devnet seed has to name its file.
-fn registry_for(cluster: Cluster) -> anyhow::Result<PathBuf> {
-    match cluster {
-        Cluster::MainnetBeta => Ok(PathBuf::from("config/collections.toml")),
-        Cluster::Devnet => bail!(
-            "no registry ships for {cluster} yet: config/collections.toml is the \
-             mainnet-beta registry and must not be seeded into a {cluster} database — \
-             pass --config <file> to apply one explicitly"
-        ),
-    }
+/// No fallback, because the fallback is the bug: a registry is one chain's
+/// addresses, and seeding mainnet's into a devnet database would have the
+/// ingester subscribe to — and the webhook register — seventeen thousand mints
+/// that do not exist on that chain, in a registry `seed` never deletes from.
+///
+/// Picking the file is half of that. The other half is in the file: every
+/// registry names its cluster and `seed::load` refuses a mismatch, so an
+/// explicit `--config` cannot carry one cluster's registry into another's
+/// database either.
+fn registry_for(cluster: Cluster) -> PathBuf {
+    cluster_dir(cluster).join("collections.toml")
 }
 
 /// The RPC client for a command that reads the chain, already proven to be on
@@ -1280,21 +1293,51 @@ async fn webhook(
 mod tests {
     use super::*;
 
-    /// `seed` with no `--config` must mean the same thing it always has on
-    /// mainnet — CI's "migrate + seed twice" and the Railway runbook both rely
-    /// on the bare command — and must mean *nothing* anywhere else, rather
-    /// than quietly applying mainnet's registry to another chain's database.
+    /// `seed` with no `--config` means the configured cluster's own registry
+    /// and never another's — CI's "migrate + seed twice" runs the bare command
+    /// once per cluster and relies on exactly that.
     #[test]
-    fn the_default_registry_is_mainnets_and_only_on_mainnet() {
+    fn the_default_registry_is_the_clusters_own() {
         assert_eq!(
-            registry_for(Cluster::MainnetBeta).unwrap(),
-            PathBuf::from("config/collections.toml")
+            registry_for(Cluster::MainnetBeta),
+            PathBuf::from("config/mainnet-beta/collections.toml")
         );
-        let error = registry_for(Cluster::Devnet).unwrap_err().to_string();
-        assert!(
-            error.contains("devnet") && error.contains("--config"),
-            "the refusal must name the cluster and the way out: {error}"
+        assert_eq!(
+            registry_for(Cluster::Devnet),
+            PathBuf::from("config/devnet/collections.toml")
         );
+    }
+
+    /// Every cluster the binary can be configured for ships both of its files,
+    /// each valid for that cluster and refused for every other. Without this,
+    /// a third `Cluster` variant would compile, pass CI, and fail on the first
+    /// `seed` of its environment.
+    #[test]
+    fn every_cluster_ships_a_registry_and_a_raffles_config_of_its_own() {
+        use indexer_data_model::raffles_program;
+
+        // The binary runs from the repository root; a test runs from the
+        // package directory.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for cluster in Cluster::ALL {
+            let registry = repo.join(registry_for(cluster));
+            let raffles = repo.join(cluster_dir(cluster)).join("raffles.toml");
+            seed::load(&registry, cluster.as_str())
+                .unwrap_or_else(|e| panic!("the {cluster} registry: {e:#}"));
+            raffles_program::load(&raffles, cluster.as_str())
+                .unwrap_or_else(|e| panic!("the {cluster} raffles config: {e:#}"));
+
+            for other in Cluster::ALL.into_iter().filter(|other| *other != cluster) {
+                assert!(
+                    seed::load(&registry, other.as_str()).is_err(),
+                    "the {cluster} registry was accepted on {other}"
+                );
+                assert!(
+                    raffles_program::load(&raffles, other.as_str()).is_err(),
+                    "the {cluster} raffles config was accepted on {other}"
+                );
+            }
+        }
     }
 
     /// The flag is optional so that the default can depend on the cluster; a

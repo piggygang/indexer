@@ -1,5 +1,7 @@
-//! The committed `config/collections.toml` against a fresh database: applied
-//! twice it is a no-op, and it never deletes.
+//! The committed registries against a fresh database: applied twice each is a
+//! no-op, and the seed never deletes. Most of this runs on mainnet-beta's
+//! (`config/mainnet-beta/collections.toml`), the one with mint lists and a
+//! token; devnet's gets the same idempotency check in a database of its own.
 
 use std::path::Path;
 
@@ -8,9 +10,17 @@ use indexer_data_model::attributes::ensure_trait_type;
 use indexer_data_model::seed::{self, ApplyOptions, Outcome};
 use indexer_data_model::{registry, PgPool};
 
+/// The registry committed for `cluster`, loaded as that cluster.
+fn committed_for(cluster: &str) -> seed::Seed {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config")
+        .join(cluster)
+        .join("collections.toml");
+    seed::load(&path, cluster).unwrap()
+}
+
 fn committed() -> seed::Seed {
-    seed::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/collections.toml"))
-        .unwrap()
+    committed_for("mainnet-beta")
 }
 
 async fn counts(pool: &PgPool) -> (i64, i64, i64) {
@@ -126,6 +136,73 @@ async fn seed_twice_is_idempotent(pool: PgPool) {
     assert_eq!(synced, 1, "the drifted Name flag was re-synced");
     assert!(!is_facet(&pool, name_type).await);
     assert_eq!(counts(&pool).await, (4, 17_073, 1));
+    assert_eq!(
+        updated_ats(&pool).await,
+        before,
+        "an unchanged row keeps its updated_at"
+    );
+}
+
+/// The devnet registry in a database of its own — one cluster per database, as
+/// deployed. Asserted against what the file says rather than against fixed
+/// counts, so it keeps holding when the placeholders become the fixture set.
+#[sqlx::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_devnet_registry_seeds_twice_into_its_own_database(pool: PgPool) {
+    let seed = committed_for("devnet");
+    let in_file = (
+        seed.file.collections.len() as i64,
+        seed.mints.values().map(Vec::len).sum::<usize>() as i64,
+        seed.file.tokens.len() as i64,
+    );
+
+    let first = seed::apply(&pool, &seed, ApplyOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        first
+            .collections
+            .iter()
+            .all(|c| c.outcome == Outcome::Inserted && c.mints_new == c.mints_in_file as u64),
+        "{first:?}"
+    );
+    assert!(first.tokens.iter().all(|t| t.outcome == Outcome::Inserted));
+    assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+    assert_eq!(counts(&pool).await, in_file);
+
+    // What the API serves and the pipelines index is exactly what the file
+    // enables — for placeholders, nothing.
+    let enabled: Vec<String> = registry::list_enabled(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|c| c.slug)
+        .collect();
+    let enabled_in_file: Vec<&str> = seed
+        .file
+        .collections
+        .iter()
+        .filter(|c| c.enabled)
+        .map(|c| c.slug.as_str())
+        .collect();
+    assert_eq!(enabled, enabled_in_file);
+
+    let before = updated_ats(&pool).await;
+    let second = seed::apply(&pool, &seed, ApplyOptions::default())
+        .await
+        .unwrap();
+    assert!(
+        second
+            .collections
+            .iter()
+            .all(|c| c.outcome == Outcome::Unchanged && c.mints_new == 0 && c.facets_synced == 0),
+        "{second:?}"
+    );
+    assert!(second
+        .tokens
+        .iter()
+        .all(|t| t.outcome == Outcome::Unchanged));
+    assert_eq!(counts(&pool).await, in_file);
     assert_eq!(
         updated_ats(&pool).await,
         before,
