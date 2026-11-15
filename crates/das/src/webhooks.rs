@@ -27,7 +27,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::client::{transport, DasError};
+use crate::client::{scrub, transport, DasError};
 
 /// Helius's cap on one webhook's `accountAddresses`. Our ~17 000 fit in one.
 pub const MAX_ADDRESSES: usize = 100_000;
@@ -212,13 +212,13 @@ impl WebhookClient {
         if !status.is_success() {
             // The body often names the real problem (a bad host answers with
             // HTML, a bad key with JSON), and losing it would make a wrong
-            // `HELIUS_WEBHOOK_API` unreadable.
+            // `HELIUS_WEBHOOK_API` unreadable. It is somebody else's text,
+            // though, and an error page that echoes the request target would
+            // echo the key with it — so it is scrubbed like any other message.
+            let excerpt: String = body.chars().take(300).collect();
             return Err(DasError::Rpc {
                 method: method.into(),
-                message: format!(
-                    "HTTP {status}: {}",
-                    body.chars().take(300).collect::<String>()
-                ),
+                message: format!("HTTP {status}: {}", scrub(&excerpt)),
             });
         }
         serde_json::from_str(&body).map_err(|source| DasError::Decode {

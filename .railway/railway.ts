@@ -220,10 +220,11 @@ export default defineRailway(() => {
       // worker, whose runtime can be dropped out from under a connection.
       DATABASE_MAX_CONNECTIONS: "7",
       SOLANA_CLUSTER: CLUSTER,
-      // The ingester asks this endpoint for its genesis hash before it opens a
-      // database connection or binds the port, and exits on a mismatch — so a
-      // wrong value here fails the deploy instead of running a sweep that
-      // marks a whole Core collection `removed`.
+      // The ingester asks this endpoint for its genesis hash before anything
+      // ingests, and /health answers 503 until the answer is this cluster's. So
+      // a wrong value here — another chain, or a host that never answers —
+      // fails the deploy instead of running a sweep that marks a whole Core
+      // collection `removed`.
       SOLANA_RPC_URL: RPC_URL,
       SOLANA_WS_URL: WS_URL,
     },

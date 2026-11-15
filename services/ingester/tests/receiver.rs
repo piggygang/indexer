@@ -8,7 +8,9 @@
 //! Ignored without a database: `cargo test --workspace -- --include-ignored`.
 
 use actix_web::{http::header, test, web, App};
+use indexer_config::Cluster;
 use indexer_data_model::PgPool;
+use indexer_ingester::cluster::ClusterGate;
 use indexer_ingester::receiver::{self, WebhookSecret};
 use serde_json::{json, Value};
 
@@ -254,35 +256,65 @@ async fn a_single_object_is_treated_as_one_element(pool: PgPool) {
     assert_eq!(rows(&pool).await, 1);
 }
 
-/// Liveness only, and deliberately no database: the Railway healthcheck gates
-/// the deploy, and gating it on Postgres would let a blip block a cutover.
-#[actix_web::test]
-async fn health_answers_without_a_pool() {
-    let app = app!(None::<receiver::InboxWriter>, None::<&str>);
+/// `GET /health` against the real route table, with the gate `main` would
+/// register — or none.
+async fn health(gate: Option<web::Data<ClusterGate>>) -> (u16, Value) {
+    let mut app = App::new().configure(indexer_ingester::receiver::configure);
+    if let Some(gate) = gate {
+        app = app.app_data(gate);
+    }
+    let app = test::init_service(app).await;
     let resp = test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
-    assert!(resp.status().is_success());
-    let body: Value = test::read_body_json(resp).await;
-    assert_eq!(body["service"], "indexer-ingester");
-    // Explicitly null when nothing configured one, never omitted.
-    assert!(body.as_object().unwrap().contains_key("cluster"));
-    assert!(body["cluster"].is_null());
+    let status = resp.status().as_u16();
+    (status, test::read_body_json(resp).await)
 }
 
-/// The deploy gate also says which chain: the `SOLANA_CLUSTER` spelling,
-/// verbatim, exactly as `main` registers it.
+/// Liveness, and deliberately no database: the Railway healthcheck gates the
+/// deploy, and gating it on Postgres would let a blip block a cutover. No
+/// writer, no secret and no pool are registered here, and it still answers.
 #[actix_web::test]
-async fn health_reports_the_configured_cluster() {
-    for cluster in indexer_config::Cluster::ALL {
-        let app = test::init_service(
-            App::new()
-                .app_data(web::Data::new(cluster))
-                .configure(indexer_ingester::receiver::configure),
-        )
-        .await;
-        let resp =
-            test::call_service(&app, test::TestRequest::get().uri("/health").to_request()).await;
-        assert!(resp.status().is_success());
-        let body: Value = test::read_body_json(resp).await;
+async fn health_answers_without_a_pool() {
+    let gate = web::Data::new(ClusterGate::new(Cluster::MainnetBeta));
+    gate.open();
+    let (status, body) = health(Some(gate)).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["service"], "indexer-ingester");
+}
+
+/// The deploy gate. A bound port is not enough: until the RPC endpoint has
+/// proved its cluster the answer is 503, so a deployment on the wrong chain —
+/// or one that cannot find out — never replaces the one that is working. The
+/// same gate, opened by `main` once the check passes, turns it 200 without a
+/// restart, and both answers say which chain.
+#[actix_web::test]
+async fn health_is_503_until_the_cluster_is_verified() {
+    for cluster in Cluster::ALL {
+        let gate = web::Data::new(ClusterGate::new(cluster));
+
+        let (status, body) = health(Some(gate.clone())).await;
+        assert_eq!(status, 503, "an unverified cluster must not pass the gate");
+        assert_eq!(body["status"], "starting");
         assert_eq!(body["cluster"], cluster.as_str());
+        assert!(
+            body["reason"].as_str().unwrap().contains(cluster.as_str()),
+            "the reason should say what is being waited for: {body}"
+        );
+
+        gate.open();
+        let (status, body) = health(Some(gate)).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["cluster"], cluster.as_str());
+        assert!(body.get("reason").is_none(), "nothing left to explain");
     }
+}
+
+/// Fail closed. A route table that forgot to register the gate must fail its
+/// deploy, not pass it on a handler that had nothing to check.
+#[actix_web::test]
+async fn health_without_a_gate_is_503() {
+    let (status, body) = health(None).await;
+    assert_eq!(status, 503);
+    assert_eq!(body["status"], "unavailable");
 }

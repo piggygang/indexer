@@ -419,12 +419,25 @@ fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250u64.saturating_mul(1 << attempt.min(5)))
 }
 
-/// Strips the API key so a URL can appear in a log line.
+/// Reduces a URL to its origin — `scheme://host[:port]` — so it can appear in
+/// a log line.
+///
+/// Everything after the origin can be a credential: the query carries
+/// `api-key=`, a dedicated node's access token is usually the path, and
+/// userinfo is a password by definition. Masking only the query was enough
+/// while the host was a constant in this crate; it stopped being enough when
+/// the endpoint became configuration, because the config crate accepts a path
+/// and hides it from the boot log for exactly this reason.
+///
+/// Text that is not a URL at all says nothing about itself: there is no part
+/// of an unparseable value that is known to be safe.
 pub fn redact(url: &str) -> String {
-    match url.find("api-key=") {
-        Some(index) => format!("{}api-key=***", &url[..index]),
-        None => url.to_string(),
-    }
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<redacted>".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority.rsplit('@').next().unwrap_or_default();
+    format!("{scheme}://{host}")
 }
 
 /// Convenience for a consumer that wants one shared source.
@@ -437,12 +450,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_api_key_never_reaches_a_log_line() {
+    fn a_logged_url_is_its_origin_and_nothing_else() {
         assert_eq!(
             redact("wss://mainnet.helius-rpc.com/?api-key=secret"),
-            "wss://mainnet.helius-rpc.com/?api-key=***"
+            "wss://mainnet.helius-rpc.com"
         );
-        assert_eq!(redact("ws://127.0.0.1:9/"), "ws://127.0.0.1:9/");
+        assert_eq!(redact("ws://127.0.0.1:9/"), "ws://127.0.0.1:9");
+        // A dedicated node keeps its token in the path, and the config crate
+        // accepts one — so the path goes too, not just the query. This is the
+        // string a failed connect logs at `warn`.
+        assert_eq!(
+            redact("wss://node.example.test/t0k3n/?api-key=secret"),
+            "wss://node.example.test"
+        );
+        assert_eq!(
+            redact("wss://user:t0k3n@node.example.test:8443/x"),
+            "wss://node.example.test:8443"
+        );
+        // Not a URL: no part of it is known to be safe to print.
+        assert_eq!(redact("t0k3n:x@node.example.test"), "<redacted>");
     }
 
     #[test]
@@ -460,16 +486,8 @@ mod tests {
             HeliusWs::new("ws://127.0.0.1:8900", "").url,
             "ws://127.0.0.1:8900"
         );
-    }
-
-    /// The adapter dials what it is handed and nothing else: the cluster is
-    /// the caller's configuration, so no constructor may know a host.
-    #[test]
-    fn the_adapter_streams_whichever_cluster_its_endpoint_serves() {
-        let mainnet = HeliusWs::new("wss://mainnet.helius-rpc.com", "k");
-        let devnet = HeliusWs::new("wss://devnet.helius-rpc.com", "k");
-        assert_ne!(mainnet.url, devnet.url);
-        assert!(devnet.url.starts_with("wss://devnet.helius-rpc.com/"));
+        // That the adapter then *dials* this URL — the endpoint it was handed,
+        // and no host of its own — is `tests/ws_adapter.rs`'s to prove.
     }
 
     #[test]

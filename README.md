@@ -164,7 +164,7 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 |---|---|---|---|
 | `PORT` | no | `8080` | injected by Railway |
 | `HOST` | no | `::` | dual-stack bind; Railway private networking needs the IPv6 bind |
-| `RUST_LOG` | no | `info` | |
+| `RUST_LOG` | no | `info` | never `trace` with a real key: tungstenite logs the WebSocket upgrade request, `?api-key=` included |
 | `SOLANA_CLUSTER` | **every binary** | — (none) | `devnet` \| `mainnet-beta`, spelled exactly. The one variable with no default: see **Clusters** below. `/health` reports it |
 | `SOLANA_RPC_URL` | ingester, `admin backfill` / `backfill-activity` | — | JSON-RPC + DAS, e.g. `https://mainnet.helius-rpc.com`. The bare endpoint — the key is appended from `HELIUS_API_KEY`. Never derived from the cluster; a hostname that names another cluster is a parse error, and its `getGenesisHash` is compared with the cluster's before anything is written |
 | `SOLANA_WS_URL` | ingester (with `ws`) | — | Enhanced WebSockets, e.g. `wss://mainnet.helius-rpc.com`. Its own variable, same rules as `SOLANA_RPC_URL` |
@@ -241,9 +241,10 @@ And what the cluster changes, which is all of it:
   (devnet ran about 53 million ahead of mainnet on 2026-11-15); checkpoints are
   written with `GREATEST`, so one that ever took the other chain's slot would
   sit above this chain's tip for years.
-- **`/health`**, on the api and the ingester: `"cluster":"mainnet-beta"`. It is
-  what the deployment was *configured* as. The api dials no RPC and has nothing
-  to check the claim against; the ingester is the one that proves it.
+- **`/health`**, on the api and the ingester: `"cluster":"mainnet-beta"`. On
+  the api it is what the deployment was *configured* as — it dials no RPC and
+  has nothing to check the claim against. On the ingester a 200 is a verified
+  statement: the answer is 503 until the RPC has proved it.
 - **`seed`'s default registry.** `config/collections.toml` is mainnet's, so
   the bare command applies it on mainnet-beta only; on devnet it refuses and
   asks for `--config`, rather than seeding seventeen thousand mints that do not
@@ -252,18 +253,38 @@ And what the cluster changes, which is all of it:
 
 ### How the ingester boots
 
-The cluster check is the first thing it does with the network, ahead of the
-database: a deployment pointed at the wrong chain exits without having opened a
-connection to Postgres or bound its port — so the *deploy* fails and Railway
-keeps the previous one, instead of passing the healthcheck and crash-looping.
+The webhook receiver comes up first, as it always has — filing a delivery needs
+no RPC — but its `/health`, the deploy gate, answers **503 until the cluster is
+verified**. Then the ingester asks `SOLANA_RPC_URL` for its genesis hash, and
+nothing that writes ownership or activity — the schedule, either consumer —
+starts before the answer:
 
-An endpoint that does not answer is a different case, and gets the opposite
-treatment. It is never a pass, and never an exit either: Railway's `ON_FAILURE`
+| the endpoint… | the ingester… | a deploy… |
+|---|---|---|
+| states this cluster's hash | opens the gate (`/health` → 200) and starts ingesting | goes live |
+| states another cluster's | exits non-zero, having ingested nothing | fails: `/health` never answered 200, Railway keeps the previous one |
+| does not answer | waits, with a capped backoff, for as long as it takes | fails at the 120 s healthcheck, same outcome |
+
+Not answering is never a pass, and never an exit either: Railway's `ON_FAILURE`
 gives up after ten restarts, so exiting would turn a Helius incident into an
-ingester still down after Helius is back. The check has 15 s alone; then boot
-carries on to the database and the webhook receiver (filing a delivery needs no
-RPC), and the check resumes, unbounded and with a capped backoff, before the
-schedule or any consumer starts. **Nothing is ingested until it passes.**
+ingester still down after Helius is back. The gate is what stops waiting from
+being a way to go live unverified: a mistyped host or a dead key looks exactly
+like an outage from the inside, and neither can replace a working deployment.
+A deployment that is *already* live and restarts into an incident is gated by
+nothing — the healthcheck only gates deploys — so it waits, receiver up and
+filing, and resumes when the endpoint answers.
+
+The cost is one case: **a deploy that coincides with a Helius outage longer
+than the healthcheck window fails and has to be redeployed afterwards.** The
+gate cannot tell an outage from a misconfiguration, and it sides with the
+deployment that is already working.
+
+`/health` is still a liveness check. The gate is a latch — opened once at boot,
+never shut again, never re-asked on a probe — the same kind of fact as "it
+connected to Postgres and migrated".
+
+SIGTERM ends the wait at once, including while a request to an endpoint that
+accepted the connection and then went silent is still open.
 
 `indexer-admin` is a one-shot, so it gives up on an unreachable endpoint as
 readily as on a wrong one.
@@ -345,16 +366,20 @@ railway logs --service ingester -d -n 50                # cluster: … / cluster
 ### Checked (2026-11-15)
 
 The two genesis hashes were read back from `api.mainnet-beta.solana.com` and
-`api.devnet.solana.com`, and the real `indexer-ingester` binary was run against
-both public RPCs: a devnet configuration verified against devnet, a
-mainnet-beta one against mainnet, and a loopback forwarder — a hostname that
-names nothing — in front of devnet under `SOLANA_CLUSTER=mainnet-beta` exited
-with both hashes before reaching the database. An endpoint that never answers
-waited out its head start and carried on to the database without ingesting.
-Run with `RUST_LOG=debug`, the key appeared in the log zero times — it used to
-ride in every transport error, because reqwest prints the request URL and the
-URL carries `api-key=`; the DAS and webhook clients now strip it where the
-error becomes a string.
+`api.devnet.solana.com`, and the comparison was run for real against both: a
+devnet configuration verified against devnet, a mainnet-beta one against
+mainnet, and a loopback forwarder — a hostname that names nothing — in front of
+devnet under `SOLANA_CLUSTER=mainnet-beta` was refused with both hashes in the
+error.
+
+Running it is also what found a leak older than this change. reqwest prints the
+request URL in its errors, the URL carries `api-key=`, and callers both logged
+those errors and stored them, in `webhook_inbox.last_error` and
+`backfill_state.last_error`. The DAS and webhook clients now strip the URL where
+the error becomes a string, and a logged endpoint is its origin only — no path,
+because a dedicated node's token usually is the path. **Rows and log lines
+written before that may still hold the key.** `RUST_LOG=trace` still would:
+tungstenite logs the WebSocket upgrade request, query string included.
 
 Still to do on the first real devnet boot (PIG-116): the same run against
 Helius's devnet endpoints with a key, and `transactionSubscribe` there.
@@ -762,7 +787,8 @@ purpose. Reading the log:
 5. `railway add --repo piggygang/indexer`; in the dashboard: rename the
    service `api`, branch `main`, enable **Wait for CI**, set Watch Paths,
    confirm region.
-6. Variables on `api`: `HELIUS_API_KEY`, `DATABASE_URL=${{Postgres.DATABASE_URL}}`,
+6. Variables on `api`: `SOLANA_CLUSTER` (required — the api does not boot
+   without it), `HELIUS_API_KEY`, `DATABASE_URL=${{Postgres.DATABASE_URL}}`,
    `RUST_LOG=info`.
 7. Push → CI green → build → healthcheck → ACTIVE. `railway domain --service
    api`, then `curl https://<domain>/health`.

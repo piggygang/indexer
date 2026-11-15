@@ -17,12 +17,12 @@
 //! deliveries.
 //!
 //! **Nothing is ingested until the cluster is verified** (PIG-113). The
-//! cluster and its endpoints are independent variables, so before any consumer
-//! or sweep starts, `SOLANA_RPC_URL` has to state — by its own genesis hash —
-//! that it serves `SOLANA_CLUSTER`. The check is the first thing the process
-//! does with the network, ahead of the database: a deployment pointed at the
-//! wrong chain exits without having opened a connection to Postgres. See
-//! [`indexer_ingester::cluster`].
+//! cluster and its endpoints are independent variables, so before the schedule
+//! or any consumer starts, `SOLANA_RPC_URL` has to state — by its own genesis
+//! hash — that it serves `SOLANA_CLUSTER`. The webhook receiver is already up
+//! by then, filing deliveries, but its `/health` answers 503 until the check
+//! passes: a deployment on the wrong chain, or one that cannot get an answer
+//! at all, never passes the deploy gate. See [`indexer_ingester::cluster`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ use actix_web::{web, App, HttpServer};
 use indexer_config::{Config, Transport};
 use indexer_das::DasClient;
 use indexer_ingest::ws::HeliusWs;
-use indexer_ingester::cluster::{self, Verdict};
+use indexer_ingester::cluster::{self, ClusterGate, Verdict};
 use indexer_ingester::consumer::{self, Consumer, Lane};
 use indexer_ingester::inbox::WebhookInbox;
 use indexer_ingester::receiver::{self, WebhookSecret};
@@ -41,24 +41,6 @@ use indexer_ingester::schedule;
 /// backlog here means the database is the bottleneck, and a 503 that Helius
 /// retries is a better answer than an unbounded queue.
 const WRITE_QUEUE: usize = 64;
-
-/// How long the cluster check runs before anything else happens.
-///
-/// The webhook receiver's `/health` is the deploy gate, so the order matters.
-/// An endpoint on the wrong cluster must fail the *deploy* — exit before the
-/// port is bound, so Railway keeps the previous deployment — rather than pass
-/// the healthcheck and then crash-loop with nothing left to fall back to. But
-/// an endpoint that simply is not answering must not hold the receiver back
-/// for the length of an outage: filing a delivery needs no RPC, and Helius
-/// drops what it cannot deliver after about three tries.
-///
-/// So the check gets this long alone, first. One answer takes well under a
-/// second and the client's own four attempts span about 3.5 s, so this covers
-/// a slow answer and a retry round, and still leaves the database its 60 s
-/// inside the 120 s healthcheck window. If it has not answered by then, boot
-/// carries on to the receiver and the check resumes — unbounded — before
-/// anything that writes is started.
-const CLUSTER_CHECK_HEAD_START: Duration = Duration::from_secs(15);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -81,15 +63,6 @@ async fn main() -> anyhow::Result<()> {
     let api_key = config.helius.required_api_key()?;
     log::info!("cluster: {}", solana.describe());
 
-    // Every client in this process is built here and nowhere else, so there is
-    // one place that decides which endpoint a `DasClient` dials.
-    let das = || DasClient::with_endpoint(rpc_url, api_key);
-
-    // The cluster check, first and alone — see CLUSTER_CHECK_HEAD_START. A
-    // mismatch returns from here: no database connection, no bound port.
-    let verifier = das()?;
-    let verified = cluster::verify_within(&verifier, solana, CLUSTER_CHECK_HEAD_START).await?;
-
     let db = &config.database;
     let pool = indexer_data_model::connect_with_retry(
         db.required_url()?,
@@ -102,6 +75,9 @@ async fn main() -> anyhow::Result<()> {
     indexer_data_model::migrate(&pool).await?;
     log::info!("database migrated");
 
+    // Every client in this process is built here and nowhere else, so there is
+    // one place that decides which endpoint a `DasClient` dials.
+    let das = || DasClient::with_endpoint(rpc_url, api_key);
     // One throttled client for everything that reconciles. There is exactly
     // one reconciling task in this process now — the schedule — so this is the
     // whole reconcile budget rather than one share of it. Helius meters DAS at
@@ -128,20 +104,35 @@ async fn main() -> anyhow::Result<()> {
     // The webhook receiver: spawned first and independently, so it is accepting
     // deliveries before the consumers finish their boot reconcile and keeps
     // accepting them across every consumer restart.
+    //
+    // Its `/health` answers from this gate, and the gate is shut: the deploy
+    // does not go green on a bound port alone.
+    let gate = web::Data::new(ClusterGate::new(cluster));
     let http = if config.ingest.runs(Transport::Webhook) {
-        Some(serve(&config, pool.clone(), shutdown.clone())?)
+        Some(serve(
+            &config,
+            pool.clone(),
+            shutdown.clone(),
+            gate.clone(),
+        )?)
     } else {
         None
     };
 
-    // No answer inside the head start: the receiver is up and filing, and the
-    // check resumes here for as long as it takes. Still nothing is ingested
-    // until it passes — the schedule and the consumers below are what write.
-    let verdict = if verified {
-        Verdict::Verified
-    } else {
-        cluster::verify(&verifier, solana, shutdown.clone()).await?
-    };
+    // The cluster check. Everything above only files deliveries; everything
+    // below writes ownership and activity, and none of it starts until the RPC
+    // endpoint has stated a genesis hash that is this cluster's.
+    //
+    // A mismatch returns from here with the gate still shut, so the deploy
+    // fails and Railway keeps the previous one. An endpoint that does not
+    // answer is waited on for as long as it takes — see the module doc for why
+    // that is neither a pass nor an exit — and a deploy stuck there fails its
+    // healthcheck the same way.
+    //
+    // One request per round: the loop owns the retrying, and it is the half
+    // that can hear a shutdown.
+    let verifier = das()?.with_max_attempts(1);
+    let verdict = cluster::verify(&verifier, solana, shutdown.clone()).await?;
     if verdict == Verdict::Interrupted {
         if let Some(http) = http {
             if let Err(error) = http.await {
@@ -151,6 +142,7 @@ async fn main() -> anyhow::Result<()> {
         log::info!("ingester stopped before the cluster was verified; nothing was ingested");
         return Ok(());
     }
+    gate.open();
 
     // Spawned once, outside the supervisors: the schedule is not part of any
     // consumer's lifecycle, and re-spawning it on every restart would let a
@@ -234,6 +226,7 @@ fn serve(
     config: &Config,
     pool: indexer_data_model::PgPool,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    gate: web::Data<ClusterGate>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let secret = WebhookSecret::new(config.helius.required_webhook_secret()?);
     let (writer, writes) = receiver::writer(pool, WRITE_QUEUE);
@@ -241,13 +234,13 @@ fn serve(
 
     let secret = web::Data::new(secret);
     let writer = web::Data::new(writer);
-    // What `/health` reports, so the deploy gate also says which chain.
-    let cluster = web::Data::new(config.solana.cluster);
     let server = HttpServer::new(move || {
         App::new()
             .app_data(secret.clone())
             .app_data(writer.clone())
-            .app_data(cluster.clone())
+            // What `/health` answers from: which chain, and whether the RPC
+            // endpoint has proved it yet.
+            .app_data(gate.clone())
             .configure(receiver::configure)
     })
     // Two, not one-per-core: this endpoint serves a few hundred requests a day

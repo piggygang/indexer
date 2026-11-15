@@ -83,13 +83,35 @@ impl FromStr for Cluster {
     /// Exact spellings only. `mainnet` is the Wallet Standard's name for the
     /// same cluster and the likeliest typo, and it is refused like any other:
     /// a value that is *nearly* right must fail the boot, not be guessed at.
+    ///
+    /// The rejected value is repeated back only when it could be a cluster
+    /// name — a short word. This variable sits next to the endpoints in every
+    /// dashboard and `.env`, so what lands in it by mistake is a URL with a key
+    /// in it, or the key itself, and an error message is the last place for
+    /// either.
     fn from_str(value: &str) -> Result<Self> {
         match value.trim() {
             "mainnet-beta" => Ok(Self::MainnetBeta),
             "devnet" => Ok(Self::Devnet),
-            other => anyhow::bail!("unknown cluster '{other}' (devnet | mainnet-beta)"),
+            other if is_short_word(other) => {
+                anyhow::bail!("unknown cluster '{other}' (devnet | mainnet-beta)")
+            }
+            _ => anyhow::bail!(
+                "unknown cluster (devnet | mainnet-beta) — the value does not look like a \
+                 cluster name, so it is not shown"
+            ),
         }
     }
+}
+
+/// Could this be a mistyped cluster name? Letters, digits, `-` and `_`, and no
+/// longer than a name plus a typo — which a URL, a UUID-shaped API key and a
+/// base64 secret all fail.
+fn is_short_word(value: &str) -> bool {
+    value.len() <= 20
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// The cluster and the endpoints that reach it.
@@ -491,7 +513,9 @@ where
 /// [`SolanaConfig::cluster`].
 fn required_cluster(key: &str) -> Result<Cluster> {
     match env::var(key) {
-        Ok(raw) if !raw.is_empty() => raw.parse().with_context(|| format!("invalid {key}={raw}")),
+        // The value is not repeated here: `Cluster::from_str` decides whether
+        // it is safe to show.
+        Ok(raw) if !raw.is_empty() => raw.parse().with_context(|| format!("invalid {key}")),
         _ => anyhow::bail!(
             "{key} is required (devnet | mainnet-beta) and has no default: a defaulted \
              cluster would silently index the other chain into this database \
@@ -541,9 +565,10 @@ fn endpoint(key: &str, wire: Wire, cluster: Cluster) -> Result<Option<String>> {
 /// **No error here echoes the raw value.** Unlike `PORT`, a URL is where a key
 /// ends up when someone pastes the line from the Helius dashboard, and the
 /// commonest mistake this function exists to catch is exactly that paste. The
-/// messages name the variable and the rule instead; the one that prints any of
-/// it prints the origin — scheme and host — and only after a query string and
-/// credentials have been ruled out.
+/// messages name the variable and the rule instead. Two print a part of it,
+/// and only a part that cannot hold a secret: a scheme, when it is one of the
+/// four this function knows, and the origin — scheme and host — once a query
+/// string and credentials have been ruled out.
 fn parse_endpoint(key: &str, raw: &str, wire: Wire, cluster: Cluster) -> Result<String> {
     let raw = raw.trim();
     // Railway leaves a reference it cannot resolve in place as literal text —
@@ -560,11 +585,17 @@ fn parse_endpoint(key: &str, raw: &str, wire: Wire, cluster: Cluster) -> Result<
     })?;
 
     let scheme = url.scheme();
-    anyhow::ensure!(
-        scheme == wire.secure() || scheme == wire.plaintext(),
-        "invalid {key}: scheme `{scheme}://`, expected `{}://`",
-        wire.secure()
-    );
+    if scheme != wire.secure() && scheme != wire.plaintext() {
+        // Only a scheme this function knows is repeated back. `Url` reads
+        // `token:x@host` — credentials pasted without their `https://` — as a
+        // URL whose *scheme* is `token`, so anything else may be the secret.
+        let got = if matches!(scheme, "http" | "https" | "ws" | "wss") {
+            format!("`{scheme}://`")
+        } else {
+            "another scheme or none (not shown)".to_string()
+        };
+        anyhow::bail!("invalid {key}: expected `{}://`, got {got}", wire.secure());
+    }
     let host = url
         .host()
         .with_context(|| format!("invalid {key}: no host"))?;
@@ -792,8 +823,25 @@ mod tests {
         env::set_var("SOLANA_CLUSTER", "mainnet");
         let err = format!("{:#}", Config::try_from_env().unwrap_err());
         assert!(
-            err.contains("SOLANA_CLUSTER=mainnet") && err.contains("devnet | mainnet-beta"),
+            err.contains("invalid SOLANA_CLUSTER")
+                && err.contains("'mainnet'")
+                && err.contains("devnet | mainnet-beta"),
             "unexpected error: {err}"
+        );
+        // The neighbouring variable's value, pasted one line too high: the
+        // dashboard's RPC URL, key and all. It is refused without being shown.
+        env::set_var(
+            "SOLANA_CLUSTER",
+            "https://mainnet.helius-rpc.com/?api-key=s3cr3t",
+        );
+        let err = format!("{:#}", Config::try_from_env().unwrap_err());
+        assert!(
+            err.contains("invalid SOLANA_CLUSTER") && err.contains("devnet | mainnet-beta"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !err.contains("s3cr3t") && !err.contains("helius"),
+            "leaked: {err}"
         );
 
         // A whole devnet configuration: every endpoint explicit, each one
@@ -867,6 +915,23 @@ mod tests {
             assert!(
                 err.contains("devnet | mainnet-beta"),
                 "the error for '{wrong}' must list the valid values: {err}"
+            );
+        }
+        // A near miss is repeated back, because seeing `mainnet` is the fix.
+        let err = "mainnet".parse::<Cluster>().unwrap_err().to_string();
+        assert!(err.contains("'mainnet'"), "unexpected error: {err}");
+        // What lands in this variable by mistake is not a near miss: a URL
+        // with a key in it, a UUID-shaped key, a base64 secret. None of it is
+        // repeated.
+        for secret in [
+            "https://rpc.example.test/?api-key=s3cr3t",
+            "5e3cr3t0-aaaa-4bbb-8ccc-dddddddddddd",
+            "s3cr3t+base64/with=padding",
+        ] {
+            let err = secret.parse::<Cluster>().unwrap_err().to_string();
+            assert!(
+                err.contains("devnet | mainnet-beta") && !err.contains(secret),
+                "leaked: {err}"
             );
         }
     }
@@ -970,6 +1035,14 @@ mod tests {
                 Wire::Http,
                 "unresolved Railway reference",
             ),
+            // Credentials pasted without their scheme: `Url` reads the user
+            // half as the scheme, so an unknown scheme is never repeated.
+            (
+                "s3cr3t:pw@rpc.example.test",
+                Wire::Http,
+                "expected `https://`",
+            ),
+            ("s3cr3t:8899", Wire::Ws, "expected `wss://`"),
         ] {
             let message = err(raw, wire);
             assert!(

@@ -1,10 +1,10 @@
-//! The boot-time cluster check.
+//! The boot-time cluster check, and the gate it opens.
 //!
 //! [`indexer_das::cluster::verify`] asks the endpoint which chain it is on;
 //! this decides what each answer means for a process that is meant to stay up
 //! for weeks.
 //!
-//! * **It agrees** → ingest.
+//! * **It agrees** → the gate opens and ingestion starts.
 //! * **It is another cluster** → fatal, on purpose. This is exactly the
 //!   "configuration failure a restart cannot fix" the binary reserves a
 //!   non-zero exit for, and the alternative is not a degraded ingester but a
@@ -20,15 +20,25 @@
 //!   nothing the outage had not already taken, and the reconnect reconcile
 //!   closes the gap exactly as it does after any other downtime.
 //!
+//! **The gate is what makes the deploy tell those apart.** [`ClusterGate`]
+//! is what `/health` answers from, and it stays shut — 503 — until the check
+//! passes. So a new deployment that is on the wrong chain, or that cannot get
+//! an answer at all (a mistyped host, a dead key), never goes green: Railway
+//! keeps the previous one. A deployment that is *already* live and restarts
+//! into a Helius incident is not gated by anything — the healthcheck only
+//! gates deploys — and simply waits here, with the webhook receiver up and
+//! filing, until the endpoint answers.
+//!
 //! The WebSocket endpoint is not checked here and cannot be: pubsub does not
 //! answer `getGenesisHash`. It gets the config crate's offline check — a
 //! hostname that names another cluster is refused at parse time — and that is
 //! all it gets.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
-use indexer_config::SolanaConfig;
+use indexer_config::{Cluster, SolanaConfig};
 use indexer_das::{cluster, ClusterError, DasClient};
 use tokio::sync::watch;
 
@@ -48,15 +58,58 @@ const BACKOFF: [Duration; 5] = [
 pub enum Verdict {
     /// The endpoint is on the configured cluster.
     Verified,
-    /// Shutdown was requested before the endpoint answered. Nothing was
-    /// verified, so nothing may be started.
+    /// Shutdown was requested before the endpoint was verified. Nothing was
+    /// verified, so nothing may be started — including when the answer was
+    /// already on its way.
     Interrupted,
+}
+
+/// Which cluster this deployment was configured for, and whether its RPC
+/// endpoint has proved it yet. The receiver's `/health` answers from this.
+///
+/// Shut until [`ClusterGate::open`], and open for good after: the genesis hash
+/// of an endpoint does not change under a running process, so there is nothing
+/// that could shut it again and no reason for a probe to re-ask. That is what
+/// keeps `/health` a liveness check — one fact, settled once at boot, the same
+/// way "connected to Postgres and migrated" is — rather than a dependency ping
+/// that could fail a later deploy on a Helius blip.
+#[derive(Debug)]
+pub struct ClusterGate {
+    cluster: Cluster,
+    verified: AtomicBool,
+}
+
+impl ClusterGate {
+    pub fn new(cluster: Cluster) -> Self {
+        Self {
+            cluster,
+            verified: AtomicBool::new(false),
+        }
+    }
+
+    pub fn cluster(&self) -> Cluster {
+        self.cluster
+    }
+
+    /// The endpoint has proved its cluster. One way only.
+    pub fn open(&self) {
+        self.verified.store(true, Ordering::Release);
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.verified.load(Ordering::Acquire)
+    }
 }
 
 /// Waits until `SOLANA_RPC_URL` has proved it serves `SOLANA_CLUSTER`.
 ///
 /// `Err` only for a mismatch, with a message that names both variables — it is
 /// the last thing the process logs before it exits.
+///
+/// Give it a client that does not retry on its own (`with_max_attempts(1)`):
+/// this loop owns the retrying and the backoff, and it is the half that can
+/// hear a shutdown. The client's four attempts at a 30 s timeout each would
+/// otherwise sit inside a single round.
 pub async fn verify(
     das: &DasClient,
     solana: &SolanaConfig,
@@ -82,35 +135,14 @@ pub async fn verify(
     Ok(verdict)
 }
 
-/// One bounded round of [`verify`], for the head of the boot sequence.
-///
-/// `Ok(true)` when the endpoint proved itself inside `budget`, `Ok(false)`
-/// when it has not answered yet — which is *not yet*, not a pass: the caller
-/// still owes an unbounded [`verify`] before it starts anything that writes.
-/// `Err` for a mismatch, exactly as [`verify`].
-///
-/// It runs before the signal handler exists, so nothing interrupts it but the
-/// budget; the process is still an ordinary one that SIGTERM simply ends.
-pub async fn verify_within(
-    das: &DasClient,
-    solana: &SolanaConfig,
-    budget: Duration,
-) -> anyhow::Result<bool> {
-    let (_idle, never) = watch::channel(false);
-    match tokio::time::timeout(budget, verify(das, solana, never)).await {
-        Ok(verdict) => Ok(verdict? == Verdict::Verified),
-        Err(_) => {
-            log::warn!(
-                "cluster still not verified after {budget:?}; carrying on with the boot — \
-                 the check resumes before anything is ingested"
-            );
-            Ok(false)
-        }
-    }
-}
-
 /// The loop itself, with the expected hash and the backoff as parameters so a
 /// test can use synthetic hashes and millisecond waits.
+///
+/// Shutdown is raced against the request as well as against the backoff, and
+/// it is the `biased` first arm of both: an endpoint that accepts a connection
+/// and then says nothing must not hold SIGTERM for the length of its timeout,
+/// and an answer that lands together with the request to stop must not come
+/// back as `Verified` to a caller that has been told to stop.
 async fn wait_for(
     das: &DasClient,
     expected_genesis_hash: &str,
@@ -119,10 +151,12 @@ async fn wait_for(
 ) -> Result<Verdict, ClusterError> {
     let mut attempt = 0usize;
     loop {
-        if *shutdown.borrow() {
-            return Ok(Verdict::Interrupted);
-        }
-        match cluster::verify(das, expected_genesis_hash).await {
+        let answer = tokio::select! {
+            biased;
+            _ = stopped(&mut shutdown) => return Ok(Verdict::Interrupted),
+            answer = cluster::verify(das, expected_genesis_hash) => answer,
+        };
+        match answer {
             Ok(()) => return Ok(Verdict::Verified),
             Err(mismatch @ ClusterError::Mismatch { .. }) => return Err(mismatch),
             Err(ClusterError::Unverified(error)) => {
@@ -132,19 +166,27 @@ async fn wait_for(
                     "cluster not verified ({error}); nothing is ingested until it is — \
                      retrying in {wait:?} (attempt {attempt})"
                 );
-                let sleep = tokio::time::sleep(wait);
-                tokio::pin!(sleep);
                 tokio::select! {
-                    _ = &mut sleep => {}
-                    changed = shutdown.changed() => {
-                        // No signal source left to wake us: wait the backoff
-                        // out rather than spin on a closed channel.
-                        if changed.is_err() {
-                            sleep.await;
-                        }
-                    }
+                    biased;
+                    _ = stopped(&mut shutdown) => return Ok(Verdict::Interrupted),
+                    _ = tokio::time::sleep(wait) => {}
                 }
             }
+        }
+    }
+}
+
+/// Resolves once shutdown has been requested — and never, if the signal task
+/// is gone without having asked. A closed channel has to lose every `select!`
+/// it is in, so the request and the backoff run their course; resolving on it
+/// would turn the backoff into a hot loop.
+async fn stopped(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return std::future::pending().await;
         }
     }
 }
@@ -152,7 +194,7 @@ async fn wait_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -164,10 +206,21 @@ mod tests {
 
     const QUICK: [Duration; 1] = [Duration::from_millis(5)];
 
-    /// A loopback RPC that cannot answer `getGenesisHash` for its first
-    /// `failures` calls — the JSON-RPC error a node gives while it is still
-    /// starting — and then states `hash`.
-    async fn rpc(failures: usize, hash: &'static str) -> (DasClient, Arc<AtomicUsize>) {
+    /// How the loopback node behaves once it has read a request.
+    #[derive(Clone, Copy)]
+    enum Node {
+        /// Cannot answer `getGenesisHash` for its first `failures` calls — the
+        /// JSON-RPC error a node gives while it is still starting — and then
+        /// states `hash`.
+        Answers { failures: usize, hash: &'static str },
+        /// States `hash`, but only after `delay`.
+        Slow { delay: Duration, hash: &'static str },
+        /// Accepts the connection and never says anything: a wedged proxy, a
+        /// load balancer with no healthy backend.
+        Silent,
+    }
+
+    async fn node(behaviour: Node) -> (DasClient, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
@@ -178,13 +231,22 @@ mod tests {
                 tokio::spawn(async move {
                     let mut chunk = [0u8; 4096];
                     let _ = stream.read(&mut chunk).await;
-                    let payload = if attempt < failures {
-                        serde_json::json!({
+                    let hash = match behaviour {
+                        Node::Answers { failures, hash } => (attempt >= failures).then_some(hash),
+                        Node::Slow { delay, hash } => {
+                            tokio::time::sleep(delay).await;
+                            Some(hash)
+                        }
+                        Node::Silent => return std::future::pending().await,
+                    };
+                    let payload = match hash {
+                        Some(hash) => {
+                            serde_json::json!({"jsonrpc": "2.0", "id": "indexer", "result": hash})
+                        }
+                        None => serde_json::json!({
                             "jsonrpc": "2.0", "id": "indexer",
                             "error": {"code": -32005, "message": "Node is unhealthy"},
-                        })
-                    } else {
-                        serde_json::json!({"jsonrpc": "2.0", "id": "indexer", "result": hash})
+                        }),
                     }
                     .to_string();
                     let response = format!(
@@ -197,7 +259,15 @@ mod tests {
                 });
             }
         });
-        (DasClient::with_endpoint(&endpoint, "").unwrap(), calls)
+        // One attempt per round, as `main` builds it.
+        let das = DasClient::with_endpoint(&endpoint, "")
+            .unwrap()
+            .with_max_attempts(1);
+        (das, calls)
+    }
+
+    async fn rpc(failures: usize, hash: &'static str) -> (DasClient, Arc<AtomicUsize>) {
+        node(Node::Answers { failures, hash }).await
     }
 
     fn never() -> (watch::Sender<bool>, watch::Receiver<bool>) {
@@ -209,7 +279,7 @@ mod tests {
     /// built for, on a port nobody chose.
     fn devnet() -> SolanaConfig {
         SolanaConfig {
-            cluster: indexer_config::Cluster::Devnet,
+            cluster: Cluster::Devnet,
             rpc_url: Some("http://127.0.0.1:8899".into()),
             ws_url: None,
         }
@@ -222,14 +292,16 @@ mod tests {
     /// hashes, because it is the last line the process prints.
     #[tokio::test]
     async fn the_boot_check_passes_its_own_cluster_and_names_everything_on_a_mismatch() {
-        use indexer_config::Cluster;
-        let budget = Duration::from_secs(5);
-
         let (das, _) = rpc(0, Cluster::Devnet.genesis_hash()).await;
-        assert!(verify_within(&das, &devnet(), budget).await.unwrap());
+        let (_keep, shutdown) = never();
+        assert_eq!(
+            verify(&das, &devnet(), shutdown).await.unwrap(),
+            Verdict::Verified
+        );
 
         let (das, _) = rpc(0, Cluster::MainnetBeta.genesis_hash()).await;
-        let error = verify_within(&das, &devnet(), budget).await.unwrap_err();
+        let (_keep, shutdown) = never();
+        let error = verify(&das, &devnet(), shutdown).await.unwrap_err();
         let message = format!("{error:#}");
         for expected in [
             "SOLANA_CLUSTER is devnet",
@@ -242,18 +314,6 @@ mod tests {
                 "missing {expected:?} in: {message}"
             );
         }
-    }
-
-    /// The head start is a budget, not a verdict: an endpoint that has not
-    /// answered inside it is reported as *not yet*, so boot can bring the
-    /// receiver up — and the caller still owes the unbounded check.
-    #[tokio::test]
-    async fn an_unanswered_head_start_is_not_yet_rather_than_a_pass_or_an_error() {
-        let (das, _) = rpc(usize::MAX, OURS).await;
-        let verified = verify_within(&das, &devnet(), Duration::from_millis(300))
-            .await
-            .unwrap();
-        assert!(!verified, "no answer is never a pass");
     }
 
     #[tokio::test]
@@ -309,9 +369,10 @@ mod tests {
     }
 
     /// SIGTERM during an outage must not have to wait for the outage to end —
-    /// and must not be mistaken for a verification.
+    /// and must not be mistaken for a verification. This is the backoff half:
+    /// the node answers at once, with an error, and the wait is in the sleep.
     #[tokio::test]
-    async fn a_shutdown_ends_the_wait_without_verifying() {
+    async fn a_shutdown_during_the_backoff_ends_the_wait() {
         let (das, _) = rpc(usize::MAX, OURS).await;
         let (stop, shutdown) = never();
         let long = [Duration::from_secs(3_600)];
@@ -327,6 +388,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(verdict, Verdict::Interrupted);
+    }
+
+    /// The request half, which is the one that bites: an endpoint that accepts
+    /// the connection and then says nothing holds the request open for the
+    /// client's whole 30 s timeout. Without a race against shutdown the process
+    /// neither serves nor exits for that long, and Railway ends it with SIGKILL.
+    #[tokio::test]
+    async fn a_shutdown_while_the_request_is_in_flight_ends_the_wait() {
+        let (das, calls) = node(Node::Silent).await;
+        let (stop, shutdown) = never();
+
+        let waiting = tokio::spawn(async move { wait_for(&das, OURS, &QUICK, shutdown).await });
+        // Long enough for the request to be on the wire and unanswered.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "the request is in flight");
+        stop.send(true).unwrap();
+
+        let verdict = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("an unanswered request must not hold the shutdown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(verdict, Verdict::Interrupted);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "and it was not retried");
+    }
+
+    /// `Interrupted` means nothing may be started, so it has to hold even when
+    /// the right answer is already on its way: shutdown is asked for while the
+    /// node is still composing a reply that would have verified.
+    #[tokio::test]
+    async fn an_answer_that_arrives_after_the_shutdown_request_is_not_a_verification() {
+        let (das, _) = node(Node::Slow {
+            delay: Duration::from_millis(600),
+            hash: OURS,
+        })
+        .await;
+        let (stop, shutdown) = never();
+
+        let waiting = tokio::spawn(async move { wait_for(&das, OURS, &QUICK, shutdown).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        stop.send(true).unwrap();
+
+        let verdict = tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(verdict, Verdict::Interrupted);
+
+        // The same node, left alone, does verify — so the verdict above was
+        // the shutdown's doing, not the node's.
+        let (das, _) = node(Node::Slow {
+            delay: Duration::from_millis(50),
+            hash: OURS,
+        })
+        .await;
+        let (_keep, shutdown) = never();
+        assert_eq!(
+            wait_for(&das, OURS, &QUICK, shutdown).await.unwrap(),
+            Verdict::Verified
+        );
     }
 
     /// With the signal task gone there is nothing left to wake the wait, and a
@@ -352,5 +474,30 @@ mod tests {
             attempts <= 4,
             "one attempt per 200 ms backoff, not a spin: {attempts}"
         );
+
+        // And it still verifies: a closed channel is "nobody will ask", not
+        // "stop".
+        let (das, _) = rpc(1, OURS).await;
+        let (stop, shutdown) = never();
+        drop(stop);
+        assert_eq!(
+            wait_for(&das, OURS, &QUICK, shutdown).await.unwrap(),
+            Verdict::Verified
+        );
+    }
+
+    /// Shut until the check passes, and open for good after.
+    #[test]
+    fn the_gate_is_shut_until_opened_and_remembers_its_cluster() {
+        for cluster in Cluster::ALL {
+            let gate = ClusterGate::new(cluster);
+            assert!(!gate.is_open(), "a new gate must be shut");
+            assert_eq!(gate.cluster(), cluster);
+            gate.open();
+            assert!(gate.is_open());
+            // Idempotent: there is no state in which opening shuts it.
+            gate.open();
+            assert!(gate.is_open());
+        }
     }
 }
