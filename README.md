@@ -209,7 +209,10 @@ Three rules, each there because of what the alternative does quietly:
   the variable. `SOLANA_WS_URL` is not the RPC URL with the scheme swapped;
   that would be a derived URL. Each is the *bare* endpoint: `HELIUS_API_KEY` is
   appended as `?api-key=` by the client, and a value carrying a query string or
-  credentials is rejected, in an error that never repeats it.
+  credentials is rejected, in an error that never repeats it. A redirect is not
+  followed either — a `Location` header is an endpoint nobody wrote down, and
+  the key would travel with the request — so an endpoint that redirects shows
+  up as an HTTP 3xx error to fix in the variable.
 - **Agreement is checked, because independent variables can disagree.**
 
   | check | when | covers | what it catches |

@@ -27,7 +27,7 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::client::{http_client, scrub, transport, DasError};
+use crate::client::{http_client, mask, transport, DasError, Redirects};
 
 /// Helius's cap on one webhook's `accountAddresses`. Our ~17 000 fit in one.
 pub const MAX_ADDRESSES: usize = 100_000;
@@ -101,9 +101,10 @@ impl WebhookClient {
     /// `base` is the API host — see the module doc on why it is a parameter.
     pub fn new(base: &str, api_key: &str) -> Result<Self, DasError> {
         Ok(Self {
-            // The shared builder: same user agent, and — the part that matters
-            // here, because this URL carries the key too — no `Referer`.
-            http: http_client(Duration::from_secs(60))?,
+            // Every request here carries the key in its query, and `create`
+            // and `update` carry the webhook secret in their body, so this
+            // client never follows a redirect — see `Redirects::Refuse`.
+            http: http_client(Duration::from_secs(60), Redirects::Refuse)?,
             base: base.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
         })
@@ -123,7 +124,7 @@ impl WebhookClient {
             .send()
             .await
             .map_err(transport)?;
-        Self::decode(response, "listWebhooks").await
+        self.decode(response, "listWebhooks", None).await
     }
 
     /// **Costs 100 credits.**
@@ -140,7 +141,8 @@ impl WebhookClient {
             .send()
             .await
             .map_err(transport)?;
-        Self::decode(response, "createWebhook").await
+        self.decode(response, "createWebhook", Some(auth_header))
+            .await
     }
 
     /// **Costs 100 credits**, and rewrites the whole address list — Helius has
@@ -159,7 +161,8 @@ impl WebhookClient {
             .send()
             .await
             .map_err(transport)?;
-        Self::decode(response, "updateWebhook").await
+        self.decode(response, "updateWebhook", Some(auth_header))
+            .await
     }
 
     /// **Costs 100 credits.**
@@ -199,9 +202,13 @@ impl WebhookClient {
         })
     }
 
+    /// `auth_header` is the webhook secret the request carried in its body,
+    /// when it carried one.
     async fn decode<T: for<'de> Deserialize<'de>>(
+        &self,
         response: reqwest::Response,
         method: &str,
+        auth_header: Option<&str>,
     ) -> Result<T, DasError> {
         let status = response.status();
         let body = response.text().await.map_err(transport)?;
@@ -209,12 +216,15 @@ impl WebhookClient {
             // The body often names the real problem (a bad host answers with
             // HTML, a bad key with JSON), and losing it would make a wrong
             // `HELIUS_WEBHOOK_API` unreadable. It is somebody else's text,
-            // though, and an error page that echoes the request target would
-            // echo the key with it — so it is scrubbed like any other message.
-            let excerpt: String = body.chars().take(300).collect();
+            // though, and a validation error that repeats what it was sent
+            // repeats the key and the webhook secret with it. Both are masked
+            // by value — and before the cut, so a secret that straddles the
+            // 300th character does not survive as its first half.
+            let masked = mask(&body, &[&self.api_key, auth_header.unwrap_or_default()]);
+            let excerpt: String = masked.chars().take(300).collect();
             return Err(DasError::Rpc {
                 method: method.into(),
-                message: format!("HTTP {status}: {}", scrub(&excerpt)),
+                message: format!("HTTP {status}: {excerpt}"),
             });
         }
         serde_json::from_str(&body).map_err(|source| DasError::Decode {
@@ -284,21 +294,74 @@ mod tests {
         assert!(!rendered.contains("s3cr3t-key"), "leaked: {rendered}");
     }
 
-    /// The management URL carries the key in its query exactly as the RPC one
-    /// does, so a redirect must not announce it in a `Referer` here either.
+    /// A `400` that repeats the request it rejected — the request line with the
+    /// key in it, the JSON body with the webhook secret in it — is the likeliest
+    /// way for either to end up on a terminal or in a log. The diagnostic
+    /// survives; the two values do not.
     #[tokio::test]
-    async fn a_redirect_does_not_hand_the_key_to_the_next_host() {
-        let (base, seen) = crate::client::test_support::redirect_to_another_origin("[]").await;
-        let client = WebhookClient::new(&base, "s3cr3t-key").unwrap();
+    async fn an_error_body_that_echoes_the_request_is_masked() {
+        use crate::client::test_support::answering_with;
 
-        // The redirect is followed — otherwise this would prove nothing.
-        assert!(client.list().await.unwrap().is_empty());
-        let request = seen.await.unwrap();
+        let base = answering_with("400 Bad Request", |request| {
+            let (head, body) = request.split_once("\r\n\r\n").unwrap_or((request, ""));
+            let line = head.lines().next().unwrap_or_default();
+            format!("invalid payload {body} for {line}")
+        })
+        .await;
+        let client = WebhookClient::new(&base, "s3cr3t-key-value").unwrap();
+
+        let error = client
+            .create(
+                "https://example.test/hook",
+                &["a".to_string()],
+                "wh-s3cr3t-value",
+            )
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
-            !request.to_lowercase().contains("referer:"),
-            "a Referer was sent to the redirect target:\n{request}"
+            error.contains("400") && error.contains("https://example.test/hook"),
+            "the diagnostic must survive: {error}"
         );
-        assert!(!request.contains("s3cr3t-key"), "leaked:\n{request}");
+        assert!(
+            error.contains(r#""authHeader":"***""#) && error.contains("api-key=***"),
+            "both were echoed, so both must show as masked: {error}"
+        );
+        assert!(!error.contains("s3cr3t"), "leaked: {error}");
+    }
+
+    /// Every request here carries the key in its query, and `create` and
+    /// `update` carry the webhook secret in their body — which a `307` or
+    /// `308` asks the client to repeat, verbatim, at another origin. So none
+    /// of them follows a redirect: the next host hears nothing at all.
+    #[tokio::test]
+    async fn a_redirect_is_refused_so_neither_the_key_nor_the_secret_travels_on() {
+        use crate::client::test_support::redirect_to_another_origin;
+
+        // `list`, a GET: the key is in the query.
+        let (base, mut seen) = redirect_to_another_origin("[]").await;
+        let client = WebhookClient::new(&base, "s3cr3t-key").unwrap();
+        let error = client.list().await.unwrap_err().to_string();
+        assert!(error.contains("307"), "unexpected error: {error}");
+        assert!(seen.try_recv().is_err(), "the redirect was followed");
+
+        // `create`, a POST: the body is what a 307 would have repeated.
+        let (base, mut seen) = redirect_to_another_origin(r#"{"webhookID":"wh_1"}"#).await;
+        let client = WebhookClient::new(&base, "s3cr3t-key").unwrap();
+        let error = client
+            .create("https://example.test/hook", &["a".to_string()], "wh-s3cr3t")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("307"), "unexpected error: {error}");
+        assert!(
+            !error.contains("s3cr3t"),
+            "the error must not carry the key or the secret: {error}"
+        );
+        assert!(
+            seen.try_recv().is_err(),
+            "the body — and the webhook secret in it — was repeated to another origin"
+        );
     }
 
     /// A moved endpoint alone must still be worth the write — otherwise a
