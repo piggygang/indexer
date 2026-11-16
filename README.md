@@ -193,8 +193,8 @@ literals in `crates/das` and `crates/ingest`, `HELIUS_WEBHOOK_API` defaulted to
 the mainnet host, and the stream cursors were named `…:mainnet`. A cluster is
 now **config, not code** — nothing in the pipeline branches on it — and one
 deployment is one cluster for its whole life: its own Railway environment, its
-own Postgres, its own variables. PIG-116 adds the `devnet` environment; this is
-what lets it exist.
+own Postgres, its own variables. Two exist: `production` indexes mainnet-beta
+and `devnet` indexes devnet (PIG-116; see **Environments** under Deployment).
 
 Three rules, each there because of what the alternative does quietly:
 
@@ -336,23 +336,32 @@ idles: there is nothing to track until the fixture addresses are filled in
 merge never applies `railway.ts`. So the order is the reverse of the usual one
 — **apply, then merge**:
 
-1. `railway config plan`. Expect seven additions and nothing else:
-   `SOLANA_CLUSTER` on `api`, `admin` and `ingester`; `SOLANA_RPC_URL` on
-   `admin` and `ingester`; `SOLANA_WS_URL` on `ingester`; `HELIUS_WEBHOOK_API`
-   on `admin`.
-2. `railway config apply`. Each service redeploys the image it is already
-   running, which ignores a name it does not know.
+1. `railway config plan --environment production`. Expect seven additions and
+   nothing else: `SOLANA_CLUSTER` on `api`, `admin` and `ingester`;
+   `SOLANA_RPC_URL` on `admin` and `ingester`; `SOLANA_WS_URL` on `ingester`;
+   `HELIUS_WEBHOOK_API` on `admin`.
+2. `railway config apply --environment production`. Each service redeploys the
+   image it is already running, which ignores a name it does not know.
 3. Merge. The new image finds its variables on first boot.
 
 Merged first instead, nothing breaks and nothing ships: `api` and `ingester`
 fail their healthcheck and Railway keeps the previous deployment, until the
-variables exist and a redeploy picks them up. Afterwards:
+variables exist. Afterwards:
 
 ```sh
 curl -s https://api.indexer.piggygang.net/health        # "cluster":"mainnet-beta"
 curl -s https://ingester.indexer.piggygang.net/health   # likewise
-railway logs --service ingester -d -n 50                # cluster: … / cluster verified: … / resuming helius-ws:mainnet from <the same cursor>
+railway logs --service ingester --environment production -d -n 50
+# cluster: … / cluster verified: … / resuming helius-webhook:mainnet from <the same cursor>
 ```
+
+That is the order it actually ran in. #19 and #20 merged before the apply, and
+from #19 on every `api` and `ingester` deploy failed its healthcheck
+(`SOLANA_CLUSTER is required`) while #17 kept serving, and `admin` came up on
+#20 with no cluster at all. The apply on 2026-11-16 shipped them by itself: the
+variable change deployed `main`'s newest commit on all three services, so no
+manual redeploy was needed, and the ingester resumed `helius-webhook:mainnet`
+from the cursor it had stopped at.
 
 ### What it does not check
 
@@ -392,8 +401,12 @@ because a dedicated node's token usually is the path. **Rows and log lines
 written before that may still hold the key.** `RUST_LOG=trace` still would:
 tungstenite logs the WebSocket upgrade request, query string included.
 
-Still to do on the first real devnet boot (PIG-116): the same run against
-Helius's devnet endpoints with a key, and `transactionSubscribe` there.
+The first real devnet boot (PIG-116, 2026-11-16) ran the same check against
+Helius with a key: the devnet ingester asked `https://devnet.helius-rpc.com`
+for its genesis hash and logged `cluster verified: the RPC endpoint's genesis
+hash is devnet's` before anything else started. `transactionSubscribe` on devnet
+is still unexercised. Devnet runs what production runs, and production retired
+the WebSocket lane, so nothing there opens a socket.
 
 ## Endpoints
 
@@ -652,6 +665,55 @@ Flow: push to `main` → GitHub Actions CI → Railway (**Wait for CI** enabled)
 builds the Dockerfile → `/health` must return 200 → traffic cutover. Rollback:
 `git revert` + push, or dashboard → previous deployment → Redeploy.
 
+### Environments (PIG-116)
+
+One Railway environment per cluster, in the one `Indexer` project — not a
+project per cluster (duplicated setup, no extra isolation), and not one
+deployment switched by variables (a mainnet ingester cannot also watch devnet,
+and end-to-end tests must never touch the production database):
+
+| environment | cluster | api | ingester | Postgres |
+|---|---|---|---|---|
+| `production` | `mainnet-beta` | `api.indexer.piggygang.net` | `ingester.indexer.piggygang.net` | its own |
+| `devnet` | `devnet` | `api.devnet.indexer.piggygang.net` | `ingester.devnet.indexer.piggygang.net` | its own |
+
+Both run the same four services, the same code and the same transports (the
+webhook lane alone, since production retired the WebSocket). `api`, `admin`,
+`ingester`, `Postgres` and `postgres-volume` are each one project resource with
+an instance per environment, so their IDs are the same in both, while devnet's
+volume instance is a disk of its own. Private DNS is per environment:
+`postgres.railway.internal` is devnet's own database inside devnet.
+`railway.ts` renders each environment from its `ENVIRONMENTS` table (cluster,
+endpoints, domains, transports) and throws for an environment the table does
+not name, so an unknown one can never be planned with mainnet's values.
+
+**Both environments deploy `main`.** A `devnet` branch was the alternative,
+and it loses on every count that matters here:
+
+- Devnet exists for end-to-end tests (PIG-69). Off `main`, they test the code
+  production serves, and not a branch that may never merge in that form.
+- Migrations are forward-only and **never edited once merged**, because sqlx
+  checksums every applied one. A branch that deploys ahead of review would apply
+  migrations that can still change, and the first amended one stops devnet's
+  `api` from booting.
+- CI runs on pushes to `main` and on pull requests only, so a `devnet` branch
+  would need a trigger of its own before Wait for CI meant anything there.
+- What must not be live on mainnet yet is gated by **config, not by branch**:
+  the raffles program is `deployed = false` in
+  `config/mainnet-beta/raffles.toml` and `true` in devnet's once it exists.
+
+The price is that devnet never runs code ahead of production, and every merge
+builds and deploys twice. It also widens one rule: a variable a binary cannot
+boot without is applied **in every environment** before the merge that needs
+it.
+
+The drift check is now one plan per environment, and both must exit 0:
+
+```sh
+railway config plan --environment production --detailed-exit-code
+railway config plan --environment devnet --detailed-exit-code
+```
+
 ### Services
 
 | Service | Binary | Start | Healthcheck | Why it exists |
@@ -716,25 +778,30 @@ Railway **deprecated config-as-code**: new services cannot opt into
 **2026-12-01**. Project config therefore lives in `.railway/railway.ts`.
 
 Prerequisites: **Node ≥ 22** (the CLI evaluates the file with
-`node --experimental-strip-types`, added in 22.6) and the SDK installed at the
-repo root — `npm install railway` — because the CLI resolves `railway/iac` from
-`node_modules` rather than injecting it. `package.json`/`package-lock.json` are
-committed for that reason; the Rust workspace has no Node runtime dependency.
+`node --experimental-strip-types`, added in 22.6; Node 26 works too) and the SDK
+installed at the repo root — `npm ci`, which installs the locked `railway` —
+because the CLI resolves `railway/iac` from `node_modules` rather than injecting
+it. `package.json`/`package-lock.json` are committed for that reason; the Rust
+workspace has no Node runtime dependency.
 
 ```sh
-railway config pull                          # live project → authoring code
-railway config plan --detailed-exit-code     # read-only; 0 = no drift, 2 = pending
-railway config apply --plan <pinned> --yes
+railway config pull --json --environment <env>                # live environment → graph, to compare
+railway config plan --environment <env> --detailed-exit-code  # read-only; 0 = no drift, 2 = pending
+railway config apply --environment <env> --plan <pinned> --yes
 ```
 
-**Nothing applies this file but you.** `plan`/`apply` read `.railway/railway.ts`
-from the working tree and reconcile the *linked* project — there is no
-`--environment` flag, the target comes from `railway link`. No CI job runs the
-CLI, and Railway's GitHub integration deploys images: it never reads `.railway/`,
-which is also dockerignored and in no service's watch patterns. So merging to
-`main` changes project config not at all — it only redeploys existing services
-whose watch patterns match. Treat `plan` exiting 0 as the standing drift check;
-if it does not, the committed file and production have diverged.
+**Nothing applies this file but you, and one environment at a time.**
+`plan`/`apply` read `.railway/railway.ts` from the working tree and reconcile
+one environment of the *linked* project: the one `--environment` names, or the
+linked one without it. CLI 5.45.10 had no such flag; 5.74.0 has it on `plan`,
+`apply` and `pull`. **Always pass it**: the file renders a different
+environment for each value, and throws for one its table does not name. No CI
+job runs the CLI, and Railway's GitHub integration deploys images: it never
+reads `.railway/`, which is also dockerignored and in no service's watch
+patterns. So merging to `main` changes project config not at all — it only
+redeploys existing services whose watch patterns match. Treat both plans exiting
+0 as the standing drift check; if one does not, the committed file and that
+environment have diverged.
 
 One consequence worth stating on its own: **a variable a binary cannot boot
 without has to be applied before the merge that needs it**, not after.
@@ -745,7 +812,12 @@ without has to be applied before the merge that needs it**, not after.
 never from `railway config migrate`.** IaC treats omission as deletion, so a
 file that does not mention the Postgres service invites the reconciler to delete
 Postgres *and its volume*; `pull` imports the whole project, secrets included as
-`preserve()`. Before any `apply`, read the plan and abort on any
+`preserve()`. With two environments `pull` is a comparison, no longer an
+author: it writes one environment, flat, and `--force` would replace the
+`ENVIRONMENTS` table with it. Read `railway config pull --json --environment
+<env>` against what the file renders instead. Anything live in an environment
+and missing from its render is a deletion waiting for the next apply. Before any
+`apply`, read the plan and abort on any
 `delete`/`replace`/`recreate`, on any change under `Postgres`, or on any removal
 of `HELIUS_API_KEY`. **Never pass `--confirm-destructive`** — needing it is the
 abort signal, and usually means a service name's casing is wrong
@@ -768,15 +840,16 @@ not the website, before concluding something must be set by hand.
 
 Three places the docs mislead:
 
-- **Custom domains cannot be registered from IaC** — the one genuinely
-  out-of-band step in this project. `domains: ["…"]` is *descriptive*: it names
-  a domain Railway already has, and `config plan` refuses outright to create
-  one (*"Custom-domain registration is not supported by Railway configuration"*).
-  `api`'s line works only because that domain predates the IaC file. Create the
-  domain first, then add the line:
+- **Custom domains cannot be registered from IaC** — one of the two genuinely
+  out-of-band steps in this project (the other is creating an environment).
+  `domains: ["…"]` is *descriptive*: it names a domain Railway already has, and
+  `config plan` refuses outright to create one (*"Custom-domain registration is
+  not supported by Railway configuration"*). `api`'s line worked only because
+  that domain predates the IaC file. Create the domain first, then list it in
+  `ENVIRONMENTS`:
 
   ```sh
-  railway domain ingester.indexer.piggygang.net --port 8080 --service ingester
+  railway domain ingester.indexer.piggygang.net --port 8080 --service ingester --environment production
   ```
 
   **`--port 8080` is not optional.** The bare-string form compiles to
@@ -808,21 +881,72 @@ every service**, including README-only commits, and an `admin` rebuild tears
 down an SSH session mid-command. Railway's build cache is per service, so
 `admin`'s first build recompiles the whole dependency graph.
 
+### Standing up an environment
+
+How `devnet` was made (2026-11-16), and so how the next one would be:
+
+1. **An entry in `ENVIRONMENTS` first** — cluster, endpoints, domains,
+   transports. The file throws for an environment it does not name.
+2. **An empty environment**: `railway environment new devnet`. Never
+   `--duplicate production`: a duplicate copies production's variables, mainnet
+   endpoints and webhook secret included, and deploys them.
+3. **Plan and apply without the domains.** `plan` refuses a domain Railway does
+   not have yet, and IaC cannot create one. Plan from a copy of the file with
+   the new entry's two domain lines removed, kept in `.railway/` so `railway/iac`
+   still resolves (`--file .railway/bootstrap.ts --environment devnet`). Expect
+   five creations and nothing else: services `api`, `admin`, `ingester`,
+   database `Postgres`, volume `postgres-volume`. The apply binds them by name
+   to the project's existing services, so the IDs are production's. Postgres
+   gets credentials of its own, and the volume a new, empty disk.
+4. **The secrets, the moment `apply` returns.** The cold build is the window,
+   and the ingester does not boot without them:
+
+   ```sh
+   # KEY: production's, read with `railway variable list --service admin --environment production --json`
+   printf '%s' "$KEY" | railway variable set HELIUS_API_KEY --stdin --service admin --environment devnet
+   printf '%s' "$KEY" | railway variable set HELIUS_API_KEY --stdin --service ingester --environment devnet --skip-deploys
+   openssl rand -hex 32 | tr -d '\n' | railway variable set HELIUS_WEBHOOK_SECRET --stdin --service ingester --environment devnet
+   ```
+
+   One Helius key serves both clusters. The webhook secret is the environment's
+   own and never production's: each environment registers its own webhook, and
+   the secret is that webhook's whole authenticity check. The last `set`
+   deploys, so the ingester's first deployment has both.
+5. **The domains**, out of band:
+   `railway domain <host> --port 8080 --service <api|ingester> --environment devnet`.
+   Each prints a CNAME to an `*.up.railway.app` target and a
+   `_railway-verify.<host>` TXT record. `piggygang.net` is on Vercel DNS (team
+   PiggyGang), next to production's pairs. The certificate followed about two
+   minutes after the records.
+6. **Plan the committed file, and apply once more.** The services an apply
+   *creates* come up **without Wait for CI**: `source.checkSuites` is dropped on
+   create. So the first plan of the real file reads
+   `~ Update <svc> source.checkSuites (null → true)` for each service. Until that
+   is applied, a push deploys there without waiting for CI. After it, the plan
+   must exit 0.
+7. **Check from outside**: `/health` on both hosts reports the cluster, `/ready`
+   is 200, and a `POST /webhooks/helius` with a wrong `Authorization` is a 401.
+   The ingester's log says `cluster verified: …` before anything else starts.
+
+Registering the environment's Helius webhook is a separate step, and costs
+credits: see **Registering it** under Webhooks. Devnet's is PIG-139's.
+
 ### Operating the admin service
 
 ```sh
 railway ssh keys add --key ~/.ssh/id_ed25519.pub --name "laptop"   # once per account
-railway ssh --service admin -- indexer-admin migrate
-railway ssh --service admin -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml --dry-run
-railway ssh --service admin -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml
-railway ssh --service admin -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml --expect-unchanged
+railway ssh --service admin --environment production -- indexer-admin migrate
+railway ssh --service admin --environment production -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml --dry-run
+railway ssh --service admin --environment production -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml
+railway ssh --service admin --environment production -- indexer-admin seed --config /app/config/mainnet-beta/collections.toml --expect-unchanged
+railway ssh --service admin --environment devnet -- indexer-admin seed --config /app/config/devnet/collections.toml
 ```
 
-That is the production environment; in the devnet one the directory is
-`/app/config/devnet/`. The bare `indexer-admin seed` picks the same file from
-`SOLANA_CLUSTER`, but by a path relative to `/app`. Either way the wrong
-environment's line fails instead of seeding: a registry names its cluster and
-is refused on any other.
+Pass `--environment` every time. Without it the session lands in the linked
+environment, and each environment's `admin` holds that environment's database.
+The bare `indexer-admin seed` picks the same file from `SOLANA_CLUSTER`, but by
+a path relative to `/app`. Either way the wrong environment's line fails
+instead of seeding: a registry names its cluster and is refused on any other.
 
 Pass `--config` as an **absolute path** so nothing depends on where the SSH
 session lands, and prefer this non-interactive form: `railway ssh --session`
@@ -856,6 +980,10 @@ Railway gotchas (verified 2026-08-30):
   and their region example is wrong. Trust the bundled `.d.ts`, not the website.
 - **Node ≥ 22 is required** to evaluate `railway.ts`; on Node 20 the CLI fails
   with `node: bad option: --experimental-strip-types`.
+- **Run `railway config` as `railway` itself**, not through a wrapper such as
+  `timeout`. The SDK checks the CLI's version by running `$_ --version`, and
+  `$_` is then the wrapper, so a new enough CLI fails with *requires Railway CLI
+  5.42.1 or newer*.
 - Service variables reach the Docker build **only when the Dockerfile declares
   a matching `ARG`**.
 
@@ -1059,7 +1187,7 @@ which uses one pooled connection at a time, but leaves no headroom if a second
 one-off run overlaps.
 
 ```sh
-railway ssh --service admin -- indexer-admin backfill --slug piggy-sol-gang
+railway ssh --service admin --environment production -- indexer-admin backfill --slug piggy-sol-gang
 ```
 
 ## Historical activity backfill (ALG-622)
@@ -1466,7 +1594,7 @@ commits its own transaction and `finished_at` is written only on completion.
 to **5** with this change: three things can now hold a connection at once (the
 live writer, the spawned reconcile, and the scheduler's probe or sweep), plus a
 Core mint's background attribute hydration, plus a spare. Changing it needs
-`railway config plan` then `apply` — a merge applies nothing.
+`railway config plan` then `apply`, per environment — a merge applies nothing.
 
 Due-ness lives in `backfill_state.finished_at`, not an in-memory timer, because
 the supervisor restarts the consumer with a backoff and a flapping ingester
@@ -1622,10 +1750,13 @@ permanent hole. Production watched `integrity_owner_mismatch` climb 1216 → 165
 overnight on a single reconnect in twelve hours. Helius webhooks move delivery
 off a socket this process has to stay glued to and onto Helius's own retries.
 
-**Both transports run at once**, selected by `INGEST_TRANSPORTS`. They write
-through the same signature-keyed idempotent `activity::record`, so double
+**Both transports can run at once**, selected by `INGEST_TRANSPORTS`. They
+write through the same signature-keyed idempotent `activity::record`, so double
 delivery is already a no-op — which is what makes the WebSocket's loss rate
-*measurable* instead of assumed.
+*measurable* instead of assumed. Production ran both from 2026-09-05 and now
+runs `webhook` alone: the WebSocket was retired by the cutover under *Deciding
+when to retire the WebSocket*, set in the dashboard, and `railway.ts` says so
+since PIG-116. Devnet runs whatever production runs.
 
 | | transport | cursor | what it costs |
 |---|---|---|---|
@@ -1634,7 +1765,10 @@ delivery is already a no-op — which is what makes the WebSocket's loss rate
 
 The cursor keys carry the cluster: `…:devnet` on a devnet deployment (see
 **Clusters**). A webhook is registered per cluster too — against that
-cluster's `HELIUS_WEBHOOK_API`, pointing at that environment's `WEBHOOK_URL`.
+cluster's `HELIUS_WEBHOOK_API`, pointing at that environment's `WEBHOOK_URL`,
+with that environment's own `HELIUS_WEBHOOK_SECRET`. Devnet's receiver is up at
+`https://ingester.devnet.indexer.piggygang.net/webhooks/helius`. Its webhook is
+not registered yet (PIG-139), so its inbox stays empty until then.
 
 ### Be honest about what this buys
 
@@ -1706,9 +1840,10 @@ ordering mistake takes the ingester down:
 2. **Create the domain — IaC cannot.**
    `railway domain ingester.indexer.piggygang.net --port 8080 --service ingester`,
    then point DNS at it. See *The IaC option surface* above for why, and why the
-   port is fixed. Add `domains: ["ingester.indexer.piggygang.net"]` to
-   `railway.ts` afterwards; its absence is not a deletion, so there is no rush,
-   but `plan` will not read as clean until it is there.
+   port is fixed. List it in `railway.ts` afterwards (`ingesterDomain` in
+   `ENVIRONMENTS`). Its absence is neither a deletion nor a diff (on
+   2026-11-16, `plan` showed no change for this live domain while the file left
+   it out), so the line is documentation.
 3. `railway config plan` → `apply` for the healthcheck, `INGEST_TRANSPORTS`
    and the connection bump.
 4. Confirm the endpoint is actually reachable *before* spending credits:
@@ -1784,8 +1919,8 @@ a healthy ingester prints nothing between subscribing and the next sweep. So
 "alive" is still a question you answer from the database, not from the process:
 
 ```sh
-railway status                                   # → "- ingester: ● Online"
-railway logs --service ingester -d -n 200        # -d = this deployment, -n = no streaming
+railway status                                                          # → "- ingester: ● Online"
+railway logs --service ingester --environment production -d -n 200     # -d = this deployment, -n = no streaming; devnet likewise
 ```
 ```sql
 -- Alive and receiving roots? `updated_at` moves on every checkpoint even when
@@ -2329,4 +2464,5 @@ map leaves out, which have no art id to fetch (PIG-183).
 - ALG-628 — prod monitoring/alerting · ALG-629 — external collections
 - PIG-113 — cluster-aware config: `SOLANA_CLUSTER`, explicit endpoints, cluster on `/health` — done
 - PIG-134 — per-cluster registry (`config/<cluster>/`) + raffles program config — done; the devnet registry holds placeholders until the fixture addresses land
-- PIG-116 — the `devnet` Railway environment · PIG-139 — seed + backfill the devnet registry
+- PIG-116 — the `devnet` Railway environment: its own Postgres, `api`, `ingester`, `admin`, `api.devnet.indexer.piggygang.net`, deploying `main` — done
+- PIG-139 — seed + backfill the devnet registry, register its webhook, verify live tracking
