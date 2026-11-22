@@ -69,9 +69,11 @@ impl std::fmt::Display for WebhookType {
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Webhook {
-    #[serde(default)]
+    /// Helius spells this one, and the URL, as acronyms (`webhookID`,
+    /// `webhookURL`), which `camelCase` alone would read as `webhookId`.
+    #[serde(default, rename = "webhookID")]
     pub webhook_id: String,
-    #[serde(default)]
+    #[serde(default, rename = "webhookURL")]
     pub webhook_url: String,
     #[serde(default)]
     pub webhook_type: String,
@@ -494,6 +496,61 @@ mod tests {
             seen.try_recv().is_err(),
             "the body — and the webhook secret in it — was repeated to another origin"
         );
+    }
+
+    /// Read through the real decode path, a response in Helius's own shape
+    /// must fill the id and the URL. An empty `webhook_url` matches no
+    /// registration, so every sync would create another webhook, for 100
+    /// credits, instead of updating the one it has — and never see its type.
+    #[tokio::test]
+    async fn an_api_shaped_list_selects_the_webhook_by_url_and_sees_its_type() {
+        use crate::client::test_support::answering_with;
+
+        let url = "https://x.test/webhooks/helius";
+        let listed = r#"[{
+            "webhookID": "wh-1",
+            "wallet": "w",
+            "project": "p",
+            "webhookURL": "https://x.test/webhooks/helius",
+            "transactionTypes": ["ANY"],
+            "accountAddresses": ["a", "b"],
+            "webhookType": "raw",
+            "authHeader": "s",
+            "txnStatus": "all",
+            "encoding": "jsonParsed",
+            "active": true
+        }]"#;
+        let base = answering_with("200 OK", move |_| listed.to_string()).await;
+        let registered = WebhookClient::new(&base, "k")
+            .unwrap()
+            .list()
+            .await
+            .unwrap();
+        let existing = registered
+            .iter()
+            .find(|w| w.webhook_url == url)
+            .expect("the URL must select the registration");
+        assert_eq!(existing.webhook_id, "wh-1");
+        assert_eq!(existing.webhook_type, "raw");
+
+        let wanted = ["b".to_string(), "a".to_string()];
+        let same = Diff::between(existing, url, WebhookType::Raw, &wanted);
+        assert!(same.is_noop(), "{same:?}");
+        let devnet = Diff::between(existing, url, WebhookType::RawDevnet, &wanted);
+        assert!(devnet.type_changed && !devnet.is_noop(), "{devnet:?}");
+
+        // `create` decodes its answer the same way, and the id it reports is
+        // the one the next sync updates.
+        let created = r#"{"webhookID": "wh-2", "webhookURL": "https://x.test/webhooks/helius",
+                          "webhookType": "rawDevnet", "accountAddresses": ["a"]}"#;
+        let base = answering_with("200 OK", move |_| created.to_string()).await;
+        let webhook = WebhookClient::new(&base, "k")
+            .unwrap()
+            .create(url, WebhookType::RawDevnet, &["a".to_string()], "s")
+            .await
+            .unwrap();
+        assert_eq!(webhook.webhook_id, "wh-2");
+        assert_eq!(webhook.webhook_url, url);
     }
 
     /// A moved endpoint alone must still be worth the write — otherwise a
