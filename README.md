@@ -176,9 +176,9 @@ cargo run -p indexer-admin -- seed --expect-unchanged   # the seed is a no-op th
 | `DATABASE_MAX_CONNECTIONS` | no | `5` | pool size per process (Railway Postgres is shared by api, ingester, admin) |
 | `DATABASE_CONNECT_TIMEOUT_SECS` | no | `5` | per-connection acquire timeout; boot retries connectivity for up to 60 s |
 | `INGEST_TRANSPORTS` | no | `ws` | ingester only: which transports run — `ws`, `webhook`, or `ws,webhook` for a dual run. Retirement is this one value becoming `webhook`. An unknown member is a hard error, never a silently unrun transport |
-| `HELIUS_WEBHOOK_SECRET` | ingester (with `webhook`) | — | the **whole** `Authorization` header value Helius echoes on every delivery, set as the webhook's `authHeader` and compared verbatim. Helius offers no HMAC or signature scheme, so this is the entire authenticity check |
+| `HELIUS_WEBHOOK_SECRET` | ingester (with `webhook`), `admin webhook` | — | the **whole** `Authorization` header value Helius echoes on every delivery, set as the webhook's `authHeader` and compared verbatim. Helius offers no HMAC or signature scheme, so this is the entire authenticity check. On Railway, `admin` reads the ingester's by reference |
 | `WEBHOOK_URL` | `admin webhook` | — | the public HTTPS endpoint to register. Registration only — the receiver never reads it |
-| `HELIUS_WEBHOOK_API` | `admin webhook` | — | the management API host, e.g. `https://api-mainnet.helius-rpc.com` (devnet: `api-devnet`). It was a default until PIG-113; a webhook is registered per cluster, so the host is now part of saying which one. Helius's docs and their own SDK disagree on it — this is the SDK's |
+| `HELIUS_WEBHOOK_API` | `admin webhook` | — | the management API host, `https://api-mainnet.helius-rpc.com` **on every cluster**: Helius manages webhooks per account and puts a webhook's cluster in its type (`raw` / `rawDevnet`, derived from `SOLANA_CLUSTER`), and `api-devnet` answers 404 for `/v0/webhooks`. So it is the one endpoint whose host is not checked against the cluster. No default (it had one until PIG-113). Helius's docs and their own SDK disagree on the host — this is the SDK's |
 | `WEBHOOK_POLL_MS` / `WEBHOOK_BATCH` / `WEBHOOK_LEASE_SECS` / `WEBHOOK_MAX_ATTEMPTS` / `WEBHOOK_GRACE_SECS` / `WEBHOOK_RETAIN_DAYS` | no | `1000` / `50` / `60` / `5` / `120` / `30` | drain pacing. `RETAIN_DAYS` must outlast a dual-run evaluation window — `coverage()` reads those rows |
 | `RECONCILE_TIP_INTERVAL_SECS` | no | `30` | ingester only: the tip probe — one `searchAssets` per collection filter, newest-acted-on first. This is the freshness knob; `0` disables it and leaves the hourly sweep as the only correction |
 | `RECONCILE_INTERVAL_SECS` | no | `3600` | ingester only: the periodic state sweep (ALG-624). A connect lowers it to `RECONNECT_FLOOR` (600 s) for one run rather than bypassing it. `0` disables the sweep **and** the deep pass outright — there is no longer a separate on-`Connected` reconcile for it to leave behind |
@@ -220,7 +220,7 @@ Three rules, each there because of what the alternative does quietly:
 
   | check | when | covers | what it catches |
   |---|---|---|---|
-  | the hostname names another cluster | parse time, offline | all three endpoints | `SOLANA_CLUSTER=devnet` with `https://mainnet.helius-rpc.com` — the copy-paste between two environments |
+  | the hostname names another cluster | parse time, offline | `SOLANA_RPC_URL`, `SOLANA_WS_URL` | `SOLANA_CLUSTER=devnet` with `https://mainnet.helius-rpc.com` — the copy-paste between two environments |
   | `getGenesisHash` is not the cluster's | before the first write | `SOLANA_RPC_URL` | a host with no cluster in its name: a dedicated node, a proxy |
 
   The second is not paranoia. DAS on the wrong chain does not fail:
@@ -228,6 +228,12 @@ Three rules, each there because of what the alternative does quietly:
   the sweep reads an empty page for a `core_collection` as *every stored asset
   left* — the whole population flips to `removed` and the API serves an empty
   collection until a sweep against the right chain brings it back.
+
+  `HELIUS_WEBHOOK_API` gets neither, because its host is not where the cluster
+  lives: one management API serves every cluster, and a webhook watches devnet
+  only when its `webhookType` is `rawDevnet` rather than `raw`.
+  `indexer-admin webhook` derives the type from `SOLANA_CLUSTER`, and a
+  registered webhook of the wrong type is a change it rewrites (PIG-139).
 
 What each binary needs:
 
@@ -240,6 +246,8 @@ What each binary needs:
 And what the cluster changes, which is all of it:
 
 - **The endpoints dialled** — nothing else chooses a host.
+- **The webhook type** `indexer-admin webhook` registers: `raw` on
+  mainnet-beta, `rawDevnet` on devnet.
 - **The cursor keys.** `ingest_state.stream` is `helius-ws:mainnet` /
   `helius-webhook:mainnet` on mainnet-beta — unchanged, because a renamed key
   is a cursor nobody reads — and `…:devnet` on devnet. A cursor is a slot
@@ -301,7 +309,7 @@ readily as on a wrong one.
 SOLANA_CLUSTER=devnet
 SOLANA_RPC_URL=https://devnet.helius-rpc.com
 SOLANA_WS_URL=wss://devnet.helius-rpc.com
-HELIUS_WEBHOOK_API=https://api-devnet.helius-rpc.com   # `indexer-admin webhook` only
+HELIUS_WEBHOOK_API=https://api-mainnet.helius-rpc.com  # `indexer-admin webhook` only; one host for every cluster
 HELIUS_API_KEY=…                                       # the same key serves both clusters
 DATABASE_URL=…                                         # a database of its own, never the mainnet one
 ```
@@ -379,9 +387,11 @@ from the cursor it had stopped at.
   mainnet one for good, because `seed` never deletes. `indexer-admin` logs
   the cluster and the database target on consecutive lines for exactly that
   reason, and a stamp in the database itself is the real fix — not built here.
-- **Which Helius features exist on devnet** — `getTransactionsForAddress` in
-  particular, which the activity backfill depends on — is not established by
-  this change. PIG-139 runs the backfills there.
+- **Which Helius features exist on devnet** is not established by this change;
+  PIG-139 runs the backfills there. `getTransactionsForAddress`, which the
+  activity backfill depends on, is documented for devnet with **two weeks** of
+  history (mainnet's is unlimited), so `backfill-activity` must reach a devnet
+  asset within two weeks of its mint or it never sees that event.
 
 ### Checked (2026-11-15)
 
@@ -1764,9 +1774,11 @@ since PIG-116. Devnet runs whatever production runs.
 | `webhook` | `POST /webhooks/helius` → `webhook_inbox` → drain | `helius-webhook:mainnet` | 1 credit/event + 1 `getTransaction` |
 
 The cursor keys carry the cluster: `…:devnet` on a devnet deployment (see
-**Clusters**). A webhook is registered per cluster too — against that
-cluster's `HELIUS_WEBHOOK_API`, pointing at that environment's `WEBHOOK_URL`,
-with that environment's own `HELIUS_WEBHOOK_SECRET`. Devnet's receiver is up at
+**Clusters**). A webhook is registered per environment too — with the type
+that watches its cluster (`raw` or `rawDevnet`), pointing at that
+environment's `WEBHOOK_URL`, with that environment's own
+`HELIUS_WEBHOOK_SECRET` — through the one management API every cluster shares.
+Devnet's receiver is up at
 `https://ingester.devnet.indexer.piggygang.net/webhooks/helius`. Its webhook is
 not registered yet (PIG-139), so its inbox stays empty until then.
 
@@ -1867,7 +1879,20 @@ indexer-admin webhook               # creates or updates (100 credits)
 
 It needs `HELIUS_WEBHOOK_API` — no longer defaulted, since PIG-113 — alongside
 `HELIUS_API_KEY`, `WEBHOOK_URL` and `HELIUS_WEBHOOK_SECRET`, and prints the
-cluster and the API host before it lists anything.
+cluster, the webhook type and the API host before it lists anything. On
+Railway the `admin` service carries all four (the secret as a reference to the
+ingester's, since PIG-139), so the bare command runs over `railway ssh` in
+either environment.
+
+**The cluster is the webhook's type, not the host.** Helius manages webhooks
+per account through one API, `api-mainnet.helius-rpc.com`, for every cluster
+(its `api-devnet` host answers 404 for `/v0/webhooks`), and a webhook watches
+devnet only when it is registered as `rawDevnet`. The subcommand takes the
+type from `SOLANA_CLUSTER`, and a registered webhook of the other type counts
+as a change: a `raw` webhook over devnet addresses watches mainnet for them
+and delivers nothing, with every signal green. One account means one list, so
+`list` returns every environment's webhooks; the subcommand picks its own by
+`WEBHOOK_URL`.
 
 Every Helius webhook mutation costs 100 credits **and rewrites the whole address
 list**, so it lists first, diffs, and writes nothing when nothing changed.

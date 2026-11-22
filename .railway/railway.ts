@@ -48,6 +48,10 @@ const COMMON = ["crates/**", "Cargo.toml", "Cargo.lock", "Dockerfile"];
 //   admin     + SOLANA_RPC_URL, HELIUS_WEBHOOK_API  (backfills; `webhook`)
 //   ingester  + SOLANA_RPC_URL, SOLANA_WS_URL
 //
+// (`webhook` also needs the ingester's WEBHOOK_URL and HELIUS_WEBHOOK_SECRET;
+// admin carries the first as the same literal and reads the second by
+// reference, so the secret has one value.)
+//
 // A required variable inverts the usual order: **apply before the merge that
 // needs it**, in every environment, because a merge never applies this file and
 // every environment deploys `main`. Setting a variable redeploys the binary that
@@ -56,9 +60,10 @@ const COMMON = ["crates/**", "Cargo.toml", "Cargo.lock", "Dockerfile"];
 // healthcheck and Railway keeps the old deployment — safe, but nothing ships
 // until the variable exists.
 //
-// A hostname that names another cluster is refused at parse time, so a devnet
-// value pasted into the production entry fails the deploy rather than indexing
-// devnet into that Postgres.
+// An RPC or WebSocket hostname that names another cluster is refused at parse
+// time, so a devnet value pasted into the production entry fails the deploy
+// rather than indexing devnet into that Postgres. The webhook API host is
+// exempt: it serves every cluster (see `webhookApi`).
 interface Environment {
   /** `devnet` | `mainnet-beta` — the SOLANA_CLUSTER spelling, exactly. */
   cluster: string;
@@ -66,7 +71,13 @@ interface Environment {
   rpcUrl: string;
   /** Enhanced WebSockets. Its own variable — never the RPC URL with the scheme swapped. */
   wsUrl: string;
-  /** Webhook management API (`indexer-admin webhook`). */
+  /**
+   * Webhook management API (`indexer-admin webhook`). One host for every
+   * cluster: Helius manages webhooks per account and puts a webhook's cluster
+   * in its type (`raw` / `rawDevnet`, which the binary derives from
+   * SOLANA_CLUSTER). `api-devnet.helius-rpc.com` answers 404 for
+   * `/v0/webhooks` (checked 2026-11-17), so devnet uses the mainnet-named host.
+   */
   webhookApi: string;
   /**
    * Custom domains. IaC **cannot register one** — `config plan` refuses
@@ -116,7 +127,7 @@ const ENVIRONMENTS: Record<string, Environment> = {
     cluster: "devnet",
     rpcUrl: "https://devnet.helius-rpc.com",
     wsUrl: "wss://devnet.helius-rpc.com",
-    webhookApi: "https://api-devnet.helius-rpc.com",
+    webhookApi: "https://api-mainnet.helius-rpc.com", // the same as production's, on purpose: see `webhookApi`
     apiDomain: "api.devnet.indexer.piggygang.net",
     ingesterDomain: "ingester.devnet.indexer.piggygang.net",
     webhookUrl: "https://ingester.devnet.indexer.piggygang.net/webhooks/helius",
@@ -176,47 +187,6 @@ export default defineRailway((ctx) => {
       RUST_LOG: "info",
       SOLANA_CLUSTER: target.cluster, // required; the api dials no endpoint, so it has none
       ...target.apiKept,
-    },
-  });
-
-  // Operational CLI (indexer-admin: migrate | seed | bench). It exists to be
-  // `railway ssh`'d into and serves no traffic, so it has no healthcheck —
-  // unset means the deploy goes Active as soon as the container starts, which
-  // is what a service that never binds $PORT needs — and no domain.
-  const admin = service("admin", {
-    source: github(REPO, { branch: "main", checkSuites: true }),
-    build: {
-      builder: "DOCKERFILE",
-      dockerfilePath: "Dockerfile",
-      // config/** is watched here and not on api: the registry seed ships in
-      // the admin image only.
-      watchPatterns: ["services/admin/**", "config/**", ...COMMON],
-    },
-    // indexer-admin is a CLI with a required subcommand, so the image's default
-    // CMD would exit 2 and leave nothing to attach to. Railway runs a start
-    // command in EXEC form — it replaces the ENTRYPOINT and gets no shell — so
-    // the /bin/sh wrapper is required for `trap`. Without the trap the idle
-    // process is PID 1 with no handler and ignores SIGTERM per
-    // pid_namespaces(7), making every redeploy wait out the grace period.
-    start: `/bin/sh -c "trap 'exit 0' TERM INT; sleep infinity & wait"`,
-    replicas: { [REGION]: 1 },
-    env: {
-      BIN: "indexer-admin", // reaches the build only because the Dockerfile declares ARG BIN
-      DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
-      // Set live on `admin` for the DAS backfill. Declared here because IaC
-      // treats omission as deletion: while this line was missing, every
-      // `config plan` carried a destructive `- Delete variable
-      // admin.HELIUS_API_KEY`, which made the drift check unusable.
-      HELIUS_API_KEY: preserve(),
-      RUST_LOG: "info",
-      DATABASE_MAX_CONNECTIONS: "2", // interactive, one-off; leave headroom for api
-      SOLANA_CLUSTER: target.cluster,
-      // `backfill` and `backfill-activity` verify this endpoint's genesis hash
-      // against the cluster before they write.
-      SOLANA_RPC_URL: target.rpcUrl,
-      // `webhook` only. It used to be a default inside the binary; declared so
-      // `webhook --dry-run` keeps working from `railway ssh` as it did.
-      HELIUS_WEBHOOK_API: target.webhookApi,
     },
   });
 
@@ -300,6 +270,54 @@ export default defineRailway((ctx) => {
       // Read only with the `ws` transport; declared regardless, so turning the
       // lane back on is the one INGEST_TRANSPORTS change.
       SOLANA_WS_URL: target.wsUrl,
+    },
+  });
+
+  // Operational CLI (indexer-admin: migrate | seed | bench). It exists to be
+  // `railway ssh`'d into and serves no traffic, so it has no healthcheck —
+  // unset means the deploy goes Active as soon as the container starts, which
+  // is what a service that never binds $PORT needs — and no domain.
+  const admin = service("admin", {
+    source: github(REPO, { branch: "main", checkSuites: true }),
+    build: {
+      builder: "DOCKERFILE",
+      dockerfilePath: "Dockerfile",
+      // config/** is watched here and not on api: the registry seed ships in
+      // the admin image only.
+      watchPatterns: ["services/admin/**", "config/**", ...COMMON],
+    },
+    // indexer-admin is a CLI with a required subcommand, so the image's default
+    // CMD would exit 2 and leave nothing to attach to. Railway runs a start
+    // command in EXEC form — it replaces the ENTRYPOINT and gets no shell — so
+    // the /bin/sh wrapper is required for `trap`. Without the trap the idle
+    // process is PID 1 with no handler and ignores SIGTERM per
+    // pid_namespaces(7), making every redeploy wait out the grace period.
+    start: `/bin/sh -c "trap 'exit 0' TERM INT; sleep infinity & wait"`,
+    replicas: { [REGION]: 1 },
+    env: {
+      BIN: "indexer-admin", // reaches the build only because the Dockerfile declares ARG BIN
+      DATABASE_URL: Postgres.env.DATABASE_URL, // private: postgres.railway.internal
+      // Set live on `admin` for the DAS backfill. Declared here because IaC
+      // treats omission as deletion: while this line was missing, every
+      // `config plan` carried a destructive `- Delete variable
+      // admin.HELIUS_API_KEY`, which made the drift check unusable.
+      HELIUS_API_KEY: preserve(),
+      RUST_LOG: "info",
+      DATABASE_MAX_CONNECTIONS: "2", // interactive, one-off; leave headroom for api
+      SOLANA_CLUSTER: target.cluster,
+      // `backfill` and `backfill-activity` verify this endpoint's genesis hash
+      // against the cluster before they write.
+      SOLANA_RPC_URL: target.rpcUrl,
+      // `webhook` only. It used to be a default inside the binary; declared so
+      // `webhook --dry-run` keeps working from `railway ssh` as it did.
+      HELIUS_WEBHOOK_API: target.webhookApi,
+      // `webhook` registers the ingester's endpoint with the ingester's
+      // secret, so it reads both from there: the URL as the same literal, the
+      // secret by reference, which keeps it one value in one place. Without
+      // them a real `webhook` run could not work from `railway ssh`, only
+      // `--dry-run --url …` (PIG-139).
+      WEBHOOK_URL: target.webhookUrl,
+      HELIUS_WEBHOOK_SECRET: ingester.env.HELIUS_WEBHOOK_SECRET,
     },
   });
 

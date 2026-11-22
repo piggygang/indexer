@@ -6,7 +6,7 @@
 //! streaming interface is `crates/ingest`'s; a webhook's registration is a
 //! configuration call, not a transport.
 //!
-//! Two facts shape the whole module:
+//! Three facts shape the whole module:
 //!
 //! * **Every mutation costs 100 credits and rewrites the entire address list**
 //!   — adding one mint is the same price as replacing all 17 000. So the caller
@@ -15,10 +15,16 @@
 //! * **The base host is genuinely uncertain.** Helius's docs say
 //!   `mainnet.helius-rpc.com`, their own SDK uses `api-mainnet.helius-rpc.com`,
 //!   and a legacy `api.helius.xyz` is still in circulation. It is therefore
-//!   configuration (`HELIUS_WEBHOOK_API`) with no default — a webhook is
-//!   registered per cluster, so the host is part of saying which one — and
+//!   configuration (`HELIUS_WEBHOOK_API`) with no default, and
 //!   [`WebhookClient::list`], a free `GET`, is the first call any caller
 //!   makes, so a wrong host fails cheaply and by name.
+//! * **A webhook's cluster is its type, never the host.** Helius manages
+//!   webhooks per account, through one API for every cluster (the
+//!   `api-devnet` hosts answer 404 for `/v0/webhooks`), and a webhook watches
+//!   devnet only when its `webhookType` is [`WebhookType::RawDevnet`]. A `raw`
+//!   one over devnet addresses watches *mainnet* for them: 200s, no errors,
+//!   nothing delivered. So the type is an argument to every write, and
+//!   [`Diff`] counts a wrong one as a change.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -31,6 +37,33 @@ use crate::client::{http_client, mask, transport, DasError, Redirects};
 
 /// Helius's cap on one webhook's `accountAddresses`. Our ~17 000 fit in one.
 pub const MAX_ADDRESSES: usize = 100_000;
+
+/// The `webhookType` a webhook is registered with, which is how Helius says
+/// which cluster it watches — see the module doc. The raw kind on either
+/// cluster, never `enhanced`: the request body's doc says why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookType {
+    /// `raw`: mainnet-beta.
+    Raw,
+    /// `rawDevnet`: devnet.
+    RawDevnet,
+}
+
+impl WebhookType {
+    /// The spelling Helius takes and reports.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::RawDevnet => "rawDevnet",
+        }
+    }
+}
+
+impl std::fmt::Display for WebhookType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A registered webhook, as Helius reports it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -57,6 +90,8 @@ pub struct Diff {
     pub removed: Vec<String>,
     /// The endpoint moved.
     pub url_changed: bool,
+    /// Registered with another cluster's type, so it watches the wrong chain.
+    pub type_changed: bool,
     /// We hold a secret and cannot prove the registered one matches, so a sync
     /// rewrites it whenever it rewrites anything else. Never a reason to write
     /// on its own — that would make every run cost 100 credits.
@@ -65,7 +100,12 @@ pub struct Diff {
 
 impl Diff {
     /// Between the tracked set and what Helius currently holds.
-    pub fn between(registered: &Webhook, url: &str, wanted: &[String]) -> Self {
+    pub fn between(
+        registered: &Webhook,
+        url: &str,
+        webhook_type: WebhookType,
+        wanted: &[String],
+    ) -> Self {
         let current: BTreeSet<&str> = registered
             .account_addresses
             .iter()
@@ -82,12 +122,16 @@ impl Diff {
                 .map(|a| (*a).to_string())
                 .collect(),
             url_changed: registered.webhook_url != url,
+            // Compared only when Helius reported one, like the secret: an
+            // unknown type must not turn every run into a 100-credit write.
+            type_changed: !registered.webhook_type.is_empty()
+                && registered.webhook_type != webhook_type.as_str(),
             kept: current.intersection(&wanted_set).count(),
         }
     }
 
     pub fn is_noop(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && !self.url_changed
+        self.added.is_empty() && self.removed.is_empty() && !self.url_changed && !self.type_changed
     }
 }
 
@@ -131,13 +175,14 @@ impl WebhookClient {
     pub async fn create(
         &self,
         url: &str,
+        webhook_type: WebhookType,
         addresses: &[String],
         auth_header: &str,
     ) -> Result<Webhook, DasError> {
         let response = self
             .http
             .post(self.url(""))
-            .json(&Self::body(url, addresses, auth_header))
+            .json(&Self::body(url, webhook_type, addresses, auth_header))
             .send()
             .await
             .map_err(transport)?;
@@ -151,13 +196,14 @@ impl WebhookClient {
         &self,
         webhook_id: &str,
         url: &str,
+        webhook_type: WebhookType,
         addresses: &[String],
         auth_header: &str,
     ) -> Result<Webhook, DasError> {
         let response = self
             .http
             .put(self.url(&format!("/{webhook_id}")))
-            .json(&Self::body(url, addresses, auth_header))
+            .json(&Self::body(url, webhook_type, addresses, auth_header))
             .send()
             .await
             .map_err(transport)?;
@@ -183,7 +229,7 @@ impl WebhookClient {
         Ok(())
     }
 
-    /// `raw`, deliberately.
+    /// `raw` (or its devnet twin), deliberately.
     ///
     /// `enhanced` would deliver Helius's own interpreted schema, which the
     /// decoder cannot read at all, and it silently drops failed transactions.
@@ -192,10 +238,15 @@ impl WebhookClient {
     /// cannot filter by type, and `txnStatus: "all"` keeps failures visible —
     /// the receiver records them as `failed` rather than pretending they did
     /// not happen.
-    fn body(url: &str, addresses: &[String], auth_header: &str) -> serde_json::Value {
+    fn body(
+        url: &str,
+        webhook_type: WebhookType,
+        addresses: &[String],
+        auth_header: &str,
+    ) -> serde_json::Value {
         json!({
             "webhookURL": url,
-            "webhookType": "raw",
+            "webhookType": webhook_type.as_str(),
             "txnStatus": "all",
             "accountAddresses": addresses,
             "authHeader": auth_header,
@@ -262,6 +313,7 @@ mod tests {
         let diff = Diff::between(
             &registered,
             "https://x.test/hook",
+            WebhookType::Raw,
             &["b".to_string(), "a".to_string()],
         );
         assert!(diff.is_noop(), "order must not count as a change: {diff:?}");
@@ -274,13 +326,58 @@ mod tests {
         let diff = Diff::between(
             &registered,
             "https://new.test/hook",
+            WebhookType::Raw,
             &["b".to_string(), "c".to_string()],
         );
         assert_eq!(diff.added, vec!["c".to_string()]);
         assert_eq!(diff.removed, vec!["a".to_string()]);
         assert!(diff.url_changed);
+        assert!(!diff.type_changed);
         assert_eq!(diff.kept, 1);
         assert!(!diff.is_noop());
+    }
+
+    /// A webhook over devnet addresses registered as `raw` watches mainnet
+    /// for them and delivers nothing while looking healthy — so the type goes
+    /// out on every write, and a wrong one alone is worth the 100 credits.
+    #[test]
+    fn the_type_says_which_cluster_and_a_wrong_one_is_a_change() {
+        let body = WebhookClient::body(
+            "https://x.test/hook",
+            WebhookType::RawDevnet,
+            &["a".to_string()],
+            "secret",
+        );
+        assert_eq!(body["webhookType"], "rawDevnet");
+        assert_eq!(
+            WebhookClient::body("https://x.test/hook", WebhookType::Raw, &[], "secret")
+                ["webhookType"],
+            "raw"
+        );
+
+        let registered = webhook(&["a"], "https://x.test/hook");
+        let diff = Diff::between(
+            &registered,
+            "https://x.test/hook",
+            WebhookType::RawDevnet,
+            &["a".to_string()],
+        );
+        assert!(diff.type_changed && !diff.url_changed && diff.added.is_empty());
+        assert!(!diff.is_noop());
+
+        // A type Helius did not report is not evidence of a wrong one; like
+        // the secret, it must not make every run a write.
+        let unreported = Webhook {
+            webhook_type: String::new(),
+            ..registered
+        };
+        let diff = Diff::between(
+            &unreported,
+            "https://x.test/hook",
+            WebhookType::RawDevnet,
+            &["a".to_string()],
+        );
+        assert!(diff.is_noop(), "{diff:?}");
     }
 
     /// The management URL carries the key exactly as the RPC one does, and a
@@ -313,6 +410,7 @@ mod tests {
         let error = client
             .create(
                 "https://example.test/hook",
+                WebhookType::Raw,
                 &["a".to_string()],
                 "wh-s3cr3t-value",
             )
@@ -340,7 +438,12 @@ mod tests {
         let client = WebhookClient::new(&base, "s3cr3t-key-value").unwrap();
         let secret = r#"h"k\1"#;
         let error = client
-            .create("https://example.test/hook", &["a".to_string()], secret)
+            .create(
+                "https://example.test/hook",
+                WebhookType::Raw,
+                &["a".to_string()],
+                secret,
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -373,7 +476,12 @@ mod tests {
         let (base, mut seen) = redirect_to_another_origin(r#"{"webhookID":"wh_1"}"#).await;
         let client = WebhookClient::new(&base, "s3cr3t-key").unwrap();
         let error = client
-            .create("https://example.test/hook", &["a".to_string()], "wh-s3cr3t")
+            .create(
+                "https://example.test/hook",
+                WebhookType::Raw,
+                &["a".to_string()],
+                "wh-s3cr3t",
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -393,7 +501,12 @@ mod tests {
     #[test]
     fn a_moved_url_alone_is_a_change() {
         let registered = webhook(&["a"], "https://old.test/hook");
-        let diff = Diff::between(&registered, "https://new.test/hook", &["a".to_string()]);
+        let diff = Diff::between(
+            &registered,
+            "https://new.test/hook",
+            WebhookType::Raw,
+            &["a".to_string()],
+        );
         assert!(diff.added.is_empty() && diff.removed.is_empty());
         assert!(!diff.is_noop());
     }
