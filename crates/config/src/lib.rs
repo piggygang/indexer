@@ -369,11 +369,15 @@ pub struct HeliusConfig {
     /// subcommand's first call is a free `GET`, so a wrong host fails cheaply
     /// and loudly.
     ///
-    /// It used to default to the mainnet host. It no longer defaults at all:
-    /// a webhook is registered *per cluster*, and a devnet deployment that
-    /// inherited the mainnet host would spend 100 credits registering devnet
-    /// addresses on mainnet. Same shape and same offline cluster check as the
-    /// [`SolanaConfig`] endpoints; `indexer-admin webhook` calls
+    /// **One host serves every cluster.** Helius manages webhooks per account,
+    /// and a webhook's cluster is its `webhookType` (`raw` on mainnet-beta,
+    /// `rawDevnet` on devnet), which `indexer-admin webhook` derives from
+    /// `SOLANA_CLUSTER`. The `api-devnet` hosts answer `404` for
+    /// `/v0/webhooks` (checked 2026-11-17), so a devnet deployment uses the
+    /// mainnet-named host too. That makes this the one endpoint whose hostname
+    /// is *not* checked against the cluster: there, a name is no
+    /// contradiction. The shape rules still apply, since every request carries
+    /// the key. No default, as before; `indexer-admin webhook` calls
     /// [`HeliusConfig::required_webhook_api`].
     pub webhook_api: Option<String>,
 }
@@ -454,8 +458,8 @@ impl Config {
             },
             solana: SolanaConfig {
                 cluster,
-                rpc_url: endpoint("SOLANA_RPC_URL", Wire::Http, cluster)?,
-                ws_url: endpoint("SOLANA_WS_URL", Wire::Ws, cluster)?,
+                rpc_url: endpoint("SOLANA_RPC_URL", Wire::Http, Scope::Cluster(cluster))?,
+                ws_url: endpoint("SOLANA_WS_URL", Wire::Ws, Scope::Cluster(cluster))?,
             },
             helius: HeliusConfig {
                 api_key: env::var("HELIUS_API_KEY").ok().filter(|v| !v.is_empty()),
@@ -463,7 +467,7 @@ impl Config {
                     .ok()
                     .filter(|v| !v.is_empty()),
                 webhook_url: env::var("WEBHOOK_URL").ok().filter(|v| !v.is_empty()),
-                webhook_api: endpoint("HELIUS_WEBHOOK_API", Wire::Http, cluster)?,
+                webhook_api: endpoint("HELIUS_WEBHOOK_API", Wire::Http, Scope::Account)?,
             },
             database,
             ingest: IngestConfig {
@@ -549,11 +553,23 @@ impl Wire {
     }
 }
 
+/// What an endpoint answers for, which decides whether its hostname is
+/// checked against `SOLANA_CLUSTER`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    /// One cluster's chain (JSON-RPC, DAS, the WebSocket), so a hostname that
+    /// names another cluster contradicts `SOLANA_CLUSTER`.
+    Cluster(Cluster),
+    /// The Helius account, for every cluster at once: the webhook management
+    /// API, where a webhook's cluster is its type and never the host.
+    Account,
+}
+
 /// An endpoint variable: missing → `None`, present → validated, and an
 /// invalid one is a hard error like every other variable here.
-fn endpoint(key: &str, wire: Wire, cluster: Cluster) -> Result<Option<String>> {
+fn endpoint(key: &str, wire: Wire, scope: Scope) -> Result<Option<String>> {
     match env::var(key) {
-        Ok(raw) if !raw.is_empty() => parse_endpoint(key, &raw, wire, cluster).map(Some),
+        Ok(raw) if !raw.is_empty() => parse_endpoint(key, &raw, wire, scope).map(Some),
         _ => Ok(None),
     }
 }
@@ -569,7 +585,7 @@ fn endpoint(key: &str, wire: Wire, cluster: Cluster) -> Result<Option<String>> {
 /// and only a part that cannot hold a secret: a scheme, when it is one of the
 /// four this function knows, and the origin — scheme and host — once a query
 /// string and credentials have been ruled out.
-fn parse_endpoint(key: &str, raw: &str, wire: Wire, cluster: Cluster) -> Result<String> {
+fn parse_endpoint(key: &str, raw: &str, wire: Wire, scope: Scope) -> Result<String> {
     let raw = raw.trim();
     // Railway leaves a reference it cannot resolve in place as literal text —
     // the guard `DATABASE_URL` gets in data-model, for the same reason.
@@ -618,11 +634,13 @@ fn parse_endpoint(key: &str, raw: &str, wire: Wire, cluster: Cluster) -> Result<
 
     let origin = url.origin().ascii_serialization();
     let host = host.to_string();
-    if let Some(named) = clusters_named_in(&host).find(|named| *named != cluster.as_str()) {
-        anyhow::bail!(
-            "{key}={origin} names {named}, but SOLANA_CLUSTER is {cluster} — \
-             an endpoint is never derived from the cluster, so both must be set to agree"
-        );
+    if let Scope::Cluster(cluster) = scope {
+        if let Some(named) = clusters_named_in(&host).find(|named| *named != cluster.as_str()) {
+            anyhow::bail!(
+                "{key}={origin} names {named}, but SOLANA_CLUSTER is {cluster} — \
+                 an endpoint is never derived from the cluster, so both must be set to agree"
+            );
+        }
     }
     Ok(format!("{origin}{}", url.path().trim_end_matches('/')))
 }
@@ -845,11 +863,14 @@ mod tests {
         );
 
         // A whole devnet configuration: every endpoint explicit, each one
-        // normalized to the shape the clients append `/?api-key=` to.
+        // normalized to the shape the clients append `/?api-key=` to. The
+        // webhook management host is the mainnet-named one on devnet too:
+        // Helius serves one for every cluster, and its `api-devnet` host
+        // answers 404 for `/v0/webhooks`.
         env::set_var("SOLANA_CLUSTER", "devnet");
         env::set_var("SOLANA_RPC_URL", "https://devnet.helius-rpc.com/");
         env::set_var("SOLANA_WS_URL", "wss://devnet.helius-rpc.com");
-        env::set_var("HELIUS_WEBHOOK_API", "https://api-devnet.helius-rpc.com");
+        env::set_var("HELIUS_WEBHOOK_API", "https://api-mainnet.helius-rpc.com/");
         let config = Config::try_from_env().unwrap();
         assert_eq!(config.solana.cluster, Cluster::Devnet);
         assert_eq!(
@@ -862,7 +883,7 @@ mod tests {
         );
         assert_eq!(
             config.helius.required_webhook_api().unwrap(),
-            "https://api-devnet.helius-rpc.com"
+            "https://api-mainnet.helius-rpc.com"
         );
         assert_eq!(
             config.solana.describe(),
@@ -870,9 +891,9 @@ mod tests {
         );
 
         // The mistake two environments invite: one variable copied from the
-        // other. Flip only the cluster and every endpoint now contradicts it,
-        // so the boot fails on the first one instead of indexing devnet into
-        // a mainnet database.
+        // other. Flip only the cluster and every chain endpoint now
+        // contradicts it, so the boot fails on the first one instead of
+        // indexing devnet into a mainnet database.
         env::set_var("SOLANA_CLUSTER", "mainnet-beta");
         let err = Config::try_from_env().unwrap_err().to_string();
         assert!(
@@ -884,10 +905,22 @@ mod tests {
         let err = Config::try_from_env().unwrap_err().to_string();
         assert!(err.contains("SOLANA_WS_URL"), "unexpected error: {err}");
         env::remove_var("SOLANA_WS_URL");
-        let err = Config::try_from_env().unwrap_err().to_string();
-        assert!(
-            err.contains("HELIUS_WEBHOOK_API"),
-            "unexpected error: {err}"
+        // The webhook management host is not one of them: it serves every
+        // cluster, so the same value is right in both environments.
+        let config = Config::try_from_env().unwrap();
+        assert_eq!(
+            config.helius.required_webhook_api().unwrap(),
+            "https://api-mainnet.helius-rpc.com"
+        );
+        env::set_var("SOLANA_CLUSTER", "devnet");
+        env::set_var("HELIUS_WEBHOOK_API", "https://api.helius.xyz");
+        assert_eq!(
+            Config::try_from_env()
+                .unwrap()
+                .helius
+                .required_webhook_api()
+                .unwrap(),
+            "https://api.helius.xyz"
         );
 
         clear();
@@ -959,7 +992,7 @@ mod tests {
     #[test]
     fn endpoints_are_validated_and_normalized() {
         let ok = |raw: &str, wire: Wire, cluster: Cluster| {
-            parse_endpoint("SOLANA_RPC_URL", raw, wire, cluster).unwrap()
+            parse_endpoint("SOLANA_RPC_URL", raw, wire, Scope::Cluster(cluster)).unwrap()
         };
         let main = Cluster::MainnetBeta;
 
@@ -993,7 +1026,7 @@ mod tests {
         );
 
         let err = |raw: &str, wire: Wire| {
-            parse_endpoint("SOLANA_RPC_URL", raw, wire, main)
+            parse_endpoint("SOLANA_RPC_URL", raw, wire, Scope::Cluster(main))
                 .unwrap_err()
                 .to_string()
         };
@@ -1055,7 +1088,7 @@ mod tests {
     }
 
     /// The offline half of "the cluster and its endpoints must agree" — and
-    /// the only half the WebSocket and the webhook API host can get.
+    /// the only half the WebSocket can get.
     #[test]
     fn an_endpoint_that_names_another_cluster_is_refused() {
         let check = |raw: &str, cluster: Cluster| {
@@ -1064,7 +1097,8 @@ mod tests {
             } else {
                 Wire::Http
             };
-            parse_endpoint("SOLANA_WS_URL", raw, wire, cluster).map_err(|e| e.to_string())
+            parse_endpoint("SOLANA_WS_URL", raw, wire, Scope::Cluster(cluster))
+                .map_err(|e| e.to_string())
         };
         let (main, dev) = (Cluster::MainnetBeta, Cluster::Devnet);
 
@@ -1115,6 +1149,40 @@ mod tests {
             ] {
                 assert!(check(raw, cluster).is_ok(), "{raw} names no cluster");
             }
+        }
+    }
+
+    /// The webhook management API serves the whole Helius account, and a
+    /// webhook's cluster is its type, so its host may name any cluster. The
+    /// shape rules still hold: every request there carries the key too.
+    #[test]
+    fn the_webhook_api_host_is_not_checked_against_the_cluster() {
+        let account = |raw: &str| {
+            parse_endpoint("HELIUS_WEBHOOK_API", raw, Wire::Http, Scope::Account)
+                .map_err(|e| e.to_string())
+        };
+        for raw in [
+            "https://api-mainnet.helius-rpc.com",
+            "https://mainnet.helius-rpc.com/",
+            "https://api.helius.xyz",
+        ] {
+            let normalized = account(raw).unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(normalized, raw.trim_end_matches('/'));
+        }
+        for (raw, why) in [
+            (
+                "https://api-mainnet.helius-rpc.com/?api-key=s3cr3t",
+                "HELIUS_API_KEY",
+            ),
+            ("http://api-mainnet.helius-rpc.com", "loopback"),
+            ("wss://api-mainnet.helius-rpc.com", "expected `https://`"),
+        ] {
+            let message = account(raw).unwrap_err();
+            assert!(
+                message.contains("HELIUS_WEBHOOK_API") && message.contains(why),
+                "{raw}: unexpected error: {message}"
+            );
+            assert!(!message.contains("s3cr3t"), "{raw}: leaked: {message}");
         }
     }
 

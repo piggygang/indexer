@@ -1154,14 +1154,14 @@ async fn webhook(
         Some(url) => url,
         None => config.helius.required_webhook_url()?.to_string(),
     };
-    // No default host: a webhook is registered per cluster, and inheriting the
-    // mainnet one on devnet would spend 100 credits registering devnet
-    // addresses there. The config crate has already refused a host that names
-    // another cluster.
+    // The cluster is the webhook's type, never the host: Helius serves one
+    // management API for every cluster, so this is what keeps devnet
+    // addresses from being registered as a mainnet webhook.
+    let webhook_type = webhook_type_for(config.solana.cluster);
     let api = config.helius.required_webhook_api()?;
     let client = WebhookClient::new(api, api_key)?;
     println!(
-        "cluster {} — webhook API {}",
+        "cluster {} — webhook type {webhook_type} — webhook API {}",
         config.solana.cluster,
         indexer_config::origin(api)
     );
@@ -1215,23 +1215,29 @@ async fn webhook(
     }
 
     let diff = match existing {
-        Some(existing) => Diff::between(existing, &url, &wanted),
+        Some(existing) => Diff::between(existing, &url, webhook_type, &wanted),
         // Nothing registered: everything is an addition.
         None => Diff {
             added: wanted.clone(),
             removed: Vec::new(),
             url_changed: true,
+            type_changed: false,
             kept: 0,
         },
     };
     println!(
-        "tracked={} registered={} +{} -{} kept={}{}",
+        "tracked={} registered={} +{} -{} kept={}{}{}",
         wanted.len(),
         existing.map_or(0, |w| w.account_addresses.len()),
         diff.added.len(),
         diff.removed.len(),
         diff.kept,
-        if diff.url_changed { " url-changed" } else { "" }
+        if diff.url_changed { " url-changed" } else { "" },
+        match existing {
+            Some(existing) if diff.type_changed =>
+                format!(" type-changed ({} → {webhook_type})", existing.webhook_type),
+            _ => String::new(),
+        }
     );
     for address in diff.added.iter().take(5) {
         println!("  + {address}");
@@ -1246,11 +1252,16 @@ async fn webhook(
     }
     if expect_unchanged {
         bail!(
-            "--expect-unchanged: {} addition(s), {} removal(s){}",
+            "--expect-unchanged: {} addition(s), {} removal(s){}{}",
             diff.added.len(),
             diff.removed.len(),
             if diff.url_changed {
                 ", url changed"
+            } else {
+                ""
+            },
+            if diff.type_changed {
+                ", type changed"
             } else {
                 ""
             }
@@ -1271,13 +1282,13 @@ async fn webhook(
     let result = match existing {
         Some(existing) => {
             client
-                .update(&existing.webhook_id, &url, &wanted, secret)
+                .update(&existing.webhook_id, &url, webhook_type, &wanted, secret)
                 .await?
         }
-        None => client.create(&url, &wanted, secret).await?,
+        None => client.create(&url, webhook_type, &wanted, secret).await?,
     };
     println!(
-        "{} {} with {} address(es) (100 credits)",
+        "{} {} ({webhook_type}) with {} address(es) (100 credits)",
         if existing.is_some() {
             "updated"
         } else {
@@ -1287,6 +1298,16 @@ async fn webhook(
         wanted.len()
     );
     Ok(())
+}
+
+/// The webhook type that watches `cluster`. Exhaustive on purpose: a cluster
+/// added to [`Cluster`] must say which type watches it before this compiles.
+fn webhook_type_for(cluster: Cluster) -> indexer_das::webhooks::WebhookType {
+    use indexer_das::webhooks::WebhookType;
+    match cluster {
+        Cluster::MainnetBeta => WebhookType::Raw,
+        Cluster::Devnet => WebhookType::RawDevnet,
+    }
 }
 
 #[cfg(test)]
@@ -1306,6 +1327,16 @@ mod tests {
             registry_for(Cluster::Devnet),
             PathBuf::from("config/devnet/collections.toml")
         );
+    }
+
+    /// Helius puts a webhook's cluster in its type, never in the host, so this
+    /// mapping is all that keeps devnet addresses out of a mainnet webhook.
+    #[test]
+    fn each_cluster_registers_the_webhook_type_that_watches_it() {
+        use indexer_das::webhooks::WebhookType;
+        assert_eq!(webhook_type_for(Cluster::MainnetBeta), WebhookType::Raw);
+        assert_eq!(webhook_type_for(Cluster::Devnet), WebhookType::RawDevnet);
+        assert_eq!(webhook_type_for(Cluster::Devnet).as_str(), "rawDevnet");
     }
 
     /// Every cluster the binary can be configured for ships both of its files,
